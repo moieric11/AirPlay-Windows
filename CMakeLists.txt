@@ -62,6 +62,7 @@ add_executable(airplay-windows
     src/mdns/bonjour_service.cpp
     src/crypto/identity.cpp
     src/crypto/pair_verify.cpp
+    src/crypto/fairplay.cpp
     src/airplay/info_plist.cpp
     src/airplay/rtsp_parser.cpp
     src/airplay/server.cpp
@@ -70,6 +71,21 @@ add_executable(airplay-windows
 
 target_include_directories(airplay-windows PRIVATE src)
 target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto)
+
+# ---- FairPlay SAP blobs (swap-ready) ------------------------------------------
+# By default we link the zero-filled stub. If the user drops a real blob
+# file into third_party/ (conventionally named fairplay_blobs_real.cpp),
+# we link that instead. See docs/FAIRPLAY.md.
+if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/fairplay_blobs_real.cpp")
+    message(STATUS "FairPlay: using provisioned blob (fairplay_blobs_real.cpp)")
+    target_sources(airplay-windows PRIVATE
+        third_party/fairplay_blobs_real.cpp)
+else()
+    message(STATUS "FairPlay: using zero-filled STUB — iOS handshake will "
+                   "fail at /fp-setup until a real blob is provided")
+    target_sources(airplay-windows PRIVATE
+        third_party/fairplay_blobs_stub.cpp)
+endif()
 
 if(LIBPLIST_FOUND)
     target_link_libraries(airplay-windows PRIVATE PkgConfig::LIBPLIST)

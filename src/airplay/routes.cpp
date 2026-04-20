@@ -1,6 +1,7 @@
 #include "airplay/routes.h"
 #include "airplay/client_session.h"
 #include "airplay/info_plist.h"
+#include "crypto/fairplay.h"
 #include "crypto/pair_verify.h"
 #include "log.h"
 
@@ -105,6 +106,31 @@ Response handle_pair_verify(const DeviceContext& ctx, ClientSession& session,
     return r;
 }
 
+// /fp-setup is the FairPlay SAP handshake. Two POSTs on the same TCP
+// connection: 16-byte msg1 → 142-byte msg2, then 164-byte msg3 → 32-byte
+// msg4. Crypto blobs live in third_party/fairplay_blobs_stub.cpp (replaced
+// by the real UxPlay-extracted file at provision time — see
+// docs/FAIRPLAY.md). Until then the framing is correct but the crypto is
+// zeros, so iOS will reject at this step.
+Response handle_fp_setup(ClientSession& session, const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    r.set_header("Content-Type", "application/octet-stream");
+
+    if (!session.fairplay) {
+        session.fairplay = std::make_unique<ap::crypto::FairPlaySession>();
+    }
+
+    std::vector<unsigned char> out;
+    if (!session.fairplay->process(req.body.data(), req.body.size(), out)) {
+        r.status_code = 400;
+        r.status_text = "Bad Request";
+        return r;
+    }
+    r.body = std::move(out);
+    return r;
+}
+
 Response handle_unimplemented(const Request& req, const char* what) {
     Response r = make(501, "Not Implemented");
     copy_cseq(req, r);
@@ -127,7 +153,7 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "GET"  && req.uri == "/info")          return handle_info(ctx, req);
     if (req.method == "POST" && req.uri == "/pair-setup")    return handle_pair_setup(ctx, req);
     if (req.method == "POST" && req.uri == "/pair-verify")   return handle_pair_verify(ctx, session, req);
-    if (req.method == "POST" && req.uri == "/fp-setup")      return handle_unimplemented(req, "FairPlay SAP");
+    if (req.method == "POST" && req.uri == "/fp-setup")      return handle_fp_setup(session, req);
     if (req.method == "POST" && req.uri == "/auth-setup")    return handle_unimplemented(req, "auth-setup");
     if (req.method == "POST" && req.uri == "/feedback")      {
         Response r = make(200, "OK");

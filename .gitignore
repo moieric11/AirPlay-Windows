@@ -13,3 +13,11 @@ vcpkg_installed/
 *.exe
 *.pdb
 *.ilk
+
+# Per-install receiver identity — keeps pk stable across restarts, not
+# something to ship.
+identity.key
+
+# FairPlay blobs are Apple-copyrighted; provision locally per docs/FAIRPLAY.md
+# but never commit.
+third_party/fairplay_blobs_real.cpp

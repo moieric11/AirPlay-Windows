@@ -13,6 +13,10 @@ Scenarios:
   T4  Two concurrent sessions — each TCP connection must carry its own
       PairVerifySession state (no cross-contamination of the AES-CTR
       counter or of the client Ed25519 pubkey remembered from round 1).
+  T5  /fp-setup RTSP framing — correct sizes are returned (142B for
+      msg2, 32B for msg4) even when the FairPlay blobs are stubbed.
+      Validates the state machine and routing, not the crypto itself
+      (which needs the Apple-extracted tables; see docs/FAIRPLAY.md).
 
 What this validates:
   * the crypto primitives and byte layouts we used on both sides match
@@ -229,12 +233,47 @@ def t4_concurrent_sessions(r):
         r.check(res == (200, 200, True), f"session #{i} -> {res}")
 
 
+def t5_fp_setup_framing(r):
+    print("T5  fp-setup RTSP framing (msg1->142B, msg3->32B)")
+    c = Conn(HOST, PORT)
+    try:
+        # msg1: 16 bytes starting with "FPLY" magic, mode byte at index 6.
+        msg1 = b"FPLY" + b"\x03\x01\x01\x00\x00\x00\x00\x82\x02\x00\x0f\x9f"
+        assert len(msg1) == 16
+        s1, body1 = c.rpc("POST", "/fp-setup", msg1)
+        r.check(s1 == 200,          f"fp-setup msg1 status = {s1}")
+        r.check(len(body1) == 142,  f"fp-setup msg2 size = {len(body1)} (expected 142)")
+        r.check(body1[:4] == b"FPLY", "fp-setup msg2 starts with FPLY magic")
+
+        # msg3: 164 bytes starting with FPLY magic, rest zeros is fine for framing test.
+        msg3 = b"FPLY" + b"\x03\x01\x02" + (b"\x00" * (164 - 7))
+        assert len(msg3) == 164
+        s2, body2 = c.rpc("POST", "/fp-setup", msg3)
+        r.check(s2 == 200,          f"fp-setup msg3 status = {s2}")
+        r.check(len(body2) == 32,   f"fp-setup msg4 size = {len(body2)} (expected 32)")
+
+        # Wrong length → 400.
+        s3, _ = c.rpc("POST", "/fp-setup", b"FPLY\x03\x01" + b"\x00" * 10)  # 16? adjust
+        # Our stub accepts 16B as msg1; let's send 42B which matches nothing.
+    finally:
+        c.close()
+
+    # Reject-unknown-length check on a separate connection.
+    c = Conn(HOST, PORT)
+    try:
+        s3, _ = c.rpc("POST", "/fp-setup", b"FPLY" + b"\x00" * 38)  # 42 bytes
+        r.check(s3 != 200, f"fp-setup with bogus length ({s3}) -> non-200")
+    finally:
+        c.close()
+
+
 def main():
     r = Runner()
     for fn in (t1_happy_path,
                t2_ios_headers_and_absolute_uri,
                t3_bad_client_signature,
-               t4_concurrent_sessions):
+               t4_concurrent_sessions,
+               t5_fp_setup_framing):
         try:
             fn(r)
         except Exception as e:
