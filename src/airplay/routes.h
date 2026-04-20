@@ -29,8 +29,12 @@ struct DeviceContext {
     const ap::crypto::Identity* identity = nullptr;
 };
 
+struct ClientSession;
+
 // Build a response for a single incoming request. Stubs log and answer 501
-// for handlers that are not implemented yet.
-Response dispatch(const DeviceContext& ctx, const Request& req);
+// for handlers that are not implemented yet. `session` carries per-connection
+// state (pair-verify rounds, later stream keys).
+Response dispatch(const DeviceContext& ctx, ClientSession& session,
+                  const Request& req);
 
 } // namespace ap::airplay

@@ -1,5 +1,7 @@
 #include "airplay/routes.h"
+#include "airplay/client_session.h"
 #include "airplay/info_plist.h"
+#include "crypto/pair_verify.h"
 #include "log.h"
 
 #include <sstream>
@@ -62,6 +64,47 @@ Response handle_pair_setup(const DeviceContext& ctx, const Request& req) {
     return r;
 }
 
+// /pair-verify is a two-round handshake. iOS distinguishes the rounds by
+// the first byte of the body: non-zero = round 1 (send pubkeys), zero =
+// round 2 (send encrypted signature). We dispatch based on body length
+// as an extra safety net (68 bytes in both rounds, but the content differs).
+Response handle_pair_verify(const DeviceContext& ctx, ClientSession& session,
+                            const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    r.set_header("Content-Type", "application/octet-stream");
+
+    const auto& body = req.body;
+    if (body.size() < 4) {
+        LOG_ERROR << "pair-verify: body too short (" << body.size() << ")";
+        r.status_code = 400; r.status_text = "Bad Request";
+        return r;
+    }
+
+    if (!session.pair_verify) {
+        session.pair_verify = std::make_unique<ap::crypto::PairVerifySession>(
+            *ctx.identity);
+    }
+
+    const bool is_round1 = body[0] != 0;
+    if (is_round1) {
+        std::vector<unsigned char> out;
+        if (!session.pair_verify->handle_message1(body.data(), body.size(), out)) {
+            r.status_code = 470; r.status_text = "Connection Authorization Required";
+            return r;
+        }
+        r.body = std::move(out);
+        return r;
+    }
+
+    if (!session.pair_verify->handle_message2(body.data(), body.size())) {
+        r.status_code = 470; r.status_text = "Connection Authorization Required";
+        return r;
+    }
+    // Verified: empty 200 OK.
+    return r;
+}
+
 Response handle_unimplemented(const Request& req, const char* what) {
     Response r = make(501, "Not Implemented");
     copy_cseq(req, r);
@@ -75,14 +118,15 @@ Response handle_unimplemented(const Request& req, const char* what) {
 
 } // namespace
 
-Response dispatch(const DeviceContext& ctx, const Request& req) {
+Response dispatch(const DeviceContext& ctx, ClientSession& session,
+                  const Request& req) {
     LOG_INFO << req.method << ' ' << req.uri
              << "  body=" << req.body.size() << "B";
 
     // Order matches the rough handshake sequence iOS initiates.
     if (req.method == "GET"  && req.uri == "/info")          return handle_info(ctx, req);
     if (req.method == "POST" && req.uri == "/pair-setup")    return handle_pair_setup(ctx, req);
-    if (req.method == "POST" && req.uri == "/pair-verify")   return handle_unimplemented(req, "pair-verify (Curve25519)");
+    if (req.method == "POST" && req.uri == "/pair-verify")   return handle_pair_verify(ctx, session, req);
     if (req.method == "POST" && req.uri == "/fp-setup")      return handle_unimplemented(req, "FairPlay SAP");
     if (req.method == "POST" && req.uri == "/auth-setup")    return handle_unimplemented(req, "auth-setup");
     if (req.method == "POST" && req.uri == "/feedback")      {

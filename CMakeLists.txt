@@ -61,6 +61,7 @@ add_executable(airplay-windows
     src/net/tcp_server.cpp
     src/mdns/bonjour_service.cpp
     src/crypto/identity.cpp
+    src/crypto/pair_verify.cpp
     src/airplay/info_plist.cpp
     src/airplay/rtsp_parser.cpp
     src/airplay/server.cpp

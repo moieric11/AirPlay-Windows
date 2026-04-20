@@ -1,4 +1,5 @@
 #include "airplay/server.h"
+#include "airplay/client_session.h"
 #include "log.h"
 
 namespace ap::airplay {
@@ -17,8 +18,10 @@ void Server::stop() {
 void Server::handle_client(ap::net::ClientSocket client) {
     RequestReader reader;
     Request req;
+    ClientSession session(*ctx_.identity);
+
     while (reader.read(static_cast<int>(client.fd), req)) {
-        Response res = dispatch(ctx_, req);
+        Response res = dispatch(ctx_, session, req);
         std::string wire = res.serialize();
         if (ap::net::send_all(client.fd, wire.data(),
                               static_cast<int>(wire.size())) < 0) {
