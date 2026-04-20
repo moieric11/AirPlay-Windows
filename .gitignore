@@ -1,0 +1,15 @@
+build/
+out/
+.vs/
+.vscode/
+CMakeSettings.json
+CMakeUserPresets.json
+vcpkg_installed/
+*.user
+*.sln
+*.vcxproj*
+*.suo
+*.obj
+*.exe
+*.pdb
+*.ilk
