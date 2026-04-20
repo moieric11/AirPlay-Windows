@@ -48,6 +48,11 @@ if(NOT LIBPLIST_FOUND)
     find_package(libplist CONFIG QUIET)
 endif()
 
+# ---- OpenSSL (required) -------------------------------------------------------
+# Used for Ed25519 identity keys, X25519 ECDH, AES-CTR and SHA-512 during the
+# AirPlay pair-setup / pair-verify handshake.
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+
 # ---- Sources ------------------------------------------------------------------
 add_executable(airplay-windows
     src/main.cpp
@@ -55,6 +60,7 @@ add_executable(airplay-windows
     src/net/socket.cpp
     src/net/tcp_server.cpp
     src/mdns/bonjour_service.cpp
+    src/crypto/identity.cpp
     src/airplay/info_plist.cpp
     src/airplay/rtsp_parser.cpp
     src/airplay/server.cpp
@@ -62,6 +68,7 @@ add_executable(airplay-windows
 )
 
 target_include_directories(airplay-windows PRIVATE src)
+target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto)
 
 if(LIBPLIST_FOUND)
     target_link_libraries(airplay-windows PRIVATE PkgConfig::LIBPLIST)

@@ -8,6 +8,7 @@
 //   5. Block until Ctrl-C, then tear everything down cleanly.
 
 #include "airplay/server.h"
+#include "crypto/identity.h"
 #include "log.h"
 #include "mdns/bonjour_service.h"
 #include "net/socket.h"
@@ -61,10 +62,23 @@ int main() {
 #endif
 
     auto ctx = build_device_context();
+
+    // Load (or create) the persistent Ed25519 identity. iOS caches receivers
+    // by pk — keeping a stable keypair avoids re-pairing on every launch.
+    auto identity = ap::crypto::Identity::load_or_create("identity.key");
+    if (!identity) {
+        LOG_ERROR << "failed to initialise identity — aborting";
+        ap::net::global_shutdown();
+        return 1;
+    }
+    ctx.public_key = identity->public_key();
+    ctx.identity   = identity.get();
+
     LOG_INFO << "=== AirPlay-Windows skeleton ===";
     LOG_INFO << "name="     << ctx.name;
     LOG_INFO << "deviceid=" << ctx.deviceid;
     LOG_INFO << "ip="       << ap::net::primary_ipv4();
+    LOG_INFO << "pk(Ed25519)=" << ctx.public_key.size() << " bytes";
 
     ap::airplay::Server server;
     if (!server.start(ctx, 7000)) {

@@ -100,12 +100,19 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
     set_bool(root, "keepAliveLowPower",        true);
     set_bool(root, "keepAliveSendStatsAsBody", true);
 
-    // TODO: replace with the actual Ed25519 public key once pair-setup
-    // generates a persistent keypair. iOS tolerates a 32-byte zero blob
-    // for the /info exchange itself; pair-verify is where it's checked.
-    unsigned char pk[32] = {0};
-    plist_dict_set_item(root, "pk", plist_new_data(
-        reinterpret_cast<const char*>(pk), sizeof(pk)));
+    // Ed25519 public key from the persisted Identity. A freshly-generated
+    // receiver and a zero blob both let iOS proceed past /info, but the
+    // real key is what pair-verify later matches against.
+    if (!ctx.public_key.empty()) {
+        plist_dict_set_item(root, "pk", plist_new_data(
+            reinterpret_cast<const char*>(ctx.public_key.data()),
+            ctx.public_key.size()));
+    } else {
+        LOG_WARN << "DeviceContext.public_key empty — /info pk=<32 zeros>";
+        unsigned char zero[32] = {0};
+        plist_dict_set_item(root, "pk",
+            plist_new_data(reinterpret_cast<const char*>(zero), sizeof(zero)));
+    }
 
     plist_t displays = plist_new_array();
     plist_array_append_item(displays, make_display());
