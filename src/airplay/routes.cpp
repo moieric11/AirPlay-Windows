@@ -1,4 +1,5 @@
 #include "airplay/routes.h"
+#include "airplay/info_plist.h"
 #include "log.h"
 
 #include <sstream>
@@ -18,24 +19,24 @@ void copy_cseq(const Request& req, Response& res) {
     if (!cseq.empty()) res.set_header("CSeq", cseq);
 }
 
-// Minimal /info response. A real implementation returns a binary plist;
-// iOS is tolerant enough in logs to show us progress with a placeholder
-// text body while we plug the plist serializer in a later iteration.
+// /info returns a binary plist ("bplist00") describing the receiver's
+// capabilities. iOS parses this to decide whether to proceed to pair-setup.
+// Payload structure is copied from UxPlay — see info_plist.cpp.
 Response handle_info(const DeviceContext& ctx, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
-    r.set_header("Content-Type", "text/plain");
 
-    std::ostringstream os;
-    os << "name="     << ctx.name     << '\n'
-       << "deviceid=" << ctx.deviceid << '\n'
-       << "model="    << ctx.model    << '\n'
-       << "pi="       << ctx.pi       << '\n'
-       << "features=" << ctx.features << '\n'
-       << "srcvers="  << ctx.srcvers  << '\n';
-    std::string s = os.str();
-    r.body.assign(s.begin(), s.end());
-    LOG_WARN << "/info returning placeholder text; TODO: binary plist";
+    auto body = build_info_plist(ctx);
+    if (!body.empty()) {
+        r.set_header("Content-Type", "application/x-apple-binary-plist");
+        r.body = std::move(body);
+    } else {
+        // Degraded fallback (libplist missing at build time).
+        r.set_header("Content-Type", "text/plain");
+        std::string s = "name=" + ctx.name + "\ndeviceid=" + ctx.deviceid + '\n';
+        r.body.assign(s.begin(), s.end());
+        LOG_WARN << "/info serving text fallback — iOS won't accept this";
+    }
     return r;
 }
 
