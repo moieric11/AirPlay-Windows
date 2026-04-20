@@ -1,7 +1,15 @@
 # Notes protocole AirPlay 2 (mirroring)
 
-> Notes de travail consolidées à partir de RPiPlay, UxPlay, OpenAirplay et
-> shairport-sync. Rien ici ne vient d'une documentation officielle Apple.
+> Notes de travail consolidées à partir d'**UxPlay** (référence primaire,
+> maintenu), de RPiPlay (ancêtre), d'OpenAirplay et de shairport-sync. Rien
+> ici ne vient d'une documentation officielle Apple.
+>
+> **Pourquoi UxPlay plutôt que RPiPlay** : RPiPlay n'a plus de commit de fond
+> depuis 2021. UxPlay en est le fork direct — mêmes fichiers `lib/pairing.c`,
+> `lib/fairplay.c`, `lib/raop.c`, `plist/info.plist` — mais avec les
+> correctifs iOS 17/18 (champs `osBuildVersion`, `sourceVersion`, ajustements
+> de `pair-verify`, modèles acceptés élargis). On porte toujours depuis
+> UxPlay ; RPiPlay n'est consulté qu'en cas de divergence inexpliquée.
 
 ## 1. Découverte (mDNS / DNS-SD)
 
@@ -44,8 +52,8 @@ séparés par une virgule. Bits critiques :
 | 20  | ScreenRotate         | Rotation                                  |
 | 22  | AudioFormats         | Extension audio format                    |
 
-Valeur utilisée ici (`0x5A7FFFF7,0x1E`) reprise de RPiPlay — connue pour passer
-la phase de découverte sur iOS 13–17.
+Valeur utilisée ici (`0x5A7FFFF7,0x1E`) reprise d'UxPlay — connue pour passer
+la phase de découverte sur iOS 13–18.
 
 ## 2. Handshake (RTSP-like sur TCP 7000)
 
@@ -71,17 +79,17 @@ Séquence observée (simplifiée) :
 ### Points de friction connus
 
 - **`/info`** doit répondre en **binary plist**, pas en texte libre. Le fichier
-  `plist/info.plist` de RPiPlay est la référence (90 lignes). Stub actuel : texte
-  brut — iOS est tolérant jusqu'au pair-setup.
+  `plist/info.plist` d'UxPlay (version iOS 17-safe) est la référence. Stub
+  actuel : texte brut — iOS est tolérant jusqu'au pair-setup.
 - **`pair-setup`** : SRP-6a avec paramètres 3072-bit standards. La pair
-  `(username, password)` est hardcodée (`Pair-Setup` / `3939`) dans RPiPlay.
+  `(username, password)` est hardcodée (`Pair-Setup` / `3939`) dans UxPlay.
 - **`fp-setup`** : 4 messages. Les deux premiers sont des challenges/réponses
   utilisant la table statique `playfair_table` (16 Ko) déchiffrable via l'algo
   AES-CTR dérivé dans le code de `playfair`. Sans cette table, impossible de
   passer l'étape.
 - **Chiffrement des streams** : les clés AES sont transportées dans l'entête
   `RSAAESKey` de l'ANNOUNCE, chiffrées en RSA 2048-bit avec la clé publique
-  FairPlay. RPiPlay embarque la clé privée (c'est la raison principale de la
+  FairPlay. UxPlay embarque la clé privée (c'est la raison principale de la
   licence GPL du projet).
 
 ## 3. Flux média
@@ -102,8 +110,8 @@ Séquence observée (simplifiée) :
 | Serveur TCP 7000       | OK      | `src/net/tcp_server.cpp`          |
 | Parser RTSP-like       | OK      | `src/airplay/rtsp_parser.cpp`     |
 | Dispatcher             | OK      | `src/airplay/routes.cpp`          |
-| `GET /info` (plist)    | Stub    | à porter depuis RPiPlay           |
-| `pair-setup` (SRP)     | Stub    | porter `lib/pairing.c` de RPiPlay |
+| `GET /info` (plist)    | Stub    | à porter depuis UxPlay            |
+| `pair-setup` (SRP)     | Stub    | porter `lib/pairing.c` d'UxPlay   |
 | `pair-verify` (X25519) | Stub    | idem                              |
 | `fp-setup` (FairPlay)  | Stub    | nécessite playfair + clé privée   |
 | SETUP / RECORD         | Stub    | —                                 |
@@ -113,5 +121,5 @@ Séquence observée (simplifiée) :
 ## 5. Prochaine étape recommandée
 
 Intégrer le plist binaire de `/info` (1 journée) puis porter `pair-setup` /
-`pair-verify` de RPiPlay (2–3 journées) — c'est le premier jalon qui permet
+`pair-verify` d'UxPlay (2–3 journées) — c'est le premier jalon qui permet
 d'observer un échange complet jusqu'à FairPlay dans les logs.
