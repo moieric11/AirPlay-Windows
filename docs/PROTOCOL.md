@@ -118,8 +118,35 @@ Séquence observée (simplifiée) :
 | Décrypt H.264          | Absent  | —                                 |
 | Rendu                  | Absent  | FFmpeg + SDL2 à intégrer          |
 
-## 5. Prochaine étape recommandée
+## 5. Validation actuelle
 
-Intégrer le plist binaire de `/info` (1 journée) puis porter `pair-setup` /
-`pair-verify` d'UxPlay (2–3 journées) — c'est le premier jalon qui permet
-d'observer un échange complet jusqu'à FairPlay dans les logs.
+`tools/test_pair_verify.py` exerce le récepteur sur quatre scénarios :
+
+| # | Scénario                                  | Ce qu'il prouve                                                      |
+|---|-------------------------------------------|----------------------------------------------------------------------|
+|T1 | Round-trip nominal                        | Symétrie des primitives crypto des deux côtés                        |
+|T2 | URI absolue `rtsp://host:port/…` + headers iOS (`User-Agent: AirPlay/…`, `Active-Remote`, `DACP-ID`, `X-Apple-ProtocolVersion`) | Parser RTSP tolère ce que iOS envoie réellement |
+|T3 | Signature client corrompue (1 bit flippé) | Rejet en round 2 avec status 470                                    |
+|T4 | Deux connexions TCP concurrentes          | Chaque session a son propre état (compteur AES-CTR, pubkey client)   |
+
+**Ce que la suite NE prouve PAS** (limitation intrinsèque d'une simulation) :
+
+- Que nos sels (`"Pair-Verify-AES-Key"` / `"Pair-Verify-AES-IV"`) et l'ordre
+  des octets dans `sig_data = own_x25519 || peer_x25519` correspondent à ce
+  que calcule un vrai iPhone. Si client et serveur se trompent de la même
+  façon, la suite passe quand même.
+- Que la bitmask `features` du plist fait effectivement atteindre l'étape
+  pair-verify côté iOS (plus tôt iOS peut décrocher sans log côté récepteur).
+
+Seules deux validations sont non-circulaires :
+
+1. **Diff contre un dump Wireshark** d'une session iPhone ↔ UxPlay (à
+   extraire une fois qu'on aura UxPlay qui tourne sur Linux en local).
+2. **Test contre un vrai iPhone** sur le même Wi-Fi que le récepteur Windows.
+
+## 6. Prochaine étape
+
+Avant d'attaquer FairPlay (zone GPL/juridique sensible), sécuriser le build
+Windows avec Bonjour SDK et tester avec un iPhone réel jusqu'où l'on progresse
+dans la séquence. C'est le test le plus rentable : il valide en une fois ce
+que la simulation ne peut pas.

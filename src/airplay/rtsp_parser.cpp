@@ -91,6 +91,17 @@ bool RequestReader::read_headers(int fd, Request& out, std::size_t& body_offset)
         return false;
     }
 
+    // Normalise absolute URIs. iOS sometimes sends
+    //   POST rtsp://192.168.1.5:7000/pair-verify RTSP/1.0
+    // rather than a path-only URI. Strip scheme://host[:port] so the
+    // dispatcher can keep matching on req.uri == "/pair-verify".
+    if (out.uri.rfind("rtsp://", 0) == 0 || out.uri.rfind("http://", 0) == 0) {
+        auto scheme_end = out.uri.find("://");
+        auto path_start = out.uri.find('/', scheme_end + 3);
+        out.uri = (path_start == std::string::npos) ? "/"
+                                                    : out.uri.substr(path_start);
+    }
+
     // Parse headers.
     std::size_t p = line_end + 2;
     while (p < body_offset - 2) {
