@@ -1,4 +1,5 @@
 #include "airplay/routes.h"
+#include "airplay/airplay2_setup.h"
 #include "airplay/client_session.h"
 #include "airplay/info_plist.h"
 #include "airplay/sdp.h"
@@ -162,26 +163,17 @@ Response handle_announce(ClientSession& session, const Request& req) {
     return r;
 }
 
-// SETUP negotiates the UDP transport. We parse the client's Transport
-// header, bind matching UDP sockets on our side and echo the allocated
-// ports back. Session: header persists for later TEARDOWN.
-Response handle_setup(ClientSession& session, const Request& req) {
+// Legacy RTSP SETUP (no body, Transport header). Kept for the Python test
+// suite and completeness — real iOS uses the AirPlay 2 plist body path.
+Response setup_legacy_path(ClientSession& session, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
 
     auto transport = req.header("transport");
-    if (transport.empty()) {
-        LOG_ERROR << "SETUP: missing Transport header";
-        r.status_code = 400; r.status_text = "Bad Request";
-        return r;
-    }
-
-    if (!session.streams) {
-        session.streams = std::make_unique<StreamSession>();
-    }
+    if (!session.streams) session.streams = std::make_unique<StreamSession>();
 
     StreamPorts allocated;
-    if (!session.streams->setup(transport, allocated)) {
+    if (!session.streams->setup_legacy(transport, allocated)) {
         r.status_code = 500; r.status_text = "Internal Server Error";
         return r;
     }
@@ -194,6 +186,63 @@ Response handle_setup(ClientSession& session, const Request& req) {
     r.set_header("Transport", os.str());
     r.set_header("Session",   session.streams->session_id());
     return r;
+}
+
+// AirPlay 2 SETUP: binary-plist body. Two shapes depending on whether the
+// dict carries a `streams[]` array. We log what we parsed, bind UDPs,
+// and answer with a plist carrying the allocated ports.
+Response setup_airplay2_path(ClientSession& session, const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    r.set_header("Content-Type", "application/x-apple-binary-plist");
+
+    Airplay2SetupRequest parsed;
+    if (!parse_airplay2_setup(req.body.data(), req.body.size(), parsed)) {
+        r.status_code = 400; r.status_text = "Bad Request";
+        return r;
+    }
+
+    if (!session.streams) session.streams = std::make_unique<StreamSession>();
+
+    if (parsed.has_streams) {
+        std::vector<StreamAllocation> alloc(parsed.streams.size());
+        for (std::size_t i = 0; i < parsed.streams.size(); ++i) {
+            uint16_t d = 0, c = 0;
+            if (!session.streams->setup_stream(parsed.streams[i].type, d, c)) {
+                LOG_ERROR << "airplay2 SETUP: could not bind stream #" << i;
+                r.status_code = 500; r.status_text = "Internal Server Error";
+                return r;
+            }
+            alloc[i].data_port    = d;
+            alloc[i].control_port = c;
+        }
+        r.body = build_airplay2_setup_streams_response(parsed.streams, alloc);
+    } else {
+        uint16_t event_port = 0, timing_port = 0;
+        if (!session.streams->setup_session(event_port, timing_port)) {
+            r.status_code = 500; r.status_text = "Internal Server Error";
+            return r;
+        }
+        r.body = build_airplay2_setup_session_response(event_port, timing_port);
+    }
+
+    r.set_header("Session", session.streams->session_id());
+    return r;
+}
+
+// Dispatch on whether SETUP carries a plist body (AirPlay 2) or a legacy
+// Transport: header.
+Response handle_setup(ClientSession& session, const Request& req) {
+    if (!req.body.empty()) return setup_airplay2_path(session, req);
+
+    auto transport = req.header("transport");
+    if (transport.empty()) {
+        Response r = make(400, "Bad Request");
+        copy_cseq(req, r);
+        LOG_ERROR << "SETUP: neither body (AirPlay 2) nor Transport header (legacy)";
+        return r;
+    }
+    return setup_legacy_path(session, req);
 }
 
 Response handle_record(ClientSession& session, const Request& req) {

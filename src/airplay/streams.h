@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace ap::airplay {
 
@@ -14,11 +15,27 @@ struct StreamPorts {
     uint16_t timing  = 0;   // NTP-like timing
 };
 
-// Owns the UDP sockets bound by a SETUP request. Lifetime is a full media
-// session: created on SETUP, freed on TEARDOWN or when the client session
-// goes away. For this iteration we only bind — no per-packet processing
-// yet; iOS's packets will queue in the OS buffer which is fine for a live
-// test that only needs to confirm the handshake reaches this stage.
+// One media stream in the AirPlay 2 model. iOS sends `streams[]` in the
+// SETUP body; for each entry we bind a (data, control) UDP pair.
+struct StreamChannel {
+    int      type          = 0;  // 96 / 103 / 110
+    uint16_t data_port     = 0;
+    uint16_t control_port  = 0;
+    socket_t data_sock     = INVALID_SOCK;
+    socket_t control_sock  = INVALID_SOCK;
+};
+
+// Owns every UDP socket bound on behalf of one TCP session. Two entry
+// points:
+//
+//   - setup_legacy()     : old RTSP form with Transport header (keeps our
+//                          Python test suite green).
+//   - setup_session()    : AirPlay 2 first-round SETUP — binds a single
+//                          event + timing pair.
+//   - setup_stream()     : AirPlay 2 per-stream SETUP — binds data + ctrl.
+//
+// Lifetime: from first SETUP to TEARDOWN (or socket close). Destruction
+// closes every socket.
 class StreamSession {
 public:
     StreamSession();
@@ -27,24 +44,25 @@ public:
     StreamSession(const StreamSession&)            = delete;
     StreamSession& operator=(const StreamSession&) = delete;
 
-    // Parse the RTSP `Transport:` header, bind matching UDP sockets, and
-    // fill `allocated` with the ports the OS gave us. Returns false only
-    // on hard failure (socket exhaustion).
-    bool setup(const std::string& transport_header, StreamPorts& allocated);
+    bool setup_legacy(const std::string& transport_header, StreamPorts& allocated);
+    bool setup_session(uint16_t& event_port, uint16_t& timing_port);
+    bool setup_stream(int type, uint16_t& data_port, uint16_t& control_port);
 
     void teardown();
 
-    // Generated once, persists across RECORD / GET_PARAMETER / TEARDOWN.
     const std::string& session_id() const { return session_id_; }
 
 private:
-    // Client-advertised ports (we don't send to them in this iteration,
-    // but we keep them logged for the capture analysis tonight).
+    // Legacy path state (used by the RTSP-Transport path).
     StreamPorts client_ports_{};
+    socket_t    data_sock_   = INVALID_SOCK;
+    socket_t    ctrl_sock_   = INVALID_SOCK;
+    socket_t    timing_sock_ = INVALID_SOCK;
 
-    socket_t data_sock_   = INVALID_SOCK;
-    socket_t ctrl_sock_   = INVALID_SOCK;
-    socket_t timing_sock_ = INVALID_SOCK;
+    // AirPlay 2 path state.
+    socket_t    event_sock_     = INVALID_SOCK;
+    socket_t    ap2_timing_sock = INVALID_SOCK;
+    std::vector<StreamChannel> channels_;
 
     std::string session_id_;
 };

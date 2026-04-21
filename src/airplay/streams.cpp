@@ -75,7 +75,7 @@ StreamSession::StreamSession() : session_id_(random_session_id()) {}
 
 StreamSession::~StreamSession() { teardown(); }
 
-bool StreamSession::setup(const std::string& transport, StreamPorts& allocated) {
+bool StreamSession::setup_legacy(const std::string& transport, StreamPorts& allocated) {
     client_ports_.server  = pick_port(transport, "server_port");   // rare from iOS
     client_ports_.control = pick_port(transport, "control_port");
     client_ports_.timing  = pick_port(transport, "timing_port");
@@ -119,13 +119,63 @@ bool StreamSession::setup(const std::string& transport, StreamPorts& allocated) 
     return true;
 }
 
+bool StreamSession::setup_session(uint16_t& event_port, uint16_t& timing_port) {
+    auto [e_sock, e_port] = bind_udp();
+    if (e_sock == INVALID_SOCK) {
+        LOG_ERROR << "SETUP (airplay2 session): cannot bind event socket";
+        return false;
+    }
+    auto [t_sock, t_port] = bind_udp();
+    if (t_sock == INVALID_SOCK) {
+        LOG_ERROR << "SETUP (airplay2 session): cannot bind timing socket";
+        ap::net::close_socket(e_sock);
+        return false;
+    }
+    event_sock_      = e_sock;
+    ap2_timing_sock  = t_sock;
+    event_port       = e_port;
+    timing_port      = t_port;
+    LOG_INFO << "SETUP session=" << session_id_
+             << " airplay2 event=" << e_port << " timing=" << t_port;
+    return true;
+}
+
+bool StreamSession::setup_stream(int type,
+                                 uint16_t& data_port,
+                                 uint16_t& control_port) {
+    auto [d_sock, d_port] = bind_udp();
+    if (d_sock == INVALID_SOCK) return false;
+    auto [c_sock, c_port] = bind_udp();
+    if (c_sock == INVALID_SOCK) { ap::net::close_socket(d_sock); return false; }
+
+    StreamChannel ch;
+    ch.type         = type;
+    ch.data_port    = d_port;
+    ch.control_port = c_port;
+    ch.data_sock    = d_sock;
+    ch.control_sock = c_sock;
+    channels_.push_back(ch);
+
+    data_port    = d_port;
+    control_port = c_port;
+    LOG_INFO << "SETUP session=" << session_id_ << " stream type=" << type
+             << " data=" << d_port << " control=" << c_port;
+    return true;
+}
+
 void StreamSession::teardown() {
-    for (auto* sp : { &data_sock_, &ctrl_sock_, &timing_sock_ }) {
+    for (auto* sp : { &data_sock_, &ctrl_sock_, &timing_sock_,
+                       &event_sock_, &ap2_timing_sock }) {
         if (*sp != INVALID_SOCK) {
             ap::net::close_socket(*sp);
             *sp = INVALID_SOCK;
         }
     }
+    for (auto& ch : channels_) {
+        if (ch.data_sock    != INVALID_SOCK) ap::net::close_socket(ch.data_sock);
+        if (ch.control_sock != INVALID_SOCK) ap::net::close_socket(ch.control_sock);
+    }
+    channels_.clear();
 }
 
 } // namespace ap::airplay
