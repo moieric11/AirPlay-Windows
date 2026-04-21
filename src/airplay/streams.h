@@ -1,5 +1,6 @@
 #pragma once
 
+#include "airplay/mirror_listener.h"
 #include "airplay/ntp_client.h"
 #include "net/socket.h"
 
@@ -56,6 +57,9 @@ public:
     // session (~8 sec).
     bool start_ntp(const std::string& remote_ip, uint16_t remote_port);
 
+    // Partial teardown for AirPlay 2 stream-level TEARDOWN requests.
+    void stop_stream(int type);
+
     void teardown();
 
     const std::string& session_id() const { return session_id_; }
@@ -70,8 +74,9 @@ private:
     // AirPlay 2 path state.
     socket_t    event_sock_     = INVALID_SOCK;
     socket_t    ap2_timing_sock = INVALID_SOCK;
-    std::vector<StreamChannel> channels_;
-    std::unique_ptr<NtpClient> ntp_;
+    std::vector<StreamChannel>      channels_;      // audio streams (UDP)
+    std::unique_ptr<MirrorListener> mirror_;        // video stream (TCP)
+    std::unique_ptr<NtpClient>      ntp_;
 
     std::string session_id_;
 };

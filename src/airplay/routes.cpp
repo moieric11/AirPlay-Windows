@@ -306,14 +306,37 @@ Response handle_record(ClientSession& session, const Request& req) {
     return r;
 }
 
+// TEARDOWN — per UxPlay raop_handler_teardown. iOS may teardown just one
+// stream (type 96 audio or 110 mirror) by sending a plist body
+// `{streams: [{type: N}]}`, or the whole session by sending an empty body.
+// In both cases UxPlay adds `Connection: close` to the response.
 Response handle_teardown(ClientSession& session, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
-    if (session.streams) {
-        LOG_INFO << "TEARDOWN session=" << session.streams->session_id();
-        session.streams.reset();
+    r.set_header("Connection", "close");
+
+    // Try to parse an AirPlay 2 partial-teardown plist.
+    std::vector<int> stream_types;
+    if (!req.body.empty()) {
+        Airplay2SetupRequest parsed;
+        if (parse_airplay2_setup(req.body.data(), req.body.size(), parsed)
+            && parsed.has_streams) {
+            for (const auto& s : parsed.streams) stream_types.push_back(s.type);
+        }
     }
-    session.sdp.reset();
+
+    if (!stream_types.empty() && session.streams) {
+        for (int t : stream_types) {
+            LOG_INFO << "TEARDOWN stream type=" << t;
+            session.streams->stop_stream(t);
+        }
+        // Keep session.streams alive — iOS may retry the stream without
+        // re-doing the session setup.
+    } else if (session.streams) {
+        LOG_INFO << "TEARDOWN full session=" << session.streams->session_id();
+        session.streams.reset();
+        session.sdp.reset();
+    }
     return r;
 }
 

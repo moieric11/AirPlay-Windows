@@ -143,6 +143,31 @@ bool StreamSession::setup_session(uint16_t& event_port, uint16_t& timing_port) {
 bool StreamSession::setup_stream(int type,
                                  uint16_t& data_port,
                                  uint16_t& control_port) {
+    control_port = 0;
+
+    // Type 110 (mirror video) uses a TCP byte stream, not UDP RTP. iOS will
+    // open a TCP connection to the returned dataPort right after SETUP and
+    // push H.264 NAL units over it. UxPlay implements this in raop_rtp_mirror.c.
+    if (type == 110) {
+        mirror_ = std::make_unique<MirrorListener>();
+        uint16_t p = 0;
+        if (!mirror_->start(p)) {
+            mirror_.reset();
+            return false;
+        }
+        data_port = p;
+
+        StreamChannel ch;
+        ch.type         = type;
+        ch.data_port    = p;
+        ch.data_sock    = INVALID_SOCK; // owned by MirrorListener
+        channels_.push_back(ch);
+
+        LOG_INFO << "SETUP session=" << session_id_ << " stream type=110 (TCP) data=" << p;
+        return true;
+    }
+
+    // Type 96 (audio) and any other UDP-based stream.
     auto [d_sock, d_port] = bind_udp();
     if (d_sock == INVALID_SOCK) return false;
     auto [c_sock, c_port] = bind_udp();
@@ -159,8 +184,26 @@ bool StreamSession::setup_stream(int type,
     data_port    = d_port;
     control_port = c_port;
     LOG_INFO << "SETUP session=" << session_id_ << " stream type=" << type
-             << " data=" << d_port << " control=" << c_port;
+             << " (UDP) data=" << d_port << " control=" << c_port;
     return true;
+}
+
+void StreamSession::stop_stream(int type) {
+    LOG_INFO << "stop_stream type=" << type << " session=" << session_id_;
+    if (type == 110 && mirror_) {
+        mirror_->stop();
+        mirror_.reset();
+    }
+    // Remove any audio channels matching the type.
+    for (auto it = channels_.begin(); it != channels_.end(); ) {
+        if (it->type == type) {
+            if (it->data_sock    != INVALID_SOCK) ap::net::close_socket(it->data_sock);
+            if (it->control_sock != INVALID_SOCK) ap::net::close_socket(it->control_sock);
+            it = channels_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 bool StreamSession::start_ntp(const std::string& remote_ip, uint16_t remote_port) {
@@ -173,9 +216,8 @@ bool StreamSession::start_ntp(const std::string& remote_ip, uint16_t remote_port
 }
 
 void StreamSession::teardown() {
-    // NTP thread must stop BEFORE we close its socket, otherwise recvfrom
-    // comes back with an error that looks like a crash in the logs.
-    if (ntp_) { ntp_->stop(); ntp_.reset(); }
+    if (ntp_)    { ntp_->stop();    ntp_.reset(); }
+    if (mirror_) { mirror_->stop(); mirror_.reset(); }
 
     for (auto* sp : { &data_sock_, &ctrl_sock_, &timing_sock_,
                        &event_sock_, &ap2_timing_sock }) {
