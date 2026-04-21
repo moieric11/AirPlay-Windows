@@ -17,6 +17,9 @@ Scenarios:
       msg2, 32B for msg4) even when the FairPlay blobs are stubbed.
       Validates the state machine and routing, not the crypto itself
       (which needs the Apple-extracted tables; see docs/FAIRPLAY.md).
+  T6  Media handshake shape — ANNOUNCE parses an SDP body, SETUP binds
+      real UDP sockets and echoes allocated ports in Transport, RECORD
+      preserves the Session id, TEARDOWN closes everything cleanly.
 
 What this validates:
   * the crypto primitives and byte layouts we used on both sides match
@@ -67,6 +70,7 @@ class Conn:
         self.sock.close()
 
     def rpc(self, method, path, body=b"", extra_headers=None):
+        """Returns (status:int, response_headers:dict[lower], body:bytes)."""
         self.cseq += 1
         headers = {"CSeq": str(self.cseq), "Content-Length": str(len(body))}
         if extra_headers:
@@ -84,18 +88,24 @@ class Conn:
             self.buf += chunk
         head, _, self.buf = self.buf.partition(b"\r\n\r\n")
         status = int(head.split(b" ", 2)[1])
+        resp_headers = {}
         clen = 0
         for line in head.split(b"\r\n")[1:]:
             k, _, v = line.partition(b":")
-            if k.strip().lower() == b"content-length":
-                clen = int(v.strip())
+            if not k:
+                continue
+            key = k.strip().lower().decode()
+            val = v.strip().decode()
+            resp_headers[key] = val
+            if key == "content-length":
+                clen = int(val)
         while len(self.buf) < clen:
             chunk = self.sock.recv(clen - len(self.buf))
             if not chunk:
                 break
             self.buf += chunk
         body, self.buf = self.buf[:clen], self.buf[clen:]
-        return status, body
+        return status, resp_headers, body
 
 
 def derive_key_iv(shared):
@@ -116,7 +126,7 @@ class ClientCrypto:
 
 
 def get_server_identity_pub(conn):
-    status, body = conn.rpc("POST", "/pair-setup")
+    status, _hdrs, body = conn.rpc("POST", "/pair-setup")
     assert status == 200 and len(body) == 32, \
         f"pair-setup failed: status={status} len={len(body)}"
     return body
@@ -128,7 +138,7 @@ def do_pair_verify(conn, client, server_identity_pub,
                    path="/pair-verify"):
     """Returns (round1_status, round2_status, server_sig_ok)."""
     msg1 = b"\x01\x00\x00\x00" + client.x25519_pub + client.ed_pub
-    s1, resp = conn.rpc("POST", path, msg1, headers)
+    s1, _h1, resp = conn.rpc("POST", path, msg1, headers)
     if s1 != 200 or len(resp) != 96:
         return s1, None, False
 
@@ -153,7 +163,7 @@ def do_pair_verify(conn, client, server_identity_pub,
     if break_client_sig:
         client_sig = bytes([client_sig[0] ^ 0x01]) + client_sig[1:]
     msg2 = b"\x00\x00\x00\x00" + dec.update(client_sig)
-    s2, _ = conn.rpc("POST", path, msg2, headers)
+    s2, _h2, _ = conn.rpc("POST", path, msg2, headers)
     return s1, s2, server_sig_ok
 
 
@@ -240,29 +250,82 @@ def t5_fp_setup_framing(r):
         # msg1: 16 bytes starting with "FPLY" magic, mode byte at index 6.
         msg1 = b"FPLY" + b"\x03\x01\x01\x00\x00\x00\x00\x82\x02\x00\x0f\x9f"
         assert len(msg1) == 16
-        s1, body1 = c.rpc("POST", "/fp-setup", msg1)
-        r.check(s1 == 200,          f"fp-setup msg1 status = {s1}")
-        r.check(len(body1) == 142,  f"fp-setup msg2 size = {len(body1)} (expected 142)")
+        s1, _h, body1 = c.rpc("POST", "/fp-setup", msg1)
+        r.check(s1 == 200,           f"fp-setup msg1 status = {s1}")
+        r.check(len(body1) == 142,   f"fp-setup msg2 size = {len(body1)} (expected 142)")
         r.check(body1[:4] == b"FPLY", "fp-setup msg2 starts with FPLY magic")
 
         # msg3: 164 bytes starting with FPLY magic, rest zeros is fine for framing test.
         msg3 = b"FPLY" + b"\x03\x01\x02" + (b"\x00" * (164 - 7))
         assert len(msg3) == 164
-        s2, body2 = c.rpc("POST", "/fp-setup", msg3)
+        s2, _h, body2 = c.rpc("POST", "/fp-setup", msg3)
         r.check(s2 == 200,          f"fp-setup msg3 status = {s2}")
         r.check(len(body2) == 32,   f"fp-setup msg4 size = {len(body2)} (expected 32)")
-
-        # Wrong length → 400.
-        s3, _ = c.rpc("POST", "/fp-setup", b"FPLY\x03\x01" + b"\x00" * 10)  # 16? adjust
-        # Our stub accepts 16B as msg1; let's send 42B which matches nothing.
     finally:
         c.close()
 
     # Reject-unknown-length check on a separate connection.
     c = Conn(HOST, PORT)
     try:
-        s3, _ = c.rpc("POST", "/fp-setup", b"FPLY" + b"\x00" * 38)  # 42 bytes
+        s3, _h, _ = c.rpc("POST", "/fp-setup", b"FPLY" + b"\x00" * 38)  # 42 bytes
         r.check(s3 != 200, f"fp-setup with bogus length ({s3}) -> non-200")
+    finally:
+        c.close()
+
+
+SAMPLE_SDP = (
+    "v=0\r\n"
+    "o=iTunes 999999 0 IN IP4 127.0.0.1\r\n"
+    "s=iTunes\r\n"
+    "c=IN IP4 127.0.0.1\r\n"
+    "t=0 0\r\n"
+    "m=audio 0 RTP/AVP 96\r\n"
+    "a=rtpmap:96 AppleLossless\r\n"
+    "a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n"
+    "a=rsaaeskey:ZmFrZWFlc2tleWJsb2I=\r\n"
+    "a=aesiv:ZmFrZWFlc2l2YmxvYg==\r\n"
+)
+
+
+def t6_media_handshake_shape(r):
+    print("T6  ANNOUNCE -> SETUP -> RECORD -> TEARDOWN")
+    c = Conn(HOST, PORT)
+    try:
+        url = f"rtsp://{HOST}:{PORT}/stream"
+        # ANNOUNCE with a realistic audio-only SDP.
+        s, _h, _b = c.rpc("ANNOUNCE", url, SAMPLE_SDP.encode(),
+                          {"Content-Type": "application/sdp"})
+        r.check(s == 200, f"ANNOUNCE status = {s}")
+
+        # SETUP with iOS-style Transport header.
+        s, hdrs, _b = c.rpc("SETUP", url, b"",
+                            {"Transport": "RTP/AVP/UDP;unicast;mode=record;"
+                                          "control_port=60001;timing_port=60002"})
+        r.check(s == 200, f"SETUP status = {s}")
+
+        # Verify server echoed back a Transport with real allocated ports and
+        # a Session id that persists across later requests.
+        transport = hdrs.get("transport", "")
+        session_id = hdrs.get("session", "")
+        r.check("server_port=" in transport,  f"Transport has server_port: {transport!r}")
+        r.check("control_port=" in transport, f"Transport has control_port: {transport!r}")
+        r.check("timing_port="  in transport, f"Transport has timing_port: {transport!r}")
+        r.check(session_id != "",              f"SETUP returned Session id: {session_id!r}")
+
+        def port_of(t, k):
+            import re
+            m = re.search(rf"{k}=(\d+)", t)
+            return int(m.group(1)) if m else 0
+        sp = port_of(transport, "server_port")
+        r.check(sp > 0 and sp != 60001,        f"server_port allocated (got {sp})")
+
+        s, hdrs2, _ = c.rpc("RECORD", url, b"", {"Session": session_id})
+        r.check(s == 200, f"RECORD status = {s}")
+        r.check(hdrs2.get("session", "") == session_id,
+                "RECORD echoes same Session id")
+
+        s, _h, _ = c.rpc("TEARDOWN", url, b"", {"Session": session_id})
+        r.check(s == 200, f"TEARDOWN status = {s}")
     finally:
         c.close()
 
@@ -273,7 +336,8 @@ def main():
                t2_ios_headers_and_absolute_uri,
                t3_bad_client_signature,
                t4_concurrent_sessions,
-               t5_fp_setup_framing):
+               t5_fp_setup_framing,
+               t6_media_handshake_shape):
         try:
             fn(r)
         except Exception as e:

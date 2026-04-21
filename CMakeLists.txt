@@ -65,7 +65,9 @@ add_executable(airplay-windows
     src/crypto/fairplay.cpp
     src/airplay/info_plist.cpp
     src/airplay/rtsp_parser.cpp
+    src/airplay/sdp.cpp
     src/airplay/server.cpp
+    src/airplay/streams.cpp
     src/airplay/routes.cpp
 )
 

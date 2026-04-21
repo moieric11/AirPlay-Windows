@@ -1,11 +1,14 @@
 #include "airplay/routes.h"
 #include "airplay/client_session.h"
 #include "airplay/info_plist.h"
+#include "airplay/sdp.h"
+#include "airplay/streams.h"
 #include "crypto/fairplay.h"
 #include "crypto/pair_verify.h"
 #include "log.h"
 
 #include <sstream>
+#include <string>
 
 namespace ap::airplay {
 namespace {
@@ -131,6 +134,99 @@ Response handle_fp_setup(ClientSession& session, const Request& req) {
     return r;
 }
 
+// ANNOUNCE carries an SDP body describing the media the client will send.
+// We parse what we can (iOS is friendly enough to include codec info even
+// when the body is heavily FairPlay-encrypted-key-laden) and stash it on
+// the session so SETUP can reference it.
+Response handle_announce(ClientSession& session, const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+
+    auto sdp = std::make_unique<SdpSession>();
+    std::string body_str(reinterpret_cast<const char*>(req.body.data()),
+                         req.body.size());
+    if (!parse_sdp(body_str, *sdp)) {
+        LOG_WARN << "ANNOUNCE: SDP body rejected (not SDP?)";
+        r.status_code = 400;
+        r.status_text = "Bad Request";
+        return r;
+    }
+    LOG_INFO << "ANNOUNCE medias=" << sdp->medias.size()
+             << "  rsaaeskey="    << (sdp->rsaaeskey_b64.empty() ? "no" : "yes")
+             << "  aesiv="        << (sdp->aesiv_b64.empty()     ? "no" : "yes");
+    for (const auto& m : sdp->medias) {
+        LOG_INFO << "  m=" << m.type << " pt=" << m.payload_type
+                 << " rtpmap=\"" << m.rtpmap << "\"";
+    }
+    session.sdp = std::move(sdp);
+    return r;
+}
+
+// SETUP negotiates the UDP transport. We parse the client's Transport
+// header, bind matching UDP sockets on our side and echo the allocated
+// ports back. Session: header persists for later TEARDOWN.
+Response handle_setup(ClientSession& session, const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+
+    auto transport = req.header("transport");
+    if (transport.empty()) {
+        LOG_ERROR << "SETUP: missing Transport header";
+        r.status_code = 400; r.status_text = "Bad Request";
+        return r;
+    }
+
+    if (!session.streams) {
+        session.streams = std::make_unique<StreamSession>();
+    }
+
+    StreamPorts allocated;
+    if (!session.streams->setup(transport, allocated)) {
+        r.status_code = 500; r.status_text = "Internal Server Error";
+        return r;
+    }
+
+    std::ostringstream os;
+    os << "RTP/AVP/UDP;unicast;mode=record"
+       << ";server_port=" << allocated.server;
+    if (allocated.control) os << ";control_port=" << allocated.control;
+    if (allocated.timing)  os << ";timing_port="  << allocated.timing;
+    r.set_header("Transport", os.str());
+    r.set_header("Session",   session.streams->session_id());
+    return r;
+}
+
+Response handle_record(ClientSession& session, const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+
+    if (!session.streams) {
+        LOG_WARN << "RECORD without prior SETUP";
+        r.status_code = 455; r.status_text = "Method Not Valid In This State";
+        return r;
+    }
+    // iOS expects Session on RECORD response as well.
+    r.set_header("Session", session.streams->session_id());
+    // TODO: once FairPlay blobs are provisioned and stream keys decrypted,
+    // spin up workers here that read from the bound UDP sockets. For now
+    // iOS's packets queue in the kernel — enough to confirm via Wireshark
+    // that the client did reach RECORD and is actively pushing media.
+    LOG_INFO << "RECORD: session=" << session.streams->session_id()
+             << " — stream worker not started (FairPlay blobs required)";
+    return r;
+}
+
+Response handle_teardown(ClientSession& session, const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    if (session.streams) {
+        LOG_INFO << "TEARDOWN session=" << session.streams->session_id();
+        session.streams.reset();
+    }
+    session.sdp.reset();
+    return r;
+}
+
 Response handle_unimplemented(const Request& req, const char* what) {
     Response r = make(501, "Not Implemented");
     copy_cseq(req, r);
@@ -168,14 +264,10 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
             "GET_PARAMETER, SET_PARAMETER, POST, GET");
         return r;
     }
-    if (req.method == "ANNOUNCE")    return handle_unimplemented(req, "ANNOUNCE (SDP)");
-    if (req.method == "SETUP")       return handle_unimplemented(req, "SETUP (stream ports)");
-    if (req.method == "RECORD")      return handle_unimplemented(req, "RECORD");
-    if (req.method == "TEARDOWN")    {
-        Response r = make(200, "OK");
-        copy_cseq(req, r);
-        return r;
-    }
+    if (req.method == "ANNOUNCE")    return handle_announce(session, req);
+    if (req.method == "SETUP")       return handle_setup   (session, req);
+    if (req.method == "RECORD")      return handle_record  (session, req);
+    if (req.method == "TEARDOWN")    return handle_teardown(session, req);
     if (req.method == "GET_PARAMETER" || req.method == "SET_PARAMETER") {
         Response r = make(200, "OK");
         copy_cseq(req, r);
