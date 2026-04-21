@@ -93,36 +93,52 @@ int send_all(socket_t s, const void* buf, int len) {
     return sent;
 }
 
+// "Connect" a UDP socket to a public address and read back the local address
+// the OS routing table assigned. No packet is actually sent — `connect` on a
+// UDP socket only selects the outbound interface. This bypasses virtual
+// adapters (Hyper-V, VMware, WSL) that would otherwise be picked by a naive
+// "first non-loopback" enumeration.
+namespace {
+std::string primary_ipv4_via_route() {
+    socket_t s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCK) return "0.0.0.0";
+
+    sockaddr_in peer{};
+    peer.sin_family = AF_INET;
+    peer.sin_port   = htons(53);
+    inet_pton(AF_INET, "8.8.8.8", &peer.sin_addr);
+
+    std::string result = "0.0.0.0";
+    if (::connect(s, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) == 0) {
+        sockaddr_in local{};
+#if defined(_WIN32)
+        int len = sizeof(local);
+#else
+        socklen_t len = sizeof(local);
+#endif
+        if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+            char buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &local.sin_addr, buf, sizeof(buf));
+            result = buf;
+        }
+    }
+    close_socket(s);
+    return result;
+}
+} // namespace
+
 #if defined(_WIN32)
 
 std::string primary_ipv4() {
-    ULONG size = 15 * 1024;
-    std::vector<unsigned char> buf;
-    IP_ADAPTER_ADDRESSES* adapters = nullptr;
-    DWORD rc;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        buf.resize(size);
-        adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
-        rc = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
-                                  nullptr, adapters, &size);
-        if (rc != ERROR_BUFFER_OVERFLOW) break;
-    }
-    if (rc != NO_ERROR) return "0.0.0.0";
-
-    for (auto* a = adapters; a; a = a->Next) {
-        if (a->OperStatus != IfOperStatusUp) continue;
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-        for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
-            auto* sa = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr);
-            char s[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &sa->sin_addr, s, sizeof(s));
-            return s;
-        }
-    }
-    return "0.0.0.0";
+    return primary_ipv4_via_route();
 }
 
 std::string primary_mac() {
+    // Find the adapter whose IPv4 matches primary_ipv4() and return its MAC.
+    // This way the MAC and IP always belong to the same interface — iOS
+    // correlates `deviceid` (MAC) and the RTSP socket IP.
+    const std::string target_ip = primary_ipv4();
+
     ULONG size = 15 * 1024;
     std::vector<unsigned char> buf(size);
     auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
@@ -135,14 +151,21 @@ std::string primary_mac() {
     if (rc != NO_ERROR) return "02:00:00:00:00:00";
 
     for (auto* a = adapters; a; a = a->Next) {
-        if (a->OperStatus != IfOperStatusUp) continue;
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
         if (a->PhysicalAddressLength != 6) continue;
-        char out[18];
-        std::snprintf(out, sizeof(out), "%02X:%02X:%02X:%02X:%02X:%02X",
-                      a->PhysicalAddress[0], a->PhysicalAddress[1], a->PhysicalAddress[2],
-                      a->PhysicalAddress[3], a->PhysicalAddress[4], a->PhysicalAddress[5]);
-        return out;
+        for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+            auto* sa = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr);
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
+            if (target_ip == ip) {
+                char out[18];
+                std::snprintf(out, sizeof(out),
+                              "%02X:%02X:%02X:%02X:%02X:%02X",
+                              a->PhysicalAddress[0], a->PhysicalAddress[1],
+                              a->PhysicalAddress[2], a->PhysicalAddress[3],
+                              a->PhysicalAddress[4], a->PhysicalAddress[5]);
+                return out;
+            }
+        }
     }
     return "02:00:00:00:00:00";
 }
@@ -150,20 +173,7 @@ std::string primary_mac() {
 #else
 
 std::string primary_ipv4() {
-    ifaddrs* ifa = nullptr;
-    if (getifaddrs(&ifa) != 0) return "0.0.0.0";
-    std::string result = "0.0.0.0";
-    for (auto* p = ifa; p; p = p->ifa_next) {
-        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
-        if (p->ifa_flags & IFF_LOOPBACK) continue;
-        auto* sa = reinterpret_cast<sockaddr_in*>(p->ifa_addr);
-        char s[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &sa->sin_addr, s, sizeof(s));
-        result = s;
-        break;
-    }
-    freeifaddrs(ifa);
-    return result;
+    return primary_ipv4_via_route();
 }
 
 std::string primary_mac() {
