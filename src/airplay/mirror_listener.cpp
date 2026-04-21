@@ -60,17 +60,39 @@ uint32_t get_u32_be(const unsigned char* b, int off) {
          |  static_cast<uint32_t>(b[off + 3]);
 }
 
-// SPS/PPS packet layout (unencrypted, first frame iOS sends):
-//   [4B len-BE] SPS NAL bytes | [4B len-BE] PPS NAL bytes
-// Attempts to extract the SPS and parse size / profile / level. Returns
-// true iff a plausible SPS was found AND parsed successfully.
+// SPS_PPS packet payload is the AVCC "avcC" decoder configuration record
+// (ISO 14496-15 §5.2.4.1.1), not a raw length-prefixed NAL pair:
+//
+//   [0]    configurationVersion = 1
+//   [1]    AVCProfileIndication
+//   [2]    profile_compatibility
+//   [3]    AVCLevelIndication
+//   [4]    reserved(6)=1 + lengthSizeMinusOne(2)
+//   [5]    reserved(3)=1 + numOfSequenceParameterSets(5)
+//   [6..7] sequenceParameterSetLength (BE uint16)  ← assumes numSPS >= 1
+//   [8..]  SPS NAL bytes (incl. 1-byte NAL header)
+//   then:  numOfPictureParameterSets, ppsLength(BE16), PPS NAL
+//
+// We only parse the first SPS — plenty for a human-readable video line.
 bool log_sps_from_sps_pps_payload(const std::vector<unsigned char>& payload) {
-    if (payload.size() < 5) return false;
+    if (payload.size() < 8 || payload[0] != 0x01) {
+        LOG_WARN << "mirror: SPS/PPS — unexpected format, first byte 0x"
+                 << std::hex << static_cast<int>(payload.empty() ? 0 : payload[0]);
+        return false;
+    }
 
-    uint32_t sps_len = get_u32_be(payload.data(), 0);
-    if (sps_len == 0 || sps_len > payload.size() - 4) return false;
+    uint8_t num_sps = payload[5] & 0x1f;
+    if (num_sps == 0) {
+        LOG_WARN << "mirror: avcC declares 0 SPS";
+        return false;
+    }
+    uint32_t sps_len = (static_cast<uint32_t>(payload[6]) << 8) | payload[7];
+    if (sps_len == 0 || sps_len + 8 > payload.size()) {
+        LOG_WARN << "mirror: avcC SPS length " << sps_len << " out of range";
+        return false;
+    }
 
-    const uint8_t* sps = payload.data() + 4;
+    const uint8_t* sps = payload.data() + 8;
     ap::airplay::SpsInfo info;
     if (!ap::airplay::parse_h264_sps(sps, sps_len, info)) {
         LOG_WARN << "mirror: SPS present but failed to parse";
