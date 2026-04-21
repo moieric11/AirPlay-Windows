@@ -18,9 +18,15 @@ namespace ap::airplay {
 // Sessions are allocated lazily to avoid paying their cost on connections
 // that never reach the corresponding stage.
 struct ClientSession {
-    explicit ClientSession(const ap::crypto::Identity& id) : identity(id) {}
+    ClientSession(const ap::crypto::Identity& id, std::string peer_ip)
+        : identity(id), remote_ip(std::move(peer_ip)) {}
 
     const ap::crypto::Identity& identity;
+
+    // iOS IP only (no port). Used as destination for the NTP client probes
+    // we send once SETUP is done.
+    std::string remote_ip;
+
     std::unique_ptr<ap::crypto::PairVerifySession> pair_verify;
     std::unique_ptr<ap::crypto::FairPlaySession>   fairplay;
 

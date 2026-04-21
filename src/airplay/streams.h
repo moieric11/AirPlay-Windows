@@ -1,8 +1,10 @@
 #pragma once
 
+#include "airplay/ntp_client.h"
 #include "net/socket.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -48,6 +50,12 @@ public:
     bool setup_session(uint16_t& event_port, uint16_t& timing_port);
     bool setup_stream(int type, uint16_t& data_port, uint16_t& control_port);
 
+    // Start the NTP client thread that polls iOS's timing server at
+    // (remote_ip, remote_port) from our timing socket bound by setup_session().
+    // Must be called AFTER setup_session and before iOS gives up on the
+    // session (~8 sec).
+    bool start_ntp(const std::string& remote_ip, uint16_t remote_port);
+
     void teardown();
 
     const std::string& session_id() const { return session_id_; }
@@ -63,6 +71,7 @@ private:
     socket_t    event_sock_     = INVALID_SOCK;
     socket_t    ap2_timing_sock = INVALID_SOCK;
     std::vector<StreamChannel> channels_;
+    std::unique_ptr<NtpClient> ntp_;
 
     std::string session_id_;
 };

@@ -236,6 +236,18 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
         // `event_port` is bound but unused; UxPlay always returns 0.
         (void)event_port;
         response.add_session(timing_port);
+
+        // Start the NTP client polling iOS's timing server. Without this,
+        // iOS tears down the session ~8 seconds after stream SETUP because
+        // it can't sync the media clock.
+        if (parsed.timing_rport && !session.remote_ip.empty()) {
+            session.streams->start_ntp(session.remote_ip,
+                                       static_cast<uint16_t>(parsed.timing_rport));
+        } else {
+            LOG_WARN << "skipping NTP client: timing_rport="
+                     << parsed.timing_rport
+                     << " remote_ip=\"" << session.remote_ip << '"';
+        }
     }
 
     // Branch 2: stream setup (streams[] present).

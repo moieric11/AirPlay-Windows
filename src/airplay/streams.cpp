@@ -163,7 +163,20 @@ bool StreamSession::setup_stream(int type,
     return true;
 }
 
+bool StreamSession::start_ntp(const std::string& remote_ip, uint16_t remote_port) {
+    if (ap2_timing_sock == INVALID_SOCK) {
+        LOG_ERROR << "start_ntp: timing socket not bound (call setup_session first)";
+        return false;
+    }
+    ntp_ = std::make_unique<NtpClient>();
+    return ntp_->start(ap2_timing_sock, remote_ip, remote_port);
+}
+
 void StreamSession::teardown() {
+    // NTP thread must stop BEFORE we close its socket, otherwise recvfrom
+    // comes back with an error that looks like a crash in the logs.
+    if (ntp_) { ntp_->stop(); ntp_.reset(); }
+
     for (auto* sp : { &data_sock_, &ctrl_sock_, &timing_sock_,
                        &event_sock_, &ap2_timing_sock }) {
         if (*sp != INVALID_SOCK) {

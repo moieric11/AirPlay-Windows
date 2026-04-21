@@ -18,7 +18,13 @@ void Server::stop() {
 void Server::handle_client(ap::net::ClientSocket client) {
     RequestReader reader;
     Request req;
-    ClientSession session(*ctx_.identity);
+
+    // Peer is "ip:port"; split off the IP for the NTP client destination.
+    std::string peer_ip = client.peer;
+    auto colon = peer_ip.rfind(':');
+    if (colon != std::string::npos) peer_ip.resize(colon);
+
+    ClientSession session(*ctx_.identity, peer_ip);
 
     while (reader.read(static_cast<int>(client.fd), req)) {
         Response res = dispatch(ctx_, session, req);
