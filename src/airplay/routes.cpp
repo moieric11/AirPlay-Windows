@@ -305,6 +305,41 @@ Response handle_teardown(ClientSession& session, const Request& req) {
     return r;
 }
 
+// GET_PARAMETER text/parameters. iOS queries properties of the receiver
+// through this method — currently always "volume\r\n" in mirroring mode.
+// UxPlay returns the current audio volume; since we don't render audio
+// we answer a fixed -144.0 dB (mute) which iOS accepts.
+Response handle_get_parameter(const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    r.set_header("Content-Type", "text/parameters");
+
+    std::string body_str(reinterpret_cast<const char*>(req.body.data()),
+                         req.body.size());
+    std::string out;
+    if (body_str.find("volume") != std::string::npos) {
+        out = "volume: 0.000000\r\n";
+    } else {
+        LOG_WARN << "GET_PARAMETER: unknown parameter body=\"" << body_str << '"';
+    }
+    r.body.assign(out.begin(), out.end());
+    return r;
+}
+
+// SET_PARAMETER carries volume updates, track metadata, progress, etc.
+// Acknowledge with 200; logging the body helps diagnose what iOS is trying
+// to tell us.
+Response handle_set_parameter(const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    if (!req.body.empty()) {
+        std::string body_str(reinterpret_cast<const char*>(req.body.data()),
+                             std::min<std::size_t>(req.body.size(), 128));
+        LOG_INFO << "SET_PARAMETER body=\"" << body_str << '"';
+    }
+    return r;
+}
+
 Response handle_unimplemented(const Request& req, const char* what) {
     Response r = make(501, "Not Implemented");
     copy_cseq(req, r);
@@ -346,11 +381,8 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "SETUP")       return handle_setup   (session, req);
     if (req.method == "RECORD")      return handle_record  (session, req);
     if (req.method == "TEARDOWN")    return handle_teardown(session, req);
-    if (req.method == "GET_PARAMETER" || req.method == "SET_PARAMETER") {
-        Response r = make(200, "OK");
-        copy_cseq(req, r);
-        return r;
-    }
+    if (req.method == "GET_PARAMETER")  return handle_get_parameter(req);
+    if (req.method == "SET_PARAMETER")  return handle_set_parameter(req);
 
     return handle_unimplemented(req, "unknown route");
 }
