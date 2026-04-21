@@ -188,9 +188,16 @@ Response setup_legacy_path(ClientSession& session, const Request& req) {
     return r;
 }
 
-// AirPlay 2 SETUP: binary-plist body. Two shapes depending on whether the
-// dict carries a `streams[]` array. We log what we parsed, bind UDPs,
-// and answer with a plist carrying the allocated ports.
+// AirPlay 2 SETUP. Ported from UxPlay's raop_handler_setup: two independent
+// branches (session / streams) may both fire on the SAME request, so we
+// NEVER if/else between them. A request with ekey+eiv is a "session" setup;
+// a request with streams[] is a "stream" setup; a request with both is a
+// combined setup (rare but allowed).
+//
+// NOTE: even when this handler returns 200 with a correct plist, iPhone
+// will disconnect after ~30s because the UDP timing port is bound but
+// nothing is listening for NTP queries from iOS. Porting the NTP
+// responder from UxPlay's lib/raop_ntp.c is the next milestone.
 Response setup_airplay2_path(ClientSession& session, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
@@ -204,6 +211,34 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
 
     if (!session.streams) session.streams = std::make_unique<StreamSession>();
 
+    Airplay2SetupResponse response;
+
+    // Branch 1: session setup (ekey + eiv present).
+    if (parsed.has_keys) {
+        if (parsed.is_remote_control_only) {
+            LOG_ERROR << "airplay2 SETUP: client requested isRemoteControlOnly — "
+                         "only legacy NTP timing is supported";
+            r.status_code = 500; r.status_text = "Internal Server Error";
+            return r;
+        }
+        // TODO: pass parsed.ekey through fairplay_decrypt() to recover the
+        // AES-128 stream key, then stash it + parsed.eiv on the session.
+        // Requires level-B playfair — see docs/FAIRPLAY.md. For now we just
+        // log and keep going: iPhone only checks fairplay return during
+        // actual stream decryption, not during SETUP itself.
+        LOG_WARN << "airplay2 SETUP: fairplay_decrypt skipped (playfair not yet wired)";
+
+        uint16_t event_port = 0, timing_port = 0;
+        if (!session.streams->setup_session(event_port, timing_port)) {
+            r.status_code = 500; r.status_text = "Internal Server Error";
+            return r;
+        }
+        // `event_port` is bound but unused; UxPlay always returns 0.
+        (void)event_port;
+        response.add_session(timing_port);
+    }
+
+    // Branch 2: stream setup (streams[] present).
     if (parsed.has_streams) {
         std::vector<StreamAllocation> alloc(parsed.streams.size());
         for (std::size_t i = 0; i < parsed.streams.size(); ++i) {
@@ -216,16 +251,10 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
             alloc[i].data_port    = d;
             alloc[i].control_port = c;
         }
-        r.body = build_airplay2_setup_streams_response(parsed.streams, alloc);
-    } else {
-        uint16_t event_port = 0, timing_port = 0;
-        if (!session.streams->setup_session(event_port, timing_port)) {
-            r.status_code = 500; r.status_text = "Internal Server Error";
-            return r;
-        }
-        r.body = build_airplay2_setup_session_response(event_port, timing_port);
+        response.add_streams(parsed.streams, alloc);
     }
 
+    r.body = response.serialize();
     r.set_header("Session", session.streams->session_id());
     return r;
 }

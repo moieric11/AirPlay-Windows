@@ -1,60 +1,91 @@
 #pragma once
 
-// AirPlay 2 SETUP: binary-plist body instead of the legacy RTSP
-// `Transport:` header. Two request flavours arrive on the same
-// connection:
+// AirPlay 2 SETUP — binary-plist body. Ported from UxPlay's
+// lib/raop_handlers.h `raop_handler_setup` (GPL-3.0). Two request flavours
+// can fire on the SAME request (UxPlay treats them as independent branches):
 //
-//   1. "Session setup" — dictionary without a `streams` key. iOS tells
-//      us its sessionUUID, timingProtocol, etc. We answer with the
-//      two UDP ports we bound for event + timing.
+//   "session setup"  — dict contains `ekey` (72-byte FairPlay-encrypted
+//                      AES-128 session key) and `eiv` (16-byte IV). Triggers
+//                      the fairplay_decrypt step and adds `eventPort` +
+//                      `timingPort` to the response.
 //
-//   2. "Stream setup" — dictionary with `streams: [ ... ]`. Each
-//      entry describes one media stream (mirroring video, buffered
-//      audio, realtime audio). For each we bind a (data, control)
-//      UDP pair and echo the allocated ports in the response.
+//   "stream setup"   — dict contains `streams: [ { type, … } ]`. For each
+//                      entry we bind UDP sockets and append a corresponding
+//                      response entry with dataPort / controlPort / type.
 //
-// Parsing and response building live here; the handler in routes.cpp
-// just picks which to call based on whether `streams` is present.
+// Stream types observed in practice:
+//   96  — audio (buffered ALAC/AAC)
+//   110 — mirroring video (H.264)
 
 #include "airplay/streams.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace ap::airplay {
 
-// One `streams[]` entry.
 struct StreamRequest {
-    int      type           = 0;   // 96 = buffered audio, 103 = realtime audio, 110 = mirroring video
-    int      control_port   = 0;   // iOS's own control port (info, we don't need to bind to it)
-    uint64_t stream_conn_id = 0;   // opaque ID echoed back
+    int      type             = 0;   // 96 = audio, 110 = mirror video
+    uint64_t stream_conn_id   = 0;   // type 110: seeds the AES-CTR video key
+    int      remote_control_port = 0; // type 96: iOS's own control port
+    int      ct               = 0;   // type 96: compression type
+    int      spf              = 0;   // type 96: samples per frame
+    uint64_t audio_format     = 0;
 };
 
-// Parsed high-level view of the request body.
 struct Airplay2SetupRequest {
+    // Session-setup branch.
+    bool                    has_keys = false;     // true iff ekey+eiv both present
+    std::vector<unsigned char> ekey;              // 72 bytes (RSA-AES blob)
+    std::vector<unsigned char> eiv;               // 16 bytes
+    std::string             device_id;
+    std::string             model;
+    std::string             name;
+    std::string             timing_protocol;      // typically "NTP"
+    uint64_t                timing_rport = 0;     // iOS's own timing port
+    bool                    is_remote_control_only = false;
+
+    // Stream-setup branch.
     bool                       has_streams = false;
     std::vector<StreamRequest> streams;
 };
 
-// Returns true iff body is a valid bplist00 and we could parse enough.
 bool parse_airplay2_setup(const unsigned char* body, std::size_t len,
                           Airplay2SetupRequest& out);
 
-// Build the plist response for a "session setup" (no streams). The
-// caller has already bound UDP sockets for `event` and `timing`.
-std::vector<unsigned char>
-build_airplay2_setup_session_response(uint16_t event_port, uint16_t timing_port);
+// --- Response builder ---
+//
+// UxPlay builds ONE response dict by unconditionally letting both branches
+// append their fields, so the builder mirrors that: start with an empty
+// dict, add session fields if the request had keys, add streams array if
+// the request had streams.
 
-// Build the plist response for a "stream setup". `allocated[i]` is the
-// (data, control) pair for `request[i]`.
 struct StreamAllocation {
     uint16_t data_port    = 0;
     uint16_t control_port = 0;
 };
-std::vector<unsigned char>
-build_airplay2_setup_streams_response(
-    const std::vector<StreamRequest>&    requests,
-    const std::vector<StreamAllocation>& allocated);
+
+class Airplay2SetupResponse {
+public:
+    Airplay2SetupResponse();
+    ~Airplay2SetupResponse();
+
+    // Session branch. eventPort is ALWAYS 0 in mirror/audio mode per UxPlay;
+    // only timingPort carries a real bound value.
+    void add_session(uint16_t timing_lport);
+
+    // Stream branch. `requests` and `allocated` must be the same size.
+    void add_streams(const std::vector<StreamRequest>& requests,
+                     const std::vector<StreamAllocation>& allocated);
+
+    // Serialize to bplist00.
+    std::vector<unsigned char> serialize();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 } // namespace ap::airplay
