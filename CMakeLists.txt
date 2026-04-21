@@ -68,6 +68,7 @@ add_executable(airplay-windows
     src/crypto/pair_verify.cpp
     src/crypto/fairplay.cpp
     src/airplay/airplay2_setup.cpp
+    src/airplay/h264_sps.cpp
     src/airplay/info_plist.cpp
     src/airplay/mirror_listener.cpp
     src/airplay/ntp_client.cpp

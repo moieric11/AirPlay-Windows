@@ -1,9 +1,11 @@
 #include "airplay/mirror_listener.h"
+#include "airplay/h264_sps.h"
 #include "log.h"
 
 #include <array>
 #include <cstring>
 #include <map>
+#include <sstream>
 #include <vector>
 
 #if defined(_WIN32)
@@ -49,6 +51,48 @@ uint32_t get_u32_le(const unsigned char* b, int off) {
          | (static_cast<uint32_t>(b[off + 1]) <<  8)
          | (static_cast<uint32_t>(b[off + 2]) << 16)
          | (static_cast<uint32_t>(b[off + 3]) << 24);
+}
+
+uint32_t get_u32_be(const unsigned char* b, int off) {
+    return (static_cast<uint32_t>(b[off + 0]) << 24)
+         | (static_cast<uint32_t>(b[off + 1]) << 16)
+         | (static_cast<uint32_t>(b[off + 2]) <<  8)
+         |  static_cast<uint32_t>(b[off + 3]);
+}
+
+// SPS/PPS packet layout (unencrypted, first frame iOS sends):
+//   [4B len-BE] SPS NAL bytes | [4B len-BE] PPS NAL bytes
+// Attempts to extract the SPS and parse size / profile / level. Returns
+// true iff a plausible SPS was found AND parsed successfully.
+bool log_sps_from_sps_pps_payload(const std::vector<unsigned char>& payload) {
+    if (payload.size() < 5) return false;
+
+    uint32_t sps_len = get_u32_be(payload.data(), 0);
+    if (sps_len == 0 || sps_len > payload.size() - 4) return false;
+
+    const uint8_t* sps = payload.data() + 4;
+    ap::airplay::SpsInfo info;
+    if (!ap::airplay::parse_h264_sps(sps, sps_len, info)) {
+        LOG_WARN << "mirror: SPS present but failed to parse";
+        return false;
+    }
+
+    LOG_INFO << "mirror video: H.264 " << ap::airplay::profile_name(info.profile_idc)
+             << " level " << (info.level_idc / 10) << '.' << (info.level_idc % 10)
+             << ", " << info.width << 'x' << info.height
+             << (info.interlaced ? " (interlaced)" : "");
+    return true;
+}
+
+std::string hex_dump(const unsigned char* b, std::size_t n, std::size_t max = 32) {
+    std::ostringstream os;
+    for (std::size_t i = 0; i < n && i < max; ++i) {
+        char tmp[4];
+        std::snprintf(tmp, sizeof(tmp), "%02x ", b[i]);
+        os << tmp;
+    }
+    if (n > max) os << "...(" << n << "B)";
+    return os.str();
 }
 
 uint64_t get_u64_le(const unsigned char* b, int off) {
@@ -230,6 +274,13 @@ void MirrorListener::reader_loop(socket_t client) {
                      << "  size=" << payload_size
                      << "  opt=0x" << std::hex << fopt << std::dec
                      << "  ts=" << ts;
+        }
+
+        // Only once, on the first SPS/PPS frame, log the raw bytes and try
+        // to decode the SPS into a human-readable video description.
+        if (ftype == kFrameSpsPps && counts[kFrameSpsPps] == 1 && !payload.empty()) {
+            LOG_INFO << "mirror SPS/PPS hex: " << hex_dump(payload.data(), payload.size());
+            log_sps_from_sps_pps_payload(payload);
         }
 
         if ((frames % 500) == 0) {
