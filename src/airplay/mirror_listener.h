@@ -8,16 +8,28 @@
 
 namespace ap::airplay {
 
-// TCP accept loop for AirPlay 2 mirror stream (type 110).
+// TCP listener + frame parser for the AirPlay 2 mirror stream (type 110).
 //
-// Ported from UxPlay's raop_rtp_mirror.c: the mirror video stream is NOT
-// a UDP RTP flow — it's a TCP socket. iOS opens one connection to our
-// allocated data port right after SETUP, then streams H.264 NAL units
-// over the TCP byte stream until TEARDOWN.
+// Ported from UxPlay's raop_rtp_mirror.c (GPL-3.0). The mirror stream is a
+// TCP byte stream in which each frame is a 128-byte little-endian header
+// followed by a variable-length payload:
 //
-// For now we only drain the bytes and count them. Decrypting + decoding
-// comes later (requires level-B playfair for the AES key from ekey, plus
-// an H.264 decoder).
+//   [0..3]   payload_size  — LE uint32
+//   [4..5]   payload_type  — (see table below)
+//   [6..7]   payload_option
+//   [8..15]  timestamp     — LE uint64 (NTP-like, fraction in low 32 bits)
+//   [16..127] reserved / image-size data for SPS/PPS packets
+//   [128..]  payload (NAL units: encrypted H.264 or clear SPS/PPS)
+//
+// payload_type values (first 2 bytes at offset 4..5):
+//   0x00 0x00 → AES-CTR encrypted VCL NAL type 1 (non-IDR video frame)
+//   0x00 0x10 → AES-CTR encrypted VCL NAL type 5 (IDR keyframe)
+//   0x01 0x00 → CLEAR SPS + PPS (types 7 + 8), sent at init and format changes
+//   0x02 0x00 → old-protocol heartbeat, no payload
+//   0x05 0x00 → "streaming report" (once per second, no video)
+//
+// For now we parse, count, and log. Decryption + H.264 decode is the next
+// milestone (needs playfair for the AES key).
 class MirrorListener {
 public:
     MirrorListener();
@@ -26,15 +38,12 @@ public:
     MirrorListener(const MirrorListener&)            = delete;
     MirrorListener& operator=(const MirrorListener&) = delete;
 
-    // Bind a TCP listener on 0.0.0.0:0, start the accept/recv thread, and
-    // return the allocated port through `port`. Returns false on failure.
     bool start(uint16_t& port);
-
-    // Signals the thread to exit, shuts down sockets, joins the thread.
     void stop();
 
 private:
-    void run();
+    void accept_loop();
+    void reader_loop(socket_t client);
 
     socket_t          listen_sock_{INVALID_SOCK};
     std::atomic<bool> running_{false};
