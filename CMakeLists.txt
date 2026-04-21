@@ -15,13 +15,41 @@ endif()
 # ---- libplist (required) ------------------------------------------------------
 # UxPlay uses libplist to serialise the /info, ANNOUNCE and other RTSP bodies.
 # We take the same dependency rather than writing a bplist00 encoder by hand.
+# Try three lookup paths in order (vcpkg / Linux pkg-config / raw find_*).
+set(LIBPLIST_TARGET "")
+
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
-    pkg_check_modules(LIBPLIST IMPORTED_TARGET libplist-2.0)
+    pkg_check_modules(LIBPLIST IMPORTED_TARGET libplist-2.0 QUIET)
+    if(LIBPLIST_FOUND)
+        set(LIBPLIST_TARGET PkgConfig::LIBPLIST)
+    endif()
 endif()
-if(NOT LIBPLIST_FOUND)
-    # vcpkg / CMake-config fallback (used on Windows via vcpkg manifest).
+
+if(NOT LIBPLIST_TARGET)
     find_package(libplist CONFIG QUIET)
+    foreach(_t libplist::libplist-2.0 libplist::libplist unofficial::libplist::libplist)
+        if(TARGET ${_t})
+            set(LIBPLIST_TARGET ${_t})
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(NOT LIBPLIST_TARGET)
+    # vcpkg doesn't ship a CMake config for libplist on all platforms — fall
+    # back to raw finders. With the vcpkg toolchain, CMAKE_PREFIX_PATH already
+    # points at vcpkg_installed/<triplet>/{include,lib}, so these just work.
+    find_path(LIBPLIST_INCLUDE_DIR plist/plist.h)
+    find_library(LIBPLIST_LIBRARY NAMES plist-2.0 libplist-2.0 plist libplist)
+    if(LIBPLIST_INCLUDE_DIR AND LIBPLIST_LIBRARY)
+        message(STATUS "libplist: raw find — include=${LIBPLIST_INCLUDE_DIR} "
+                       "lib=${LIBPLIST_LIBRARY}")
+        add_library(airplay_libplist INTERFACE)
+        target_include_directories(airplay_libplist INTERFACE "${LIBPLIST_INCLUDE_DIR}")
+        target_link_libraries(airplay_libplist INTERFACE "${LIBPLIST_LIBRARY}")
+        set(LIBPLIST_TARGET airplay_libplist)
+    endif()
 endif()
 
 # ---- OpenSSL (required) -------------------------------------------------------
@@ -65,20 +93,17 @@ else()
         third_party/fairplay_blobs_stub.cpp)
 endif()
 
-if(LIBPLIST_FOUND)
-    target_link_libraries(airplay-windows PRIVATE PkgConfig::LIBPLIST)
-    target_compile_definitions(airplay-windows PRIVATE HAVE_LIBPLIST=1)
-elseif(TARGET libplist::libplist-2.0)
-    target_link_libraries(airplay-windows PRIVATE libplist::libplist-2.0)
-    target_compile_definitions(airplay-windows PRIVATE HAVE_LIBPLIST=1)
-elseif(TARGET libplist::libplist)
-    target_link_libraries(airplay-windows PRIVATE libplist::libplist)
+if(LIBPLIST_TARGET)
+    message(STATUS "libplist: linking via ${LIBPLIST_TARGET}")
+    target_link_libraries(airplay-windows PRIVATE ${LIBPLIST_TARGET})
     target_compile_definitions(airplay-windows PRIVATE HAVE_LIBPLIST=1)
 else()
-    message(WARNING
-        "libplist not found. /info will return a text placeholder. "
-        "On Windows: run `vcpkg install libplist` or use the provided vcpkg.json. "
-        "On Linux: `apt install libplist-dev`.")
+    message(FATAL_ERROR
+        "libplist not found. Required for the /info binary plist — iOS will "
+        "reject the handshake without it.\n"
+        "  Windows: re-run cmake with -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/"
+        "buildsystems/vcpkg.cmake (vcpkg.json declares the dep).\n"
+        "  Linux:   apt install libplist-dev")
 endif()
 
 if(WIN32)
