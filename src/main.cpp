@@ -4,13 +4,13 @@
 //   1. Initialise Winsock (net::global_init).
 //   2. Build a DeviceContext (identifiers echoed in both mDNS TXT and /info).
 //   3. Start the AirPlay RTSP-like server on TCP 7000.
-//   4. Start the Bonjour mDNS advertisement.
+//   4. Start the native mDNS advertisement (Windows DnsService API).
 //   5. Block until Ctrl-C, then tear everything down cleanly.
 
 #include "airplay/server.h"
 #include "crypto/identity.h"
 #include "log.h"
-#include "mdns/bonjour_service.h"
+#include "mdns/mdns_service.h"
 #include "net/socket.h"
 
 #include <atomic>
@@ -87,7 +87,7 @@ int main() {
         return 1;
     }
 
-    ap::mdns::BonjourService mdns;
+    ap::mdns::MdnsService mdns;
     if (!mdns.start(ctx, server.port())) {
         LOG_WARN << "mDNS not available — receiver won't auto-appear on iOS";
     }

@@ -12,30 +12,6 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# ---- Bonjour SDK (Windows only, required for mDNS) ----------------------------
-if(WIN32)
-    if(NOT DEFINED ENV{BONJOUR_SDK_HOME})
-        set(BONJOUR_SDK_HOME "C:/Program Files/Bonjour SDK")
-    else()
-        set(BONJOUR_SDK_HOME "$ENV{BONJOUR_SDK_HOME}")
-    endif()
-
-    find_path(BONJOUR_INCLUDE_DIR dns_sd.h
-        HINTS "${BONJOUR_SDK_HOME}/Include")
-    find_library(BONJOUR_LIBRARY NAMES dnssd
-        HINTS "${BONJOUR_SDK_HOME}/Lib/x64" "${BONJOUR_SDK_HOME}/Lib/Win32")
-
-    if(NOT BONJOUR_INCLUDE_DIR OR NOT BONJOUR_LIBRARY)
-        message(WARNING
-            "Bonjour SDK not found. Install from https://developer.apple.com/bonjour/ "
-            "and set BONJOUR_SDK_HOME. The project will build without mDNS support "
-            "(discovery will not work).")
-        set(HAS_BONJOUR OFF)
-    else()
-        set(HAS_BONJOUR ON)
-    endif()
-endif()
-
 # ---- libplist (required) ------------------------------------------------------
 # UxPlay uses libplist to serialise the /info, ANNOUNCE and other RTSP bodies.
 # We take the same dependency rather than writing a bplist00 encoder by hand.
@@ -59,7 +35,7 @@ add_executable(airplay-windows
     src/log.cpp
     src/net/socket.cpp
     src/net/tcp_server.cpp
-    src/mdns/bonjour_service.cpp
+    src/mdns/mdns_service.cpp
     src/crypto/identity.cpp
     src/crypto/pair_verify.cpp
     src/crypto/fairplay.cpp
@@ -106,10 +82,6 @@ else()
 endif()
 
 if(WIN32)
-    target_link_libraries(airplay-windows PRIVATE ws2_32 iphlpapi)
-    if(HAS_BONJOUR)
-        target_include_directories(airplay-windows PRIVATE "${BONJOUR_INCLUDE_DIR}")
-        target_link_libraries(airplay-windows PRIVATE "${BONJOUR_LIBRARY}")
-        target_compile_definitions(airplay-windows PRIVATE HAVE_BONJOUR=1)
-    endif()
+    # ws2_32: Winsock; iphlpapi: GetAdaptersAddresses; dnsapi: native mDNS.
+    target_link_libraries(airplay-windows PRIVATE ws2_32 iphlpapi dnsapi)
 endif()

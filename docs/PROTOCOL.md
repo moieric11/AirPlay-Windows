@@ -105,7 +105,7 @@ Séquence observée (simplifiée) :
 
 | Composant              | État    | Fichier principal                 |
 |------------------------|---------|-----------------------------------|
-| mDNS `_airplay._tcp`   | OK      | `src/mdns/bonjour_service.cpp`    |
+| mDNS `_airplay._tcp`   | OK      | `src/mdns/mdns_service.cpp`       |
 | mDNS `_raop._tcp`      | OK      | idem                              |
 | Serveur TCP 7000       | OK      | `src/net/tcp_server.cpp`          |
 | Parser RTSP-like       | OK      | `src/airplay/rtsp_parser.cpp`     |

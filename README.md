@@ -33,23 +33,24 @@ Chaque étape est validée contre un iPhone réel avant de passer à la suivante
 
 ## Prérequis (Windows)
 
-- **Visual Studio 2022** avec composants C++ (ou Build Tools équivalents)
+- **Visual Studio 2022** (ou Build Tools) avec composants C++
 - **CMake 3.20+**
-- **vcpkg** (pour OpenSSL, plog)
-- **Bonjour SDK for Windows** (DNS-SD) — <https://developer.apple.com/bonjour/>
-  Fournit `dns_sd.h` et `dnssd.lib`. Installé aussi avec iTunes.
-- Le service **Bonjour Service** (mDNSResponder) doit tourner.
+- **vcpkg** (pour OpenSSL + libplist, déclarés dans `vcpkg.json`)
+- **Windows 10 1809+ ou Windows 11** (pour l'API mDNS native `DnsServiceRegister`)
+
+Aucune dépendance Apple requise : le récepteur s'annonce via `dnsapi.dll`
+de Windows, pas via Bonjour SDK.
 
 ## Build
 
-```bat
+```powershell
 git clone https://github.com/moieric11/airplay-windows.git
 cd airplay-windows
-cmake --preset default
-cmake --build --preset default
+cmake -S . -B build `
+  -DCMAKE_TOOLCHAIN_FILE="<chemin>/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+  -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Debug
 ```
-
-Ajuster `BONJOUR_SDK_HOME` si le SDK n'est pas dans `C:\Program Files\Bonjour SDK`.
 
 ## Lancement
 
