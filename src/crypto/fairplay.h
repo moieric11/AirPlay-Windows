@@ -37,7 +37,18 @@ private:
                      std::vector<unsigned char>& out);
 
     State   state_{State::Fresh};
-    uint8_t mode_{0};         // carried from msg1 into msg2 header
+    uint8_t mode_{0};         // selected from msg1[14]; 0..3
+
+    // msg3 payload, kept so a future fairplay_decrypt() step can combine it
+    // with the 72-byte rsaaeskey from ANNOUNCE to recover the 16-byte AES
+    // session key. Populated on successful handle_msg3.
+    std::vector<unsigned char> keymsg_;
+
+public:
+    // Exposes the 164-byte msg3 payload once the handshake has completed,
+    // for the stream-key decryption step. Returns an empty span while
+    // state() != Done.
+    const std::vector<unsigned char>& keymsg() const { return keymsg_; }
 };
 
 } // namespace ap::crypto

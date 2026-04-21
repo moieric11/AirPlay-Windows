@@ -1,117 +1,134 @@
-# FairPlay SAP — provisioning des blobs
+# FairPlay SAP — provisioning
 
 Ce document décrit comment remplacer le stub `third_party/fairplay_blobs_stub.cpp`
-par les blobs réels nécessaires à la phase `POST /fp-setup` du handshake
-AirPlay. Sans ces blobs, iOS ira jusqu'à `pair-verify` mais refusera de
-poursuivre vers `ANNOUNCE` / `SETUP`.
+par les données FairPlay nécessaires au handshake `POST /fp-setup`. Sans ces
+données iOS refuse de passer à `ANNOUNCE` / `SETUP`.
 
-## 1. Contexte
+## 1. Ce que UxPlay fait vraiment (et ce qu'on fait aussi)
 
-FairPlay SAP v1 est la phase DRM propriétaire d'Apple. L'algorithme a été
-rétro-ingénieré il y a ~8 ans (projet `playfair` d'EstebanKubata) et intégré
-à RPiPlay puis UxPlay. Il dépend de **deux données binaires extraites du
-framework `AirPlayReceiver`** d'Apple :
+FairPlay SAP se décompose en **deux sous-étapes bien distinctes** :
 
-1. Une **table de lookup** de ~16 Ko utilisée pour construire le corps de
-   `msg2` (réponse à `msg1`).
-2. Une **clé AES-128** utilisée pour déchiffrer `msg3` et produire `msg4`.
+| Étape | Rôle | Approche UxPlay |
+|-------|------|-----------------|
+| **setup + handshake** (`/fp-setup` msg1↔msg2, msg3↔msg4) | Dialogue d'authentification DRM | **Replay** : 4 réponses msg2 pré-enregistrées + header fixe pour msg4. Aucune crypto côté serveur. |
+| **decrypt** (au moment de `ANNOUNCE`) | Transformer le `rsaaeskey` (72 bytes) en clé AES-128 qui déchiffre le stream | **Algorithme obfusqué** : `lib/playfair/` + table `omg_hax.h` (~500 Ko) |
 
-Ces données sont copyrightées Apple. Aucune licence publique ne les autorise
-formellement, mais elles sont embarquées de fait dans tous les récepteurs
-AirPlay open-source (RPiPlay, UxPlay, shairport-sync avec mirroring, …)
-depuis plusieurs années sans action juridique.
+Pour "setup + handshake" il suffit donc de ~600 bytes de données, pas 16 Ko.
+C'est ce que le niveau A provisionne ici. Le niveau B (decrypt) est une étape
+distincte pour plus tard.
 
-**Ce dépôt ne les inclut pas.** La compilation par défaut link contre un
-stub rempli de zéros. L'utilisateur les provisionne lui-même.
+## 2. Niveau A — handshake (suffisant pour atteindre ANNOUNCE/SETUP/RECORD)
 
-## 2. Procédure
+### Étape 1 — cloner UxPlay à côté (pas dans ce repo)
 
-### Étape 1 — récupérer le source UxPlay
-
-```bash
-git clone https://github.com/FDH2/UxPlay.git uxplay-src
+```powershell
+git clone https://github.com/FDH2/UxPlay.git ../UxPlay-reference
 ```
 
-Le fichier pertinent est `uxplay-src/lib/fairplay_playfair.c`. Il contient
-les trois blobs dont nous avons besoin, sous forme de tableaux `static const`.
+### Étape 2 — repérer les données
 
-### Étape 2 — créer `third_party/fairplay_blobs_real.cpp`
+Le fichier qui compte est `lib/fairplay_playfair.c`. Il contient :
 
-Créer un fichier `third_party/fairplay_blobs_real.cpp` dans notre dépôt,
-avec la structure suivante :
+- `char reply_message[4][142]` — les 4 réponses msg2 (indexées par msg1[14])
+- `char fp_header[]` — 12 bytes utilisés dans msg4
+
+### Étape 3 — créer `third_party/fairplay_blobs_real.cpp`
+
+Structure :
 
 ```cpp
 // GPL-3.0 — dérivé de UxPlay/lib/fairplay_playfair.c
-// Données binaires Apple, usage d'interopérabilité uniquement.
 #include "crypto/fairplay_blobs.h"
 
 namespace ap::crypto::fairplay_blobs {
 
 const bool kPresent = true;
 
-const unsigned char kTable[kTableSize] = {
-    // … copier ici le contenu de fplay_hex[] depuis UxPlay …
+const unsigned char kReplyMessage[kReplyCount][kReplySize] = {
+    // Mode 0 : reply_message[0] copié depuis UxPlay
+    { 0x46,0x50,0x4c,0x59, /* 142 bytes au total */ },
+    // Mode 1 : reply_message[1]
+    { 0x46,0x50,0x4c,0x59, /* … */ },
+    // Mode 2
+    { 0x46,0x50,0x4c,0x59, /* … */ },
+    // Mode 3
+    { 0x46,0x50,0x4c,0x59, /* … */ },
 };
 
-const unsigned char kAesKey[kAesKeySize] = {
-    // … copier ici le contenu de fplay_aes_key[] depuis UxPlay …
+const unsigned char kFpHeader[kFpHeaderSize] = {
+    // fp_header[] depuis UxPlay
+    0x46, 0x50, 0x4c, 0x59, 0x03, 0x01, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0x14,
 };
 
-const unsigned char kReplyHeaderMode1[kReplyHeaderSize] = {
-    // … copier ici le header mode 1 depuis fairplay_reply_msg_header_mode_1[] …
-};
-const unsigned char kReplyHeaderMode2[kReplyHeaderSize] = {
-    // … et le header mode 2 …
-};
-
-} // namespace ap::crypto::fairplay_blobs
+} // namespace
 ```
 
-### Étape 3 — rebuild
+### Étape 4 — reconfigurer et rebuild
 
-Le CMake détecte automatiquement `fairplay_blobs_real.cpp` s'il existe et
-substitue le stub par celui-ci. Vérifier à la configuration :
+```powershell
+rmdir /s /q build
+cmake -S . -B build <toolchain flags>
+cmake --build build --config Debug
+```
+
+À la configuration tu dois voir :
 
 ```
 -- FairPlay: using provisioned blob (fairplay_blobs_real.cpp)
 ```
 
-### Étape 4 — port du calcul
+### Étape 5 — vérifier
 
-Le stub court-circuite les deux fonctions `compute_msg2_stub` et
-`compute_msg4_stub` dans `src/crypto/fairplay.cpp`. Une fois les blobs en
-place, porter le **calcul réel** depuis UxPlay — deux fonctions d'environ
-40 lignes chacune :
+Au runtime, les logs fp-setup doivent passer de `STUB msg2` à :
 
-- `uxplay-src/lib/fairplay.c::fairplay_setup_msg2` → adapter en
-  `real_compute_msg2(mode, msg1, out)` dans notre `fairplay.cpp`
-- `uxplay-src/lib/fairplay.c::fairplay_setup_msg4` → `real_compute_msg4`
+```
+fp-setup msg1 (mode N) → 142B replay
+fp-setup msg3 → 32B response (fp_header + msg3[144..164])
+```
 
-Basculer les deux branches `if (!fairplay_blobs::kPresent)` pour appeler
-la version réelle quand le vrai blob est présent.
+Et iPhone doit enchaîner sur `ANNOUNCE` / `SETUP` / `RECORD`.
 
-## 3. Licence
+## 3. Niveau B — decrypt (stream déchiffré, affichage)
 
-Dès que `third_party/fairplay_blobs_real.cpp` est en place, **l'exécutable
-devient redistribuable uniquement en GPL-3.0** (contamination par UxPlay).
-Mettre à jour `README.md` et `LICENSE` en conséquence.
+Pour décoder la vidéo, il faut aller plus loin : transformer le 72-byte
+`rsaaeskey` en une clé AES-128 de 16 bytes qui déchiffrera le H.264 qui arrive
+sur les sockets UDP.
 
-## 4. Vérification
+Cette étape appelle `playfair_decrypt(msg3, rsaaeskey, key_out)` qui vit dans
+`UxPlay/lib/playfair/playfair.c` et dépend de :
 
-Après provisioning complet :
+| Fichier | Taille | Contenu |
+|---------|--------|---------|
+| `hand_garble.c` | 20 Ko | Cycle AES-like + XOR |
+| `omg_hax.c` | 22 Ko | Key schedule + session key |
+| `omg_hax.h` | **483 Ko** | **Table `default_sap[]` Apple** |
+| `modified_md5.c` | 3.5 Ko | Hash dérivé MD5 |
+| `sap_hash.c` | 3.5 Ko | Autre hash interne |
+| `playfair.c` / `.h` | 1.2 Ko | Façade |
+| `LICENSE.md` | 35 Ko | **Licence à lire avant de redistribuer** |
 
-1. `cmake --build build` : pas d'erreur, log "using provisioned blob"
-2. `python3 tools/test_pair_verify.py` : T5 passe toujours (forme RTSP)
-3. Capture Wireshark d'une session iPhone : la paire `msg1/msg2` doit
-   correspondre octet-pour-octet à ce que UxPlay produit avec la même
-   entrée (tester avec le même iPhone successivement sur UxPlay Linux et
-   notre récepteur Windows, comparer les dumps).
+Pour intégrer ce niveau plus tard :
+
+1. Copier tout `lib/playfair/` dans `third_party/playfair/`
+2. Lire `LICENSE.md` (licence dérivée BSD-ish mais avec restrictions Apple)
+3. Ajouter `third_party/playfair/*.c` au `target_sources` du CMake quand le
+   blob réel est détecté
+4. Ajouter dans `fairplay.h` une méthode `decrypt(rsaaeskey, out)` qui appelle
+   `playfair_decrypt(keymsg_.data(), rsaaeskey, out)`
+5. L'utiliser dans `handle_announce` pour déchiffrer le `rsaaeskey` du SDP
+
+## 4. Licence
+
+Dès que `fairplay_blobs_real.cpp` (ou `lib/playfair/*`) est linké, **l'exécutable
+devient GPL-3.0 par dérivation d'UxPlay**. Mettre à jour `README.md` et
+`LICENSE` en conséquence.
 
 ## 5. Garde-fous
 
-- **Ne jamais commiter `fairplay_blobs_real.cpp`** dans le dépôt public.
-  Ajouter `third_party/fairplay_blobs_real.cpp` à `.gitignore` dès la
-  création du fichier.
-- Si le dépôt devient public, réfléchir à la stratégie de distribution :
-  UxPlay fournit les blobs dans son propre repo, on peut documenter un
-  script qui les récupère chez eux à la demande.
+- **`third_party/fairplay_blobs_real.cpp` est gitignored** — ne jamais le
+  commit dans ce repo.
+- Le stub (`fairplay_blobs_stub.cpp`) reste compilable seul et garde la forme
+  RTSP correcte ; les tests unitaires passent dans les deux configurations.
+- Diagnostic runtime : la ligne de log `STUB msg2` vs `142B replay` au premier
+  `/fp-setup` indique quelle variante est linkée.

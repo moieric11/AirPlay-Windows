@@ -2,33 +2,37 @@
 
 #include <cstddef>
 
-// Binary blobs extracted from Apple's AirPlayReceiver framework. These are
-// NOT checked into the repository because of their copyright status; the
-// build links against a zero-filled stub (`third_party/fairplay_blobs_stub.cpp`)
-// by default. To enable real FairPlay SAP, replace the stub with the
-// corresponding file from UxPlay — see `docs/FAIRPLAY.md`.
+// FairPlay SAP "blobs". UxPlay takes a replay-only approach: instead of
+// recomputing the 142-byte msg2 with Apple's obfuscated algorithm, it
+// stores four pre-recorded responses captured from a real Apple TV and
+// looks them up by the mode byte (msg1[14]). This covers all four modes
+// iOS uses for mirroring and costs ~600 bytes total — no 16 KB table, no
+// RSA private key, no playfair algorithm needed.
 //
-// The sizes below mirror the public reverse-engineered layout (RPiPlay /
-// UxPlay / playfair). A build-time assertion verifies they match.
+// A separate `fairplay_decrypt()` step (72→16 bytes) IS algorithmic and
+// does require `lib/playfair/` from UxPlay. We don't implement it here;
+// without it we can complete the RTSP handshake (iOS reaches ANNOUNCE /
+// SETUP / RECORD and starts pushing RTP on UDP) but can't decrypt the
+// media stream. That's a later milestone.
+//
+// The real blob is provisioned by creating `third_party/fairplay_blobs_real.cpp`
+// (gitignored). See docs/FAIRPLAY.md.
 
 namespace ap::crypto::fairplay_blobs {
 
-// Flipped to `true` by a real blob file. Stub keeps it false so callers can
-// log a clear "FairPlay not provisioned" warning instead of silently
-// returning garbage.
 extern const bool kPresent;
 
-// ~16 KB lookup table used to build the 128-byte body of msg2.
-constexpr std::size_t kTableSize = 16 * 1024;
-extern const unsigned char kTable[kTableSize];
+// Four pre-recorded msg2 responses indexed by msg1[14] (the mode byte).
+// Every response starts with "FPLY 03 01 02 00 00 00 00 82 02 0<N>" where
+// <N> is the mode index, followed by 128 bytes of mode-specific payload.
+constexpr std::size_t kReplyCount = 4;
+constexpr std::size_t kReplySize  = 142;
+extern const unsigned char kReplyMessage[kReplyCount][kReplySize];
 
-// 16-byte AES-128 key used to decrypt msg3 payload into msg4.
-constexpr std::size_t kAesKeySize = 16;
-extern const unsigned char kAesKey[kAesKeySize];
-
-// 16-byte header mixed into msg2. Real value comes from UxPlay.
-constexpr std::size_t kReplyHeaderSize = 14;
-extern const unsigned char kReplyHeaderMode1[kReplyHeaderSize];
-extern const unsigned char kReplyHeaderMode2[kReplyHeaderSize];
+// 12-byte header prepended to msg4. The remaining 20 bytes of msg4 are
+// copied verbatim from msg3[144..164] (iOS-provided data), giving a total
+// response of 32 bytes.
+constexpr std::size_t kFpHeaderSize = 12;
+extern const unsigned char kFpHeader[kFpHeaderSize];
 
 } // namespace ap::crypto::fairplay_blobs

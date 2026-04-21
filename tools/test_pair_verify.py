@@ -247,16 +247,18 @@ def t5_fp_setup_framing(r):
     print("T5  fp-setup RTSP framing (msg1->142B, msg3->32B)")
     c = Conn(HOST, PORT)
     try:
-        # msg1: 16 bytes starting with "FPLY" magic, mode byte at index 6.
-        msg1 = b"FPLY" + b"\x03\x01\x01\x00\x00\x00\x00\x82\x02\x00\x0f\x9f"
-        assert len(msg1) == 16
+        # msg1: 16 bytes. "FPLY" + version 0x03 at [4], mode 0..3 at [14].
+        # Layout per UxPlay: 0x46 0x50 0x4c 0x59 0x03 0x01 <padding 7B> <mode> <0x9f>
+        msg1 = bytes([0x46,0x50,0x4c,0x59, 0x03,0x01,0x02,0x00,
+                      0x00,0x00,0x00,0x82, 0x02,0x00, 0x01, 0x9f])
+        assert len(msg1) == 16 and msg1[14] < 4
         s1, _h, body1 = c.rpc("POST", "/fp-setup", msg1)
         r.check(s1 == 200,           f"fp-setup msg1 status = {s1}")
         r.check(len(body1) == 142,   f"fp-setup msg2 size = {len(body1)} (expected 142)")
         r.check(body1[:4] == b"FPLY", "fp-setup msg2 starts with FPLY magic")
 
-        # msg3: 164 bytes starting with FPLY magic, rest zeros is fine for framing test.
-        msg3 = b"FPLY" + b"\x03\x01\x02" + (b"\x00" * (164 - 7))
+        # msg3: 164 bytes. Version 0x03 at [4], arbitrary content afterwards.
+        msg3 = bytes([0x46,0x50,0x4c,0x59, 0x03,0x01,0x04]) + b"\x00" * (164 - 7)
         assert len(msg3) == 164
         s2, _h, body2 = c.rpc("POST", "/fp-setup", msg3)
         r.check(s2 == 200,          f"fp-setup msg3 status = {s2}")
