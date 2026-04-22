@@ -212,16 +212,58 @@ int AacDecoder::decode(const uint8_t* frame, int size) {
         const int nb = impl_->frame->nb_samples;
         const int ch = impl_->channels;
 
-        // FFmpeg AAC decoder emits AV_SAMPLE_FMT_FLTP (planar float).
-        // Convert to interleaved int16 and push into the PCM queue.
-        const float* const* planes =
-            reinterpret_cast<const float* const*>(impl_->frame->extended_data);
+        // Convert to interleaved int16, handling the several sample formats
+        // libavcodec can emit depending on the codec:
+        //   AAC decoders   → AV_SAMPLE_FMT_FLTP (planar float)
+        //   ALAC decoder   → AV_SAMPLE_FMT_S16P / S32P (planar int)
+        //   Obscure paths  → non-planar variants, rarer but handled.
+        // Mixing these up silently produces noise because
+        // reinterpret_cast<float*>(int16_data) reads integers as floats.
+        const AVSampleFormat fmt =
+            static_cast<AVSampleFormat>(impl_->frame->format);
+        const bool planar = av_sample_fmt_is_planar(fmt);
+
+        auto sample_to_s16 = [&](int channel, int idx) -> int16_t {
+            const uint8_t* plane = planar
+                ? impl_->frame->extended_data[channel]
+                : impl_->frame->extended_data[0];
+            const int pos = planar ? idx : (idx * ch + channel);
+            switch (fmt) {
+                case AV_SAMPLE_FMT_FLTP:
+                case AV_SAMPLE_FMT_FLT: {
+                    float s = reinterpret_cast<const float*>(plane)[pos];
+                    if (s >  1.f) s =  1.f;
+                    if (s < -1.f) s = -1.f;
+                    return static_cast<int16_t>(s * 32767.f);
+                }
+                case AV_SAMPLE_FMT_DBLP:
+                case AV_SAMPLE_FMT_DBL: {
+                    double s = reinterpret_cast<const double*>(plane)[pos];
+                    if (s >  1.0) s =  1.0;
+                    if (s < -1.0) s = -1.0;
+                    return static_cast<int16_t>(s * 32767.0);
+                }
+                case AV_SAMPLE_FMT_S16P:
+                case AV_SAMPLE_FMT_S16:
+                    return reinterpret_cast<const int16_t*>(plane)[pos];
+                case AV_SAMPLE_FMT_S32P:
+                case AV_SAMPLE_FMT_S32:
+                    return static_cast<int16_t>(
+                        reinterpret_cast<const int32_t*>(plane)[pos] >> 16);
+                default:
+                    return 0;
+            }
+        };
+
+        if (impl_->frames_out == 0) {
+            LOG_INFO << "AacDecoder first frame: fmt="
+                     << av_get_sample_fmt_name(fmt)
+                     << " ch=" << ch << " nb=" << nb;
+        }
+
         for (int i = 0; i < nb; ++i) {
             for (int c = 0; c < ch; ++c) {
-                float s = planes[c][i];
-                if (s >  1.f) s =  1.f;
-                if (s < -1.f) s = -1.f;
-                impl_->pcm.push_back(static_cast<int16_t>(s * 32767.f));
+                impl_->pcm.push_back(sample_to_s16(c, i));
             }
         }
 
