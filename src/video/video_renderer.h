@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -48,6 +49,12 @@ public:
     // when no fresh mirror frame is arriving. Thread-safe.
     void push_cover_art(const uint8_t* jpeg, std::size_t size);
 
+    // Push new DAAP metadata (UTF-8 strings). Re-rendered only on change.
+    // Displayed over the cover art when mirror is idle. Thread-safe.
+    void push_metadata(const std::string& title,
+                       const std::string& artist,
+                       const std::string& album);
+
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
     bool user_closed() const { return closed_.load(); }
@@ -74,6 +81,12 @@ private:
     std::mutex                 cover_mtx_;
     std::vector<unsigned char> cover_jpeg_;
     bool                       cover_dirty_{false};
+
+    std::mutex                 meta_mtx_;
+    std::string                meta_title_;
+    std::string                meta_artist_;
+    std::string                meta_album_;
+    bool                       meta_dirty_{false};
 };
 
 } // namespace ap::video

@@ -491,6 +491,9 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
                      << (md.duration_ms ? ", " + std::to_string(md.duration_ms / 1000) + "s"
                                         : std::string())
                      << ')';
+            if (session.renderer) {
+                session.renderer->push_metadata(md.title, md.artist, md.album);
+            }
         } else {
             LOG_INFO << "SET_PARAMETER dmap body=" << req.body.size() << " B "
                         "(no recognisable mlit fields)";

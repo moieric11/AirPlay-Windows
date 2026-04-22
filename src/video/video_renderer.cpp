@@ -2,7 +2,9 @@
 #include "log.h"
 
 #include <SDL.h>
+#include <SDL_ttf.h>
 
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <vector>
@@ -76,6 +78,34 @@ bool decode_jpeg_to_rgb(const uint8_t* jpeg, std::size_t size,
     return ok;
 }
 
+// Open the first TTF font we can find among a list of OS-typical paths.
+// Returns nullptr if none could be loaded (the text overlay is then
+// skipped gracefully). Caller owns the returned pointer.
+TTF_Font* open_system_font(int pt_size) {
+    static const std::array<const char*, 6> candidates = {{
+#if defined(_WIN32)
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\tahoma.ttf",
+#else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/SFNS.ttf",
+#endif
+    }};
+    for (const char* path : candidates) {
+        if (!path) continue;
+        TTF_Font* f = TTF_OpenFont(path, pt_size);
+        if (f) {
+            LOG_INFO << "VideoRenderer loaded font " << path
+                     << " @" << pt_size << "pt";
+            return f;
+        }
+    }
+    LOG_WARN << "VideoRenderer: no system font found — text overlay disabled";
+    return nullptr;
+}
+
 // Draw a filled rect into a target rect of (win_w, win_h) such that the
 // source aspect is preserved (letterbox / pillarbox).
 SDL_Rect fit_inside(int src_w, int src_h, int win_w, int win_h) {
@@ -119,6 +149,20 @@ void VideoRenderer::push_cover_art(const uint8_t* jpeg, std::size_t size) {
     std::lock_guard<std::mutex> lock(cover_mtx_);
     cover_jpeg_.assign(jpeg, jpeg + size);
     cover_dirty_ = true;
+    cv_.notify_one();
+}
+
+void VideoRenderer::push_metadata(const std::string& title,
+                                  const std::string& artist,
+                                  const std::string& album) {
+    std::lock_guard<std::mutex> lock(meta_mtx_);
+    if (meta_title_ == title && meta_artist_ == artist && meta_album_ == album) {
+        return;   // no change, no need to re-render
+    }
+    meta_title_  = title;
+    meta_artist_ = artist;
+    meta_album_  = album;
+    meta_dirty_  = true;
     cv_.notify_one();
 }
 
@@ -170,6 +214,32 @@ void VideoRenderer::run(const std::string& title) {
 
     SDL_Texture* cover_tex = nullptr;
     int          cover_tex_w = 0, cover_tex_h = 0;
+
+    // Text overlay: load SDL_ttf + one font at two sizes (title big,
+    // secondary smaller). If TTF fails we just skip the text rendering.
+    TTF_Font* font_big   = nullptr;
+    TTF_Font* font_small = nullptr;
+    if (TTF_Init() == 0) {
+        font_big   = open_system_font(32);
+        font_small = open_system_font(20);
+    } else {
+        LOG_WARN << "TTF_Init failed: " << TTF_GetError();
+    }
+    SDL_Texture* title_tex  = nullptr; int title_w  = 0, title_h  = 0;
+    SDL_Texture* artist_tex = nullptr; int artist_w = 0, artist_h = 0;
+    SDL_Texture* album_tex  = nullptr; int album_w  = 0, album_h  = 0;
+
+    auto make_text = [&](TTF_Font* f, const std::string& s, SDL_Color c,
+                         SDL_Texture*& tex, int& w, int& h) {
+        if (tex) { SDL_DestroyTexture(tex); tex = nullptr; }
+        w = h = 0;
+        if (!f || s.empty()) return;
+        SDL_Surface* surf = TTF_RenderUTF8_Blended(f, s.c_str(), c);
+        if (!surf) return;
+        tex = SDL_CreateTextureFromSurface(renderer, surf);
+        w = surf->w; h = surf->h;
+        SDL_FreeSurface(surf);
+    };
 
     auto last_video_frame_time = std::chrono::steady_clock::now()
                                  - std::chrono::seconds(10);
@@ -229,6 +299,29 @@ void VideoRenderer::run(const std::string& title) {
                 cover_dirty_ = false;
             }
         }
+        // --- Consume pending metadata --------------------------------
+        std::string t_title, t_artist, t_album;
+        bool meta_changed = false;
+        {
+            std::lock_guard<std::mutex> lock(meta_mtx_);
+            if (meta_dirty_) {
+                t_title      = meta_title_;
+                t_artist     = meta_artist_;
+                t_album      = meta_album_;
+                meta_dirty_  = false;
+                meta_changed = true;
+            }
+        }
+        if (meta_changed) {
+            make_text(font_big,   t_title,  SDL_Color{255, 255, 255, 255},
+                      title_tex,  title_w,  title_h);
+            make_text(font_small, t_artist, SDL_Color{220, 220, 220, 255},
+                      artist_tex, artist_w, artist_h);
+            make_text(font_small, t_album,  SDL_Color{180, 180, 180, 255},
+                      album_tex,  album_w,  album_h);
+            LOG_INFO << "VideoRenderer metadata textures updated";
+        }
+
         if (!pending_cover.empty()) {
             int cw = 0, ch = 0;
             std::vector<uint8_t> rgb;
@@ -269,14 +362,39 @@ void VideoRenderer::run(const std::string& title) {
             SDL_Rect dst = fit_inside(video_tex_w, video_tex_h, win_w, win_h);
             SDL_RenderCopy(renderer, video_tex, nullptr, &dst);
         } else if (cover_tex) {
-            SDL_Rect dst = fit_inside(cover_tex_w, cover_tex_h, win_w, win_h);
+            // Cover art centered in the top 70% of the window; the bottom
+            // strip holds the metadata text (title / artist / album).
+            const int strip_h = win_h / 4;
+            const int top_h   = win_h - strip_h;
+            SDL_Rect dst = fit_inside(cover_tex_w, cover_tex_h, win_w, top_h);
             SDL_RenderCopy(renderer, cover_tex, nullptr, &dst);
+
+            // Text lines stacked left-aligned with a small margin.
+            const int pad_x = 20;
+            int       y     = top_h + 10;
+            auto draw_text = [&](SDL_Texture* tex, int tw, int th) {
+                if (!tex) return;
+                int max_w = win_w - 2 * pad_x;
+                int w     = std::min(tw, max_w);
+                SDL_Rect r{pad_x, y, w, th};
+                SDL_RenderCopy(renderer, tex, nullptr, &r);
+                y += th + 4;
+            };
+            draw_text(title_tex,  title_w,  title_h);
+            draw_text(artist_tex, artist_w, artist_h);
+            draw_text(album_tex,  album_w,  album_h);
         }
         SDL_RenderPresent(renderer);
     }
 
-    if (video_tex) SDL_DestroyTexture(video_tex);
-    if (cover_tex) SDL_DestroyTexture(cover_tex);
+    if (title_tex)  SDL_DestroyTexture(title_tex);
+    if (artist_tex) SDL_DestroyTexture(artist_tex);
+    if (album_tex)  SDL_DestroyTexture(album_tex);
+    if (video_tex)  SDL_DestroyTexture(video_tex);
+    if (cover_tex)  SDL_DestroyTexture(cover_tex);
+    if (font_big)   TTF_CloseFont(font_big);
+    if (font_small) TTF_CloseFont(font_small);
+    TTF_Quit();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();

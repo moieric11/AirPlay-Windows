@@ -112,6 +112,29 @@ if(NOT SDL2_TARGET)
         "  Linux:   apt install libsdl2-dev")
 endif()
 
+# ---- SDL2_ttf (required for the metadata text overlay) ------------------------
+set(SDL2_TTF_TARGET "")
+if(PkgConfig_FOUND)
+    pkg_check_modules(SDL2_TTF IMPORTED_TARGET SDL2_ttf)
+    if(SDL2_TTF_FOUND)
+        set(SDL2_TTF_TARGET PkgConfig::SDL2_TTF)
+    endif()
+endif()
+if(NOT SDL2_TTF_TARGET)
+    find_package(SDL2_ttf CONFIG QUIET)
+    if(TARGET SDL2_ttf::SDL2_ttf)
+        set(SDL2_TTF_TARGET SDL2_ttf::SDL2_ttf)
+    elseif(TARGET SDL2_ttf::SDL2_ttf-static)
+        set(SDL2_TTF_TARGET SDL2_ttf::SDL2_ttf-static)
+    endif()
+endif()
+if(NOT SDL2_TTF_TARGET)
+    message(FATAL_ERROR
+        "SDL2_ttf not found.\n"
+        "  Windows: rerun cmake with the vcpkg toolchain (already in vcpkg.json).\n"
+        "  Linux:   apt install libsdl2-ttf-dev")
+endif()
+
 # ---- Sources ------------------------------------------------------------------
 add_executable(airplay-windows
     src/main.cpp
@@ -143,7 +166,7 @@ add_executable(airplay-windows
 )
 
 target_include_directories(airplay-windows PRIVATE src)
-target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET})
+target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET} ${SDL2_TTF_TARGET})
 if(DEFINED FFMPEG_INCLUDE_DIRS_OK)
     target_include_directories(airplay-windows PRIVATE ${FFMPEG_INCLUDE_DIRS_OK})
 endif()
