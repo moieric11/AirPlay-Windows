@@ -43,9 +43,13 @@ natif Windows (pas de Bonjour SDK ni de dépendance Apple au runtime).
 | **RAOP RTP seq dedup**                      | ✅   | bitset 65k, sliding window                   |
 | **Décodeur AAC-ELD (libavcodec)**           | ✅   | ASC `F8 E8 50 00` construit from-scratch     |
 | **Sortie audio SDL2 / WASAPI**              | ✅   | int16 stéréo 44.1 kHz, push mode             |
+| **Volume control (SET_PARAMETER → gain)**   | ✅   | dB → linéaire, atomique, fast-path unity     |
+| **Cover art (image/jpeg → disk)**           | ✅   | dump `cover.jpg` à chaque changement de piste |
+| **DAAP metadata (mlit/minm/asar/asal/astm)**| ✅   | parser DMAP standalone, `metadata: "Titre" — Artiste (Album, 234s)` |
+| **ALAC fallback (ct=2)**                    | ✅   | magic cookie 36 B + dispatch AV_CODEC_ID_ALAC |
 | AirPlay streaming mode (FairPlay Streaming) | ❌   | YouTube / Netflix / ATV+ — hors scope        |
-| Volume control (SET_PARAMETER → mixer)      | ❌   | loggé mais pas câblé                         |
-| Seeking / pause / métadonnées DAAP          | ❌   | logs only pour l'instant                     |
+| Affichage cover/metadata dans la fenêtre    | ❌   | overlay SDL (SDL_ttf à intégrer)             |
+| Seek / pause / progress playback            | ❌   | position loggée, UI à construire             |
 
 ## Stratégie
 
@@ -124,22 +128,20 @@ python3 tools/test_pair_verify.py
 
 ## Prochaines étapes
 
-La chaîne bout-en-bout marche pour mirror + audio RAOP. Les prolongements
-naturels, par priorité décroissante :
+Le cœur fonctionnel est couvert : mirror vidéo + audio RAOP dans
+les deux modes (AAC-ELD + ALAC), volume réactif, cover art et DAAP
+métadonnées extraites. Ce qui reste est de la polish UI ou du
+chantier lourd :
 
-1. **Câbler le volume** — iPhone envoie `SET_PARAMETER "volume: -X.Y"`
-   que l'on logge déjà ; il suffit de traduire la valeur dB (0 dB = max,
-   -144 dB = muet) vers un gain linéaire appliqué au buffer PCM avant
-   `SdlAudioOutput::push`.
-2. **DAAP metadata** — parser les `mlit` (titre, artiste, album, cover
-   art) envoyés en `SET_PARAMETER` pour les afficher dans la fenêtre
-   SDL quand l'écran mirror n'est pas actif.
-3. **ALAC support** — quand `ct=2` (iTunes legacy, AirPlay 1), le flux
-   est en ALAC au lieu d'AAC-ELD. `libavcodec` a un décodeur `alac`
-   disponible via `AV_CODEC_ID_ALAC` ; c'est ~30 lignes pour dispatcher.
-4. **AirPlay Streaming mode** pour YouTube / Netflix / Apple TV+.
-   Protocole distinct (`/reverse`, `/play` avec URL, FairPlay Streaming
-   DRM). Plusieurs jours de travail, licence DRM sensible.
+1. **Overlay fenêtre SDL** — afficher `cover.jpg` + titre/artiste
+   dans le VideoRenderer quand un stream audio-only est actif (pas
+   de mirror). Nécessite SDL_ttf ou un petit moteur de bitmap-text.
+2. **Playback UI** — l'iPhone envoie `progress: start/cur/end` et
+   on le logge déjà ; un bandeau de progression dans la fenêtre
+   serait naturel.
+3. **AirPlay Streaming mode** pour YouTube / Netflix / Apple TV+.
+   Protocole distinct (`/reverse`, `/play` avec URL, FairPlay
+   Streaming DRM). Plusieurs jours de travail, licence DRM sensible.
 
 ## Références
 
