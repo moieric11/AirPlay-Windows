@@ -5,6 +5,13 @@
 
 #include <chrono>
 #include <cstring>
+#include <vector>
+
+extern "C" {
+    #include <libavcodec/avcodec.h>
+    #include <libavutil/imgutils.h>
+    #include <libswscale/swscale.h>
+}
 
 namespace ap::video {
 namespace {
@@ -25,6 +32,73 @@ void copy_plane(std::vector<unsigned char>& dst,
 
 } // namespace
 
+namespace {
+
+// Decode a JPEG blob via libavcodec's MJPEG decoder and repack as
+// tightly-packed RGB24. Returns width/height through output params.
+// `out_rgb` is sized w*h*3 on success.
+bool decode_jpeg_to_rgb(const uint8_t* jpeg, std::size_t size,
+                        int& w, int& h, std::vector<uint8_t>& out_rgb) {
+    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+    if (!codec) return false;
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    AVPacket*       pkt = av_packet_alloc();
+    AVFrame*        fr  = av_frame_alloc();
+    bool ok = ctx && pkt && fr &&
+              avcodec_open2(ctx, codec, nullptr) == 0;
+    if (ok) {
+        pkt->data = const_cast<uint8_t*>(jpeg);
+        pkt->size = static_cast<int>(size);
+        ok = avcodec_send_packet(ctx, pkt)  == 0
+          && avcodec_receive_frame(ctx, fr) == 0;
+    }
+    if (ok) {
+        w = fr->width;
+        h = fr->height;
+        out_rgb.assign(static_cast<std::size_t>(w) * h * 3, 0);
+
+        SwsContext* sws = sws_getContext(
+            w, h, static_cast<AVPixelFormat>(fr->format),
+            w, h, AV_PIX_FMT_RGB24,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (sws) {
+            uint8_t* dst[1]        = { out_rgb.data() };
+            int      dst_stride[1] = { w * 3 };
+            sws_scale(sws, fr->data, fr->linesize, 0, h, dst, dst_stride);
+            sws_freeContext(sws);
+        } else {
+            ok = false;
+        }
+    }
+    if (fr)  av_frame_free(&fr);
+    if (pkt) av_packet_free(&pkt);
+    if (ctx) avcodec_free_context(&ctx);
+    return ok;
+}
+
+// Draw a filled rect into a target rect of (win_w, win_h) such that the
+// source aspect is preserved (letterbox / pillarbox).
+SDL_Rect fit_inside(int src_w, int src_h, int win_w, int win_h) {
+    SDL_Rect r{0, 0, win_w, win_h};
+    if (src_w <= 0 || src_h <= 0) return r;
+    const double src_ar = static_cast<double>(src_w) / src_h;
+    const double win_ar = static_cast<double>(win_w) / win_h;
+    if (src_ar > win_ar) {
+        r.w = win_w;
+        r.h = static_cast<int>(win_w / src_ar);
+        r.x = 0;
+        r.y = (win_h - r.h) / 2;
+    } else {
+        r.h = win_h;
+        r.w = static_cast<int>(win_h * src_ar);
+        r.x = (win_w - r.w) / 2;
+        r.y = 0;
+    }
+    return r;
+}
+
+} // namespace
+
 VideoRenderer::VideoRenderer()  = default;
 VideoRenderer::~VideoRenderer() { stop(); }
 
@@ -38,6 +112,14 @@ void VideoRenderer::stop() {
     if (!running_.exchange(false)) return;
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+}
+
+void VideoRenderer::push_cover_art(const uint8_t* jpeg, std::size_t size) {
+    if (!jpeg || size == 0) return;
+    std::lock_guard<std::mutex> lock(cover_mtx_);
+    cover_jpeg_.assign(jpeg, jpeg + size);
+    cover_dirty_ = true;
+    cv_.notify_one();
 }
 
 void VideoRenderer::push_frame(const uint8_t* y, int y_stride,
@@ -83,12 +165,16 @@ void VideoRenderer::run(const std::string& title) {
     LOG_INFO << "VideoRenderer window up (" << kDefaultWinWidth
              << 'x' << kDefaultWinHeight << ", resizable)";
 
-    SDL_Texture* texture      = nullptr;
-    int          texture_w    = 0;
-    int          texture_h    = 0;
+    SDL_Texture* video_tex = nullptr;
+    int          video_tex_w = 0, video_tex_h = 0;
+
+    SDL_Texture* cover_tex = nullptr;
+    int          cover_tex_w = 0, cover_tex_h = 0;
+
+    auto last_video_frame_time = std::chrono::steady_clock::now()
+                                 - std::chrono::seconds(10);
 
     while (running_.load()) {
-        // Pump events (quit, resize, ...). Avoid blocking the render loop.
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) {
@@ -99,69 +185,98 @@ void VideoRenderer::run(const std::string& title) {
         }
         if (!running_.load()) break;
 
-        // Wait briefly for a new frame; if none, clear and present anyway
-        // to keep the window responsive.
+        // --- Consume pending video frame -----------------------------
         bool have_frame = false;
         std::vector<unsigned char> y, u, v;
         int w = 0, h = 0;
         {
             std::unique_lock<std::mutex> lock(mtx_);
             cv_.wait_for(lock, std::chrono::milliseconds(16),
-                         [this] { return has_frame_ || !running_.load(); });
+                         [this] {
+                             return has_frame_ || cover_dirty_ || !running_.load();
+                         });
             if (has_frame_) {
-                y = y_buf_;
-                u = u_buf_;
-                v = v_buf_;
-                w = frame_w_;
-                h = frame_h_;
+                y = y_buf_; u = u_buf_; v = v_buf_;
+                w = frame_w_; h = frame_h_;
                 has_frame_ = false;
                 have_frame = true;
             }
         }
 
         if (have_frame) {
-            if (!texture || texture_w != w || texture_h != h) {
-                if (texture) SDL_DestroyTexture(texture);
-                texture = SDL_CreateTexture(renderer,
+            if (!video_tex || video_tex_w != w || video_tex_h != h) {
+                if (video_tex) SDL_DestroyTexture(video_tex);
+                video_tex = SDL_CreateTexture(renderer,
                     SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, w, h);
-                texture_w = w;
-                texture_h = h;
-                LOG_INFO << "VideoRenderer texture (IYUV) created " << w << 'x' << h;
+                video_tex_w = w; video_tex_h = h;
+                LOG_INFO << "VideoRenderer texture (IYUV) created "
+                         << w << 'x' << h;
             }
-            if (texture) {
-                SDL_UpdateYUVTexture(texture, nullptr,
-                    y.data(), w,
-                    u.data(), w / 2,
-                    v.data(), w / 2);
+            if (video_tex) {
+                SDL_UpdateYUVTexture(video_tex, nullptr,
+                    y.data(), w, u.data(), w / 2, v.data(), w / 2);
+            }
+            last_video_frame_time = std::chrono::steady_clock::now();
+        }
+
+        // --- Consume pending cover-art JPEG --------------------------
+        std::vector<unsigned char> pending_cover;
+        {
+            std::lock_guard<std::mutex> lock(cover_mtx_);
+            if (cover_dirty_) {
+                pending_cover = std::move(cover_jpeg_);
+                cover_jpeg_.clear();
+                cover_dirty_ = false;
+            }
+        }
+        if (!pending_cover.empty()) {
+            int cw = 0, ch = 0;
+            std::vector<uint8_t> rgb;
+            if (decode_jpeg_to_rgb(pending_cover.data(), pending_cover.size(),
+                                   cw, ch, rgb)) {
+                if (!cover_tex || cover_tex_w != cw || cover_tex_h != ch) {
+                    if (cover_tex) SDL_DestroyTexture(cover_tex);
+                    cover_tex = SDL_CreateTexture(renderer,
+                        SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STATIC, cw, ch);
+                    cover_tex_w = cw; cover_tex_h = ch;
+                }
+                if (cover_tex) {
+                    SDL_UpdateTexture(cover_tex, nullptr, rgb.data(), cw * 3);
+                    LOG_INFO << "VideoRenderer cover art updated ("
+                             << cw << 'x' << ch << ')';
+                }
+            } else {
+                LOG_WARN << "VideoRenderer: JPEG decode failed ("
+                         << pending_cover.size() << "B)";
             }
         }
 
+        // --- Decide which texture to show ----------------------------
+        // Video takes priority if we got a frame within the last 500 ms.
+        // Otherwise fall back to the cover texture; if neither, black.
+        const auto now = std::chrono::steady_clock::now();
+        const bool video_fresh =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_video_frame_time).count() < 500;
+
+        int win_w = 0, win_h = 0;
+        SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
+
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
-        if (texture) {
-            // Letter/pillar-box the source into the window while preserving aspect.
-            int win_w = 0, win_h = 0;
-            SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
-            const double src_ar = static_cast<double>(texture_w) / texture_h;
-            const double win_ar = static_cast<double>(win_w)     / win_h;
-            SDL_Rect dst{};
-            if (src_ar > win_ar) {
-                dst.w = win_w;
-                dst.h = static_cast<int>(win_w / src_ar);
-                dst.x = 0;
-                dst.y = (win_h - dst.h) / 2;
-            } else {
-                dst.h = win_h;
-                dst.w = static_cast<int>(win_h * src_ar);
-                dst.x = (win_w - dst.w) / 2;
-                dst.y = 0;
-            }
-            SDL_RenderCopy(renderer, texture, nullptr, &dst);
+
+        if (video_fresh && video_tex) {
+            SDL_Rect dst = fit_inside(video_tex_w, video_tex_h, win_w, win_h);
+            SDL_RenderCopy(renderer, video_tex, nullptr, &dst);
+        } else if (cover_tex) {
+            SDL_Rect dst = fit_inside(cover_tex_w, cover_tex_h, win_w, win_h);
+            SDL_RenderCopy(renderer, cover_tex, nullptr, &dst);
         }
         SDL_RenderPresent(renderer);
     }
 
-    if (texture)  SDL_DestroyTexture(texture);
+    if (video_tex) SDL_DestroyTexture(video_tex);
+    if (cover_tex) SDL_DestroyTexture(cover_tex);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();

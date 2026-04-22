@@ -43,6 +43,11 @@ public:
                     const uint8_t* v, int v_stride,
                     int width, int height);
 
+    // Hand the renderer a JPEG blob (cover art from SET_PARAMETER with
+    // Content-Type image/*). Decoded on the render thread; displayed
+    // when no fresh mirror frame is arriving. Thread-safe.
+    void push_cover_art(const uint8_t* jpeg, std::size_t size);
+
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
     bool user_closed() const { return closed_.load(); }
@@ -63,6 +68,12 @@ private:
     int                        frame_w_{0};
     int                        frame_h_{0};
     bool                       has_frame_{false};
+
+    // Pending cover-art JPEG, handed over to the render thread on the
+    // next tick. cleared when consumed.
+    std::mutex                 cover_mtx_;
+    std::vector<unsigned char> cover_jpeg_;
+    bool                       cover_dirty_{false};
 };
 
 } // namespace ap::video

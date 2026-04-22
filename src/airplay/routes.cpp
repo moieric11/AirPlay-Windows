@@ -8,6 +8,7 @@
 #include "crypto/fairplay.h"
 #include "crypto/pair_verify.h"
 #include "log.h"
+#include "video/video_renderer.h"
 
 #include <openssl/evp.h>
 
@@ -472,6 +473,9 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
     // ---- image/*: cover art -------------------------------------------
     if (ctype.find("image/") != std::string::npos) {
         save_cover_art(req.body.data(), req.body.size());
+        if (session.renderer) {
+            session.renderer->push_cover_art(req.body.data(), req.body.size());
+        }
         return r;
     }
 
