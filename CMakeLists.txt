@@ -137,6 +137,7 @@ add_executable(airplay-windows
     src/video/h264_decoder.cpp
     src/video/video_renderer.cpp
     src/audio/audio_receiver.cpp
+    src/audio/aac_decoder.cpp
 )
 
 target_include_directories(airplay-windows PRIVATE src)

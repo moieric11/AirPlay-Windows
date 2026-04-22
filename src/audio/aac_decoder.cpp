@@ -1,0 +1,207 @@
+#include "audio/aac_decoder.h"
+#include "log.h"
+
+#include <cstring>
+#include <deque>
+
+extern "C" {
+    #include <libavcodec/avcodec.h>
+    #include <libavutil/channel_layout.h>
+}
+
+namespace ap::audio {
+namespace {
+
+// MPEG-4 sampling frequency index per ISO 14496-3 Table 1.16.
+int freq_index(int sample_rate) {
+    switch (sample_rate) {
+        case 96000: return 0;
+        case 88200: return 1;
+        case 64000: return 2;
+        case 48000: return 3;
+        case 44100: return 4;
+        case 32000: return 5;
+        case 24000: return 6;
+        case 22050: return 7;
+        case 16000: return 8;
+        case 12000: return 9;
+        case 11025: return 10;
+        case  8000: return 11;
+        case  7350: return 12;
+        default:    return 15; // "explicit in ASC" — we don't handle this path
+    }
+}
+
+// Minimal bit-writer backed by a growing byte vector.
+struct BitWriter {
+    std::vector<uint8_t> buf;
+    int                  bit_pos = 0;
+
+    void put(int value, int nbits) {
+        while (nbits > 0) {
+            if ((bit_pos / 8) >= static_cast<int>(buf.size())) buf.push_back(0);
+            int byte_off   = bit_pos / 8;
+            int local_bit  = 7 - (bit_pos % 8);
+            int bit        = (value >> (nbits - 1)) & 1;
+            if (bit) buf[byte_off] |= static_cast<uint8_t>(1 << local_bit);
+            ++bit_pos;
+            --nbits;
+        }
+    }
+};
+
+} // namespace
+
+std::vector<uint8_t> build_asc_aac_eld(int sample_rate, int channels, int spf) {
+    BitWriter bw;
+
+    // audioObjectType field: AAC-ELD = 39, which is > 31 so we need the
+    // 5-bit escape prefix (11111) + 6-bit audioObjectTypeExt (39 - 32 = 7).
+    bw.put(31, 5);
+    bw.put(7,  6);
+
+    bw.put(freq_index(sample_rate), 4);
+    bw.put(channels,                4);
+
+    // ELDSpecificConfig (ISO 14496-3 §4.6.21.2).
+    const int frame_length_flag = (spf == 480) ? 1 : 0;  // 0 = 512
+    bw.put(frame_length_flag,  1);
+    bw.put(0,                  1);  // aacSectionDataResilienceFlag
+    bw.put(0,                  1);  // aacScalefactorDataResilienceFlag
+    bw.put(0,                  1);  // aacSpectralDataResilienceFlag
+    bw.put(0,                  1);  // ldSbrPresentFlag (no SBR extension)
+    bw.put(0,                  4);  // eldExtType = ELDEXT_TERM
+
+    return std::move(bw.buf);
+}
+
+// ---------------------------------------------------------------------------
+
+struct AacDecoder::Impl {
+    const AVCodec*   codec = nullptr;
+    AVCodecContext*  ctx   = nullptr;
+    AVPacket*        pkt   = nullptr;
+    AVFrame*         frame = nullptr;
+
+    int              sample_rate = 0;
+    int              channels    = 0;
+    uint64_t         frames_out  = 0;
+
+    // Interleaved int16 samples waiting for the sink.
+    std::deque<int16_t> pcm;
+
+    ~Impl() {
+        if (frame) av_frame_free(&frame);
+        if (pkt)   av_packet_free(&pkt);
+        if (ctx)   avcodec_free_context(&ctx);
+    }
+};
+
+AacDecoder::AacDecoder()  : impl_(std::make_unique<Impl>()) {}
+AacDecoder::~AacDecoder() = default;
+
+bool AacDecoder::init(const Config& cfg) {
+    impl_->codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
+    if (!impl_->codec) {
+        LOG_ERROR << "AacDecoder: libavcodec has no AAC decoder";
+        return false;
+    }
+    impl_->ctx   = avcodec_alloc_context3(impl_->codec);
+    impl_->pkt   = av_packet_alloc();
+    impl_->frame = av_frame_alloc();
+    if (!impl_->ctx || !impl_->pkt || !impl_->frame) return false;
+
+    impl_->ctx->sample_rate = cfg.sample_rate;
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+    av_channel_layout_default(&impl_->ctx->ch_layout, cfg.channels);
+#else
+    impl_->ctx->channels       = cfg.channels;
+    impl_->ctx->channel_layout = (cfg.channels == 2) ? AV_CH_LAYOUT_STEREO
+                                                     : AV_CH_LAYOUT_MONO;
+#endif
+
+    auto asc = build_asc_aac_eld(cfg.sample_rate, cfg.channels, cfg.spf);
+    impl_->ctx->extradata_size = static_cast<int>(asc.size());
+    impl_->ctx->extradata = static_cast<uint8_t*>(
+        av_mallocz(asc.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+    std::memcpy(impl_->ctx->extradata, asc.data(), asc.size());
+
+    if (avcodec_open2(impl_->ctx, impl_->codec, nullptr) != 0) {
+        LOG_ERROR << "AacDecoder: avcodec_open2(AAC) failed";
+        return false;
+    }
+
+    impl_->sample_rate = cfg.sample_rate;
+    impl_->channels    = cfg.channels;
+
+    std::string asc_hex;
+    for (uint8_t b : asc) {
+        char tmp[4]; std::snprintf(tmp, sizeof(tmp), "%02x ", b);
+        asc_hex += tmp;
+    }
+    LOG_INFO << "AacDecoder ready: AAC-ELD " << cfg.channels << "ch @"
+             << cfg.sample_rate << "Hz spf=" << cfg.spf
+             << " ASC=" << asc_hex;
+    return true;
+}
+
+int AacDecoder::decode(const uint8_t* frame, int size) {
+    if (!impl_->ctx || !frame || size <= 0) return 0;
+
+    av_packet_unref(impl_->pkt);
+    impl_->pkt->data = const_cast<uint8_t*>(frame);
+    impl_->pkt->size = size;
+
+    int ret = avcodec_send_packet(impl_->ctx, impl_->pkt);
+    if (ret < 0 && ret != AVERROR(EAGAIN)) {
+        char err[AV_ERROR_MAX_STRING_SIZE]{};
+        av_strerror(ret, err, sizeof(err));
+        LOG_WARN << "AacDecoder: send_packet error " << err;
+        return -1;
+    }
+
+    int produced = 0;
+    while (true) {
+        ret = avcodec_receive_frame(impl_->ctx, impl_->frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+        if (ret < 0) {
+            char err[AV_ERROR_MAX_STRING_SIZE]{};
+            av_strerror(ret, err, sizeof(err));
+            LOG_WARN << "AacDecoder: receive_frame error " << err;
+            return -1;
+        }
+
+        const int nb = impl_->frame->nb_samples;
+        const int ch = impl_->channels;
+
+        // FFmpeg AAC decoder emits AV_SAMPLE_FMT_FLTP (planar float).
+        // Convert to interleaved int16 and push into the PCM queue.
+        const float* const* planes =
+            reinterpret_cast<const float* const*>(impl_->frame->extended_data);
+        for (int i = 0; i < nb; ++i) {
+            for (int c = 0; c < ch; ++c) {
+                float s = planes[c][i];
+                if (s >  1.f) s =  1.f;
+                if (s < -1.f) s = -1.f;
+                impl_->pcm.push_back(static_cast<int16_t>(s * 32767.f));
+            }
+        }
+
+        ++impl_->frames_out;
+        produced += nb * ch;
+    }
+    return produced;
+}
+
+int AacDecoder::pull_pcm_s16(int16_t* dst, int max_samples) {
+    int n = static_cast<int>(std::min<std::size_t>(impl_->pcm.size(),
+                                                  static_cast<std::size_t>(max_samples)));
+    for (int i = 0; i < n; ++i) dst[i] = impl_->pcm.front(), impl_->pcm.pop_front();
+    return n;
+}
+
+int      AacDecoder::sample_rate()    const { return impl_ ? impl_->sample_rate : 0; }
+int      AacDecoder::channels()       const { return impl_ ? impl_->channels    : 0; }
+uint64_t AacDecoder::frames_decoded() const { return impl_ ? impl_->frames_out  : 0; }
+
+} // namespace ap::audio

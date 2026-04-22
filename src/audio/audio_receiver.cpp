@@ -82,6 +82,21 @@ bool AudioReceiver::start(Config cfg) {
     }
     EVP_CIPHER_CTX_set_padding(aes_ctx_, 0);
 
+    // AAC-ELD decoder — ct==4 or ct==8 per observed iOS streams. We try
+    // to init unconditionally; if the codec is something else (PCM, ALAC)
+    // the packets will fail to decode and we'll log but not crash.
+    decoder_ = std::make_unique<AacDecoder>();
+    AacDecoder::Config dc;
+    dc.ct          = cfg_.ct;
+    dc.sample_rate = cfg_.sample_rate;
+    dc.channels    = 2;
+    dc.spf         = 480;   // observed frame cadence in logs; 512 also seen
+    if (!decoder_->init(dc)) {
+        LOG_WARN << "AudioReceiver: AAC decoder init failed — running in "
+                    "decrypt-only mode";
+        decoder_.reset();
+    }
+
     set_recv_timeout(cfg_.data_sock, kRecvTimeoutMs);
 
     running_ = true;
@@ -211,10 +226,17 @@ void AudioReceiver::thread_fn() {
             if (first_big) ++big_pkts_logged;
         }
 
-        // TODO next: if (!is_duplicate && real_audio) feed (cleartext, outlen)
-        // into the AAC-ELD decoder → PCM → WASAPI. Currently the cleartext
-        // is discarded after logging.
-        (void)is_duplicate;
+        // Feed the real-audio (non-duplicate) frames to the AAC decoder.
+        // PCM accumulates inside the decoder; once WASAPI is wired up
+        // we'll drain it via pull_pcm_s16 from the audio output thread.
+        if (real_audio && !is_duplicate && decoder_) {
+            int got = decoder_->decode(cleartext, outlen);
+            if (got > 0 && decoder_->frames_decoded() <= 3) {
+                LOG_INFO << "  decoded " << got << " samples (" << got / 2
+                         << " per channel) — total PCM frames out: "
+                         << decoder_->frames_decoded();
+            }
+        }
 
         if ((pkts % 500) == 0) {
             LOG_INFO << "audio: " << pkts << " pkts, "
@@ -224,7 +246,9 @@ void AudioReceiver::thread_fn() {
 
     LOG_INFO << "AudioReceiver stopped (" << pkts << " pkts, "
              << total_bytes << " payload bytes, "
-             << dedup_dropped << " duplicate audio frames dropped)";
+             << dedup_dropped << " duplicate audio frames dropped, "
+             << (decoder_ ? decoder_->frames_decoded() : 0)
+             << " PCM frames decoded)";
     LOG_INFO << "  payload size histogram: "
              << "[0..16]="      << hist_0_16
              << "  [17..64]="   << hist_17_64

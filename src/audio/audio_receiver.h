@@ -1,9 +1,11 @@
 #pragma once
 
+#include "audio/aac_decoder.h"
 #include "net/socket.h"
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -54,10 +56,11 @@ public:
 private:
     void thread_fn();
 
-    Config            cfg_;
-    std::atomic<bool> running_{false};
-    std::thread       thread_;
-    EVP_CIPHER_CTX*   aes_ctx_{nullptr};
+    Config                      cfg_;
+    std::atomic<bool>           running_{false};
+    std::thread                 thread_;
+    EVP_CIPHER_CTX*             aes_ctx_{nullptr};
+    std::unique_ptr<AacDecoder> decoder_;
 };
 
 // Human-readable label for a RAOP "ct" (compression type) value.
