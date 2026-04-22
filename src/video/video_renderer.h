@@ -57,7 +57,15 @@ public:
 
     // Push playback progress (already converted from RTP timestamps to
     // milliseconds by the caller). total_ms == 0 hides the UI. Thread-safe.
+    //
+    // iOS only sends "progress:" at transitions (track start, seek,
+    // pause/resume), so the renderer extrapolates between pushes using
+    // the wall clock and the current rate (1.0 = playing, 0.0 = paused)
+    // set via push_playback_rate.
     void push_progress(uint32_t elapsed_ms, uint32_t total_ms);
+
+    // "rate: 1.0" / "rate: 0.0" from text/parameters. Thread-safe.
+    void push_playback_rate(float rate);
 
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
@@ -97,6 +105,13 @@ private:
     // and a slightly stale pair produces no visible glitch).
     std::atomic<uint32_t>      progress_elapsed_ms_{0};
     std::atomic<uint32_t>      progress_total_ms_{0};
+    // steady_clock::now() as nanoseconds since epoch, sampled at the
+    // most recent push_progress so the render thread can extrapolate
+    // forward until the next push arrives.
+    std::atomic<int64_t>       progress_pushed_at_ns_{0};
+    // Playing (true) advances the extrapolated elapsed; paused (false)
+    // freezes it. Toggled by rate: 1.0 / rate: 0.0.
+    std::atomic<bool>          playing_{true};
 };
 
 } // namespace ap::video

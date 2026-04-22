@@ -264,8 +264,16 @@ void VideoRenderer::push_cover_art(const uint8_t* jpeg, std::size_t size) {
 }
 
 void VideoRenderer::push_progress(uint32_t elapsed_ms, uint32_t total_ms) {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
     progress_elapsed_ms_.store(elapsed_ms, std::memory_order_relaxed);
-    progress_total_ms_.store(total_ms,   std::memory_order_relaxed);
+    progress_total_ms_.store(total_ms,     std::memory_order_relaxed);
+    progress_pushed_at_ns_.store(ns,       std::memory_order_relaxed);
+    cv_.notify_one();
+}
+
+void VideoRenderer::push_playback_rate(float rate) {
+    playing_.store(rate > 0.5f, std::memory_order_relaxed);
     cv_.notify_one();
 }
 
@@ -513,8 +521,23 @@ void VideoRenderer::run(const std::string& title) {
             // Progress row: "M:SS / M:SS" + thin bar. Only when the sender
             // reported a non-zero track length (otherwise a zero total would
             // hide the bar anyway, and dividing by zero would crash).
-            const uint32_t total_ms   = progress_total_ms_.load(std::memory_order_relaxed);
-            const uint32_t elapsed_ms = progress_elapsed_ms_.load(std::memory_order_relaxed);
+            // iOS only sends progress: at transitions, so extrapolate with
+            // the wall clock since the last push (unless paused).
+            const uint32_t total_ms        = progress_total_ms_.load(std::memory_order_relaxed);
+            const uint32_t elapsed_pushed  = progress_elapsed_ms_.load(std::memory_order_relaxed);
+            const int64_t  pushed_at_ns    = progress_pushed_at_ns_.load(std::memory_order_relaxed);
+            const bool     playing         = playing_.load(std::memory_order_relaxed);
+            uint32_t elapsed_ms = elapsed_pushed;
+            if (total_ms > 0 && playing && pushed_at_ns > 0) {
+                const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                const int64_t delta_ms = (now_ns - pushed_at_ns) / 1'000'000;
+                if (delta_ms > 0) {
+                    uint64_t extrapolated = static_cast<uint64_t>(elapsed_pushed) + delta_ms;
+                    if (extrapolated > total_ms) extrapolated = total_ms;
+                    elapsed_ms = static_cast<uint32_t>(extrapolated);
+                }
+            }
             if (total_ms > 0) {
                 auto fmt = [](uint32_t ms) {
                     const uint32_t s = ms / 1000;

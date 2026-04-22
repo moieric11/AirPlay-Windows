@@ -482,6 +482,16 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
             } else {
                 LOG_INFO << "playback " << body_str;
             }
+        } else if (body_str.compare(0, 5, "rate:") == 0) {
+            // "rate: 1.000000" = playing, "rate: 0.000000" = paused.
+            try {
+                const float rate = std::stof(body_str.substr(5));
+                LOG_INFO << "playback rate=" << rate
+                         << (rate > 0.5f ? " (playing)" : " (paused)");
+                if (session.renderer) session.renderer->push_playback_rate(rate);
+            } catch (...) {
+                LOG_WARN << "SET_PARAMETER: bad rate value";
+            }
         } else {
             LOG_INFO << "SET_PARAMETER body=\"" << body_str << '"';
         }
