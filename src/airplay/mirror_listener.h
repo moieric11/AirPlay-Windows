@@ -1,10 +1,13 @@
 #pragma once
 
+#include "crypto/mirror_decrypt.h"
 #include "net/socket.h"
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <thread>
+#include <vector>
 
 namespace ap::airplay {
 
@@ -41,6 +44,13 @@ public:
     bool start(uint16_t& port);
     void stop();
 
+    // Enable in-place AES-CTR decryption of VIDEO_IDR / VIDEO_NON_IDR frame
+    // payloads before they are logged. Call BEFORE start(). Pass the audio
+    // AES key (from fairplay_decrypt) and the streamConnectionID from the
+    // per-stream SETUP entry.
+    bool enable_decrypt(const std::vector<unsigned char>& aes_key_audio,
+                        uint64_t stream_connection_id);
+
 private:
     void accept_loop();
     void reader_loop(socket_t client);
@@ -48,6 +58,8 @@ private:
     socket_t          listen_sock_{INVALID_SOCK};
     std::atomic<bool> running_{false};
     std::thread       thread_;
+
+    std::unique_ptr<ap::crypto::MirrorDecrypt> decrypt_;
 };
 
 } // namespace ap::airplay

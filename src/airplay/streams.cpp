@@ -142,7 +142,9 @@ bool StreamSession::setup_session(uint16_t& event_port, uint16_t& timing_port) {
 
 bool StreamSession::setup_stream(int type,
                                  uint16_t& data_port,
-                                 uint16_t& control_port) {
+                                 uint16_t& control_port,
+                                 const std::vector<unsigned char>& aes_key_audio,
+                                 uint64_t stream_connection_id) {
     control_port = 0;
 
     // Type 110 (mirror video) uses a TCP byte stream, not UDP RTP. iOS will
@@ -150,6 +152,17 @@ bool StreamSession::setup_stream(int type,
     // push H.264 NAL units over it. UxPlay implements this in raop_rtp_mirror.c.
     if (type == 110) {
         mirror_ = std::make_unique<MirrorListener>();
+
+        // Wire AES-CTR decryption before starting the accept loop. iOS might
+        // already be opening the TCP connection by the time listen() returns,
+        // so decrypt must be ready first.
+        if (!aes_key_audio.empty() && stream_connection_id != 0) {
+            if (!mirror_->enable_decrypt(aes_key_audio, stream_connection_id)) {
+                LOG_WARN << "SETUP stream 110: could not init AES-CTR decrypt "
+                            "(stream will be logged encrypted)";
+            }
+        }
+
         uint16_t p = 0;
         if (!mirror_->start(p)) {
             mirror_.reset();
@@ -163,7 +176,8 @@ bool StreamSession::setup_stream(int type,
         ch.data_sock    = INVALID_SOCK; // owned by MirrorListener
         channels_.push_back(ch);
 
-        LOG_INFO << "SETUP session=" << session_id_ << " stream type=110 (TCP) data=" << p;
+        LOG_INFO << "SETUP session=" << session_id_
+                 << " stream type=110 (TCP) data=" << p;
         return true;
     }
 

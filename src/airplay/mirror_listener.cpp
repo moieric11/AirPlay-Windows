@@ -165,6 +165,17 @@ int recv_exact(socket_t s, unsigned char* buf, int len, RunningFn running) {
 MirrorListener::MirrorListener() = default;
 MirrorListener::~MirrorListener() { stop(); }
 
+bool MirrorListener::enable_decrypt(
+        const std::vector<unsigned char>& aes_key_audio,
+        uint64_t stream_connection_id) {
+    decrypt_ = std::make_unique<ap::crypto::MirrorDecrypt>();
+    if (!decrypt_->init(aes_key_audio, stream_connection_id)) {
+        decrypt_.reset();
+        return false;
+    }
+    return true;
+}
+
 bool MirrorListener::start(uint16_t& port) {
     listen_sock_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock_ == INVALID_SOCK) {
@@ -303,6 +314,34 @@ void MirrorListener::reader_loop(socket_t client) {
         if (ftype == kFrameSpsPps && counts[kFrameSpsPps] == 1 && !payload.empty()) {
             LOG_INFO << "mirror SPS/PPS hex: " << hex_dump(payload.data(), payload.size());
             log_sps_from_sps_pps_payload(payload);
+        }
+
+        // Encrypted frames (IDR + non-IDR): if the decrypt context is up,
+        // AES-CTR-decrypt the payload in place. Log a sanity line on the
+        // first decrypted frame — the payload should start with a 4-byte
+        // big-endian NAL length followed by an H.264 NAL header whose
+        // forbidden_zero_bit is 0.
+        const bool encrypted = (ftype == kFrameVideoIdr ||
+                                ftype == kFrameVideoNonIdr);
+        if (encrypted && decrypt_ && payload_size >= 5) {
+            if (!decrypt_->decrypt(payload.data(), static_cast<int>(payload_size))) {
+                LOG_WARN << "mirror: AES-CTR decrypt failed on frame "
+                         << frames << " (size=" << payload_size << ')';
+            } else if (counts[ftype] == 1) {
+                // Parse first NAL header: bytes 0..3 = length BE, byte 4 = NAL byte.
+                uint32_t nal_len = get_u32_be(payload.data(), 0);
+                uint8_t  nh      = payload[4];
+                const int nalu_type = nh & 0x1f;
+                const int ref_idc   = (nh >> 5) & 0x3;
+                const bool forbidden = (nh & 0x80) != 0;
+                LOG_INFO << "mirror decrypted frame[" << frames << "]: "
+                         << frame_name(ftype)
+                         << "  first NAL len=" << nal_len
+                         << " type=" << nalu_type
+                         << " ref_idc=" << ref_idc
+                         << (forbidden ? " FORBIDDEN_BIT_SET(!)" : "");
+                LOG_INFO << "  clear bytes: " << hex_dump(payload.data(), payload.size());
+            }
         }
 
         if ((frames % 500) == 0) {

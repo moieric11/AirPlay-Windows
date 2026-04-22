@@ -49,7 +49,14 @@ public:
 
     bool setup_legacy(const std::string& transport_header, StreamPorts& allocated);
     bool setup_session(uint16_t& event_port, uint16_t& timing_port);
-    bool setup_stream(int type, uint16_t& data_port, uint16_t& control_port);
+
+    // For type 110 (mirror TCP), if `aes_key_audio` is non-empty and
+    // `stream_connection_id` is set, the listener is wired to AES-CTR-decrypt
+    // incoming NAL payloads in place. Otherwise the listener still binds,
+    // accepts, and logs the raw encrypted byte stream.
+    bool setup_stream(int type, uint16_t& data_port, uint16_t& control_port,
+                      const std::vector<unsigned char>& aes_key_audio = {},
+                      uint64_t stream_connection_id = 0);
 
     // Start the NTP client thread that polls iOS's timing server at
     // (remote_ip, remote_port) from our timing socket bound by setup_session().

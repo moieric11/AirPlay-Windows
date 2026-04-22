@@ -267,7 +267,12 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
         std::vector<StreamAllocation> alloc(parsed.streams.size());
         for (std::size_t i = 0; i < parsed.streams.size(); ++i) {
             uint16_t d = 0, c = 0;
-            if (!session.streams->setup_stream(parsed.streams[i].type, d, c)) {
+            // Forward the session-level AES key + this stream's conn ID so
+            // MirrorListener can AES-CTR-decrypt incoming H.264 NAL payloads.
+            if (!session.streams->setup_stream(
+                    parsed.streams[i].type, d, c,
+                    session.aes_key,
+                    parsed.streams[i].stream_conn_id)) {
                 LOG_ERROR << "airplay2 SETUP: could not bind stream #" << i;
                 r.status_code = 500; r.status_text = "Internal Server Error";
                 return r;
