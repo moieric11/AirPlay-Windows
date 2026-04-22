@@ -97,6 +97,17 @@ bool AudioReceiver::start(Config cfg) {
         decoder_.reset();
     }
 
+    // SDL-backed audio sink. Goes live only if the OS gave us a device;
+    // a headless Linux VM will fall back to silent decode-only mode.
+    if (decoder_) {
+        output_ = std::make_unique<SdlAudioOutput>();
+        if (!output_->start(cfg_.sample_rate, 2)) {
+            LOG_WARN << "AudioReceiver: SDL audio output unavailable — "
+                        "PCM will be decoded but not played";
+            output_.reset();
+        }
+    }
+
     set_recv_timeout(cfg_.data_sock, kRecvTimeoutMs);
 
     running_ = true;
@@ -115,6 +126,9 @@ void AudioReceiver::stop() {
         cfg_.data_sock = INVALID_SOCK;
     }
     if (thread_.joinable()) thread_.join();
+
+    if (output_)  { output_->stop();  output_.reset();  }
+    if (decoder_) {                    decoder_.reset(); }
 
     if (aes_ctx_) {
         EVP_CIPHER_CTX_free(aes_ctx_);
@@ -226,15 +240,27 @@ void AudioReceiver::thread_fn() {
             if (first_big) ++big_pkts_logged;
         }
 
-        // Feed the real-audio (non-duplicate) frames to the AAC decoder.
-        // PCM accumulates inside the decoder; once WASAPI is wired up
-        // we'll drain it via pull_pcm_s16 from the audio output thread.
+        // Feed the real-audio (non-duplicate) frames to the AAC decoder,
+        // then immediately drain any PCM it produced into the SDL sink.
         if (real_audio && !is_duplicate && decoder_) {
             int got = decoder_->decode(cleartext, outlen);
             if (got > 0 && decoder_->frames_decoded() <= 3) {
                 LOG_INFO << "  decoded " << got << " samples (" << got / 2
                          << " per channel) — total PCM frames out: "
                          << decoder_->frames_decoded();
+            }
+
+            if (output_ && got > 0) {
+                // Drain every available PCM sample from the decoder's
+                // queue into SDL. We do it in one pull — buffer is large
+                // enough for the ~1920 stereo samples of a single AAC-ELD
+                // frame at 480 spf.
+                int16_t pcm[8192];
+                int     have = 0;
+                while ((have = decoder_->pull_pcm_s16(
+                            pcm, static_cast<int>(sizeof(pcm) / sizeof(pcm[0])))) > 0) {
+                    output_->push(pcm, have);
+                }
             }
         }
 
