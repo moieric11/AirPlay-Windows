@@ -78,32 +78,142 @@ bool decode_jpeg_to_rgb(const uint8_t* jpeg, std::size_t size,
     return ok;
 }
 
-// Open the first TTF font we can find among a list of OS-typical paths.
-// Returns nullptr if none could be loaded (the text overlay is then
-// skipped gracefully). Caller owns the returned pointer.
-TTF_Font* open_system_font(int pt_size) {
-    static const std::array<const char*, 6> candidates = {{
+// Open every font in a priority list so we can fall back per codepoint.
+// Primary fonts cover Latin / Cyrillic / Greek (Segoe UI, DejaVu Sans…);
+// the CJK fonts cover ideographs + kana + hangul (Microsoft YaHei for
+// Simplified Chinese, Meiryo for Japanese, Malgun Gothic for Korean).
+std::vector<TTF_Font*> open_font_chain(int pt_size) {
+    static const std::array<const char*, 12> candidates = {{
 #if defined(_WIN32)
-        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",   // Latin / Cyrillic / Greek
         "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\tahoma.ttf",
+        "C:\\Windows\\Fonts\\msyh.ttc",      // Chinese Simplified
+        "C:\\Windows\\Fonts\\msyh.ttf",
+        "C:\\Windows\\Fonts\\simsun.ttc",    // Chinese fallback (older)
+        "C:\\Windows\\Fonts\\meiryo.ttc",    // Japanese
+        "C:\\Windows\\Fonts\\YuGothM.ttc",
+        "C:\\Windows\\Fonts\\msgothic.ttc",
+        "C:\\Windows\\Fonts\\malgun.ttf",    // Korean
+        "C:\\Windows\\Fonts\\seguisym.ttf",  // misc symbols
 #else
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/System/Library/Fonts/SFNS.ttf",
 #endif
     }};
+    std::vector<TTF_Font*> fonts;
     for (const char* path : candidates) {
         if (!path) continue;
         TTF_Font* f = TTF_OpenFont(path, pt_size);
         if (f) {
+            fonts.push_back(f);
             LOG_INFO << "VideoRenderer loaded font " << path
                      << " @" << pt_size << "pt";
-            return f;
         }
     }
-    LOG_WARN << "VideoRenderer: no system font found — text overlay disabled";
-    return nullptr;
+    if (fonts.empty()) {
+        LOG_WARN << "VideoRenderer: no system font found — text overlay disabled";
+    }
+    return fonts;
+}
+
+// Tiny UTF-8 decoder — returns codepoint at `i` and advances `i` past
+// the sequence. Returns 0xFFFD (replacement) on malformed input.
+uint32_t utf8_next(const std::string& s, std::size_t& i) {
+    if (i >= s.size()) return 0;
+    unsigned char c0 = static_cast<unsigned char>(s[i]);
+    if (c0 < 0x80) { ++i; return c0; }
+    uint32_t cp = 0;
+    int      n  = 0;
+    if      ((c0 & 0xe0) == 0xc0) { cp = c0 & 0x1f; n = 1; }
+    else if ((c0 & 0xf0) == 0xe0) { cp = c0 & 0x0f; n = 2; }
+    else if ((c0 & 0xf8) == 0xf0) { cp = c0 & 0x07; n = 3; }
+    else { ++i; return 0xFFFD; }
+    ++i;
+    for (int k = 0; k < n; ++k) {
+        if (i >= s.size()) return 0xFFFD;
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if ((c & 0xc0) != 0x80) return 0xFFFD;
+        cp = (cp << 6) | (c & 0x3f);
+        ++i;
+    }
+    return cp;
+}
+
+// Return the first font in `fonts` that provides the given codepoint,
+// or fonts[0] if none of them do (so the missing glyph at least renders
+// as .notdef / tofu in a known font).
+TTF_Font* pick_font_for(uint32_t cp, const std::vector<TTF_Font*>& fonts) {
+    for (TTF_Font* f : fonts) {
+        if (TTF_GlyphIsProvided32(f, cp)) return f;
+    }
+    return fonts.empty() ? nullptr : fonts[0];
+}
+
+// Render an arbitrary UTF-8 string across a font chain: split the string
+// into runs of codepoints sharing the same font, render each run with
+// TTF_RenderUTF8_Blended, then hconcat the surfaces so the output looks
+// as if one super-font rendered the whole thing.
+SDL_Surface* render_multi_font(const std::vector<TTF_Font*>& fonts,
+                               const std::string& utf8,
+                               SDL_Color color) {
+    if (fonts.empty() || utf8.empty()) return nullptr;
+
+    // Build runs: [font_for_this_substring, utf8_substring]
+    struct Run { TTF_Font* font; std::string text; };
+    std::vector<Run> runs;
+
+    TTF_Font*   cur_font = nullptr;
+    std::string cur_text;
+    for (std::size_t i = 0; i < utf8.size(); ) {
+        std::size_t start = i;
+        uint32_t    cp    = utf8_next(utf8, i);
+        TTF_Font*   f     = pick_font_for(cp, fonts);
+        if (f != cur_font) {
+            if (!cur_text.empty()) runs.push_back({cur_font, std::move(cur_text)});
+            cur_text.clear();
+            cur_font = f;
+        }
+        cur_text.append(utf8, start, i - start);
+    }
+    if (!cur_text.empty()) runs.push_back({cur_font, std::move(cur_text)});
+
+    // Fast path: only one run, just use TTF directly.
+    if (runs.size() == 1 && runs[0].font) {
+        return TTF_RenderUTF8_Blended(runs[0].font, runs[0].text.c_str(), color);
+    }
+
+    // Slow path: render each run, then hconcat.
+    std::vector<SDL_Surface*> surfs;
+    int total_w = 0, max_h = 0;
+    for (const auto& r : runs) {
+        if (!r.font) { surfs.push_back(nullptr); continue; }
+        SDL_Surface* s = TTF_RenderUTF8_Blended(r.font, r.text.c_str(), color);
+        surfs.push_back(s);
+        if (s) { total_w += s->w; max_h = std::max(max_h, s->h); }
+    }
+    if (total_w == 0) {
+        for (auto* s : surfs) if (s) SDL_FreeSurface(s);
+        return nullptr;
+    }
+
+    SDL_Surface* out = SDL_CreateRGBSurfaceWithFormat(
+        0, total_w, max_h, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!out) {
+        for (auto* s : surfs) if (s) SDL_FreeSurface(s);
+        return nullptr;
+    }
+    SDL_SetSurfaceBlendMode(out, SDL_BLENDMODE_NONE);
+
+    int x = 0;
+    for (SDL_Surface* s : surfs) {
+        if (!s) continue;
+        SDL_Rect dst{ x, max_h - s->h, s->w, s->h };  // baseline-bottom align
+        SDL_SetSurfaceBlendMode(s, SDL_BLENDMODE_NONE);
+        SDL_BlitSurface(s, nullptr, out, &dst);
+        x += s->w;
+        SDL_FreeSurface(s);
+    }
+    return out;
 }
 
 // Draw a filled rect into a target rect of (win_w, win_h) such that the
@@ -215,13 +325,14 @@ void VideoRenderer::run(const std::string& title) {
     SDL_Texture* cover_tex = nullptr;
     int          cover_tex_w = 0, cover_tex_h = 0;
 
-    // Text overlay: load SDL_ttf + one font at two sizes (title big,
-    // secondary smaller). If TTF fails we just skip the text rendering.
-    TTF_Font* font_big   = nullptr;
-    TTF_Font* font_small = nullptr;
+    // Text overlay: load SDL_ttf + a multi-font chain (Latin primary +
+    // CJK fallbacks) at two sizes so make_text can cover any iOS track
+    // name, including Japanese / Chinese / Korean.
+    std::vector<TTF_Font*> fonts_big;
+    std::vector<TTF_Font*> fonts_small;
     if (TTF_Init() == 0) {
-        font_big   = open_system_font(32);
-        font_small = open_system_font(20);
+        fonts_big   = open_font_chain(32);
+        fonts_small = open_font_chain(20);
     } else {
         LOG_WARN << "TTF_Init failed: " << TTF_GetError();
     }
@@ -229,12 +340,13 @@ void VideoRenderer::run(const std::string& title) {
     SDL_Texture* artist_tex = nullptr; int artist_w = 0, artist_h = 0;
     SDL_Texture* album_tex  = nullptr; int album_w  = 0, album_h  = 0;
 
-    auto make_text = [&](TTF_Font* f, const std::string& s, SDL_Color c,
+    auto make_text = [&](const std::vector<TTF_Font*>& fonts,
+                         const std::string& s, SDL_Color c,
                          SDL_Texture*& tex, int& w, int& h) {
         if (tex) { SDL_DestroyTexture(tex); tex = nullptr; }
         w = h = 0;
-        if (!f || s.empty()) return;
-        SDL_Surface* surf = TTF_RenderUTF8_Blended(f, s.c_str(), c);
+        if (fonts.empty() || s.empty()) return;
+        SDL_Surface* surf = render_multi_font(fonts, s, c);
         if (!surf) return;
         tex = SDL_CreateTextureFromSurface(renderer, surf);
         w = surf->w; h = surf->h;
@@ -313,11 +425,11 @@ void VideoRenderer::run(const std::string& title) {
             }
         }
         if (meta_changed) {
-            make_text(font_big,   t_title,  SDL_Color{255, 255, 255, 255},
+            make_text(fonts_big,   t_title,  SDL_Color{255, 255, 255, 255},
                       title_tex,  title_w,  title_h);
-            make_text(font_small, t_artist, SDL_Color{220, 220, 220, 255},
+            make_text(fonts_small, t_artist, SDL_Color{220, 220, 220, 255},
                       artist_tex, artist_w, artist_h);
-            make_text(font_small, t_album,  SDL_Color{180, 180, 180, 255},
+            make_text(fonts_small, t_album,  SDL_Color{180, 180, 180, 255},
                       album_tex,  album_w,  album_h);
             LOG_INFO << "VideoRenderer metadata textures updated";
         }
@@ -392,8 +504,8 @@ void VideoRenderer::run(const std::string& title) {
     if (album_tex)  SDL_DestroyTexture(album_tex);
     if (video_tex)  SDL_DestroyTexture(video_tex);
     if (cover_tex)  SDL_DestroyTexture(cover_tex);
-    if (font_big)   TTF_CloseFont(font_big);
-    if (font_small) TTF_CloseFont(font_small);
+    for (TTF_Font* f : fonts_big)   if (f) TTF_CloseFont(f);
+    for (TTF_Font* f : fonts_small) if (f) TTF_CloseFont(f);
     TTF_Quit();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
