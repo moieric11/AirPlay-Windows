@@ -4,31 +4,19 @@ Récepteur AirPlay 2 (mirroring) pour Windows, porté depuis
 [UxPlay](https://github.com/FDH2/UxPlay) (GPL-3.0) avec un stack 100 %
 natif Windows (pas de Bonjour SDK ni de dépendance Apple au runtime).
 
-> **État actuel — l'écran d'un iPhone 16 / iOS 18 est capturé et décodé
-> en image RGB sur le PC Windows.**
+> **État actuel — récepteur AirPlay 2 fonctionnel sur Windows.**
 >
-> Un iPhone du même Wi-Fi voit `AirPlay-Windows` dans son Centre de
-> contrôle, traverse l'intégralité du handshake (pair-verify + FairPlay
-> + SETUP + RECORD), envoie son flux H.264 chiffré via TCP. Le récepteur
-> récupère la clé AES de session (FairPlay playfair + post-hash ECDH),
-> déchiffre chaque frame en AES-CTR, parse les NAL AVCC en Annex-B,
-> puis alimente libavcodec pour obtenir une `AVFrame YUV420P 498×1080`.
-> La première image de chaque session est dumpée en RGB24 dans
-> `first_frame.ppm` — ouverte dans GIMP ou IrfanView, c'est l'écran de
-> l'iPhone :
+> Un iPhone / iPad / Mac du même Wi-Fi voit `AirPlay-Windows` dans son
+> Centre de contrôle. La recopie d'écran s'affiche **en temps réel dans
+> une fenêtre SDL2** (498×1080 pour un iPhone 16 portrait, resizable,
+> conserve l'aspect). L'audio d'Apple Music, des vidéos natives et des
+> notifications iOS **sort du périphérique audio Windows par défaut**
+> via WASAPI/SDL.
 >
-> ```
-> H264Decoder ready (libavcodec Lavc62.28.100)
-> mirror video: H.264 High level 3.1, 498x1080
-> H264Decoder: SPS=18B, PPS=4B cached
-> mirror frame[2] VIDEO_IDR → 1 NAL(s):
->   NAL IDR_SLICE(type=5, ref_idc=1, size=6578B)
-> decoded first frame: 498x1080
-> H264Decoder: dumped 498x1080 frame to first_frame.ppm
-> ```
->
-> Reste à faire : un renderer temps réel (SDL2/Direct3D 11) pour
-> afficher un flux continu au lieu d'un PPM ponctuel, puis l'audio.
+> Ce qui ne marche pas : les apps qui forcent l'**AirPlay Streaming
+> mode** avec FairPlay DRM (YouTube / Netflix / Apple TV+) restent
+> hors scope — elles demandent un protocole et une DRM distincts, à
+> plusieurs jours de travail.
 
 ## Ce qui fonctionne
 
@@ -49,10 +37,15 @@ natif Windows (pas de Bonjour SDK ni de dépendance Apple au runtime).
 | **AES post-hash avec ECDH secret**          | ✅   | `raop_handler_setup` (modern-client path)    |
 | **AES-CTR des NAL H.264 (in-place decrypt)**| ✅   | `lib/mirror_buffer.c`                        |
 | **Split NAL + conversion Annex-B**          | ✅   | `raop_rtp_mirror_thread` (port-by-port)      |
-| **Décodeur H.264 (libavcodec)**             | ✅   | FFmpeg — SPS/PPS extraits de l'avcC et prepended |
-| **Dump 1ère frame en PPM (YUV→RGB)**        | ✅   | libswscale                                   |
-| Renderer temps réel (SDL2 / Direct3D 11)    | ❌   | à intégrer                                   |
-| Audio (RAOP, ALAC/AAC)                      | ❌   | `lib/raop.c`                                 |
+| **Décodeur H.264 (libavcodec)**             | ✅   | FFmpeg — SPS/PPS extraits de l'avcC          |
+| **Renderer vidéo temps réel (SDL2)**        | ✅   | SDL2 IYUV texture, GPU YUV→RGB               |
+| **Audio UDP RTP + AES-CBC decrypt**         | ✅   | `lib/raop_buffer.c`                          |
+| **RAOP RTP seq dedup**                      | ✅   | bitset 65k, sliding window                   |
+| **Décodeur AAC-ELD (libavcodec)**           | ✅   | ASC `F8 E8 50 00` construit from-scratch     |
+| **Sortie audio SDL2 / WASAPI**              | ✅   | int16 stéréo 44.1 kHz, push mode             |
+| AirPlay streaming mode (FairPlay Streaming) | ❌   | YouTube / Netflix / ATV+ — hors scope        |
+| Volume control (SET_PARAMETER → mixer)      | ❌   | loggé mais pas câblé                         |
+| Seeking / pause / métadonnées DAAP          | ❌   | logs only pour l'instant                     |
 
 ## Stratégie
 
@@ -131,19 +124,22 @@ python3 tools/test_pair_verify.py
 
 ## Prochaines étapes
 
-La chaîne bout-en-bout est démontrée (capture PPM fidèle de l'écran
-iPhone). Reste à la rendre utilisable en continu :
+La chaîne bout-en-bout marche pour mirror + audio RAOP. Les prolongements
+naturels, par priorité décroissante :
 
-1. **Renderer temps réel** — SDL2 (YUV texture → GPU upload) ou
-   Direct3D 11. Remplace le dump PPM ponctuel par une fenêtre qui
-   affiche le flux iPhone en direct. La `H264Decoder` produit déjà
-   des `AVFrame YUV420P`, le renderer consomme ces frames depuis
-   le thread de `MirrorListener`.
-2. **Audio RAOP** (stream type 96) sur le chemin UDP. Protocole
-   différent du vidéo : AES-128-CBC (pas CTR), format ALAC/AAC,
-   paquets RTP standard avec en-tête de 12 octets. Utilise
-   `libavcodec` pour la décompression ALAC/AAC → PCM, puis
-   WASAPI pour le rendu audio Windows.
+1. **Câbler le volume** — iPhone envoie `SET_PARAMETER "volume: -X.Y"`
+   que l'on logge déjà ; il suffit de traduire la valeur dB (0 dB = max,
+   -144 dB = muet) vers un gain linéaire appliqué au buffer PCM avant
+   `SdlAudioOutput::push`.
+2. **DAAP metadata** — parser les `mlit` (titre, artiste, album, cover
+   art) envoyés en `SET_PARAMETER` pour les afficher dans la fenêtre
+   SDL quand l'écran mirror n'est pas actif.
+3. **ALAC support** — quand `ct=2` (iTunes legacy, AirPlay 1), le flux
+   est en ALAC au lieu d'AAC-ELD. `libavcodec` a un décodeur `alac`
+   disponible via `AV_CODEC_ID_ALAC` ; c'est ~30 lignes pour dispatcher.
+4. **AirPlay Streaming mode** pour YouTube / Netflix / Apple TV+.
+   Protocole distinct (`/reverse`, `/play` avec URL, FairPlay Streaming
+   DRM). Plusieurs jours de travail, licence DRM sensible.
 
 ## Références
 
