@@ -8,6 +8,8 @@
 #include "crypto/pair_verify.h"
 #include "log.h"
 
+#include <openssl/evp.h>
+
 #include <sstream>
 #include <string>
 
@@ -229,6 +231,38 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
         if (session.fairplay) {
             auto aes_key = session.fairplay->decrypt_stream_key(parsed.ekey);
             if (aes_key.size() == 16) {
+                // Modern iOS clients require a second hashing step:
+                //   aes_key = SHA-512(aes_key || ecdh_secret)[0..16]
+                // where ecdh_secret is the 32-byte X25519 shared secret from
+                // pair-verify. Legacy AirPlay 1 clients skip this; we always
+                // apply it because iPhone / iPad / modern Mac clients do.
+                // Skipping this step leaves the stream key off by a hash and
+                // the H.264 payloads decrypt to noise.
+                if (session.pair_verify &&
+                    session.pair_verify->ecdh_secret().size() == 32) {
+                    unsigned char hashed[64];
+                    unsigned int  hashed_len = 0;
+                    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+                    bool ok = ctx &&
+                        EVP_DigestInit_ex(ctx, EVP_sha512(), nullptr) == 1 &&
+                        EVP_DigestUpdate(ctx, aes_key.data(), aes_key.size()) == 1 &&
+                        EVP_DigestUpdate(ctx,
+                            session.pair_verify->ecdh_secret().data(), 32) == 1 &&
+                        EVP_DigestFinal_ex(ctx, hashed, &hashed_len) == 1 &&
+                        hashed_len == 64;
+                    if (ctx) EVP_MD_CTX_free(ctx);
+                    if (ok) {
+                        aes_key.assign(hashed, hashed + 16);
+                        LOG_INFO << "airplay2 SETUP: AES key post-hashed with "
+                                    "ECDH secret (modern-client path)";
+                    } else {
+                        LOG_WARN << "airplay2 SETUP: SHA-512 post-hash failed; "
+                                    "using raw fairplay_decrypt output";
+                    }
+                } else {
+                    LOG_WARN << "airplay2 SETUP: no ECDH secret from pair-verify; "
+                                "using raw fairplay_decrypt output (likely broken)";
+                }
                 session.aes_key = std::move(aes_key);
                 session.aes_iv  = parsed.eiv;
                 LOG_INFO << "airplay2 SETUP: stream AES key recovered (16 B)";

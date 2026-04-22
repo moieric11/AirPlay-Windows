@@ -45,6 +45,13 @@ public:
 
     State state() const { return state_; }
 
+    // The 32-byte X25519 ECDH shared secret, available after round 1 has
+    // completed. Used by the AirPlay 2 SETUP handler to post-hash the
+    // fairplay-decrypted AES stream key (`aeskey = SHA-512(aeskey ||
+    // ecdh_secret)[0..16]`) — without this step iOS's H.264 payloads
+    // decrypt to noise.
+    const std::vector<unsigned char>& ecdh_secret() const { return ecdh_secret_; }
+
 private:
     bool derive_aes_key_iv(const unsigned char* shared_secret,
                            std::vector<unsigned char>& aes_key,
@@ -56,6 +63,7 @@ private:
     std::vector<unsigned char> server_x25519_pub_;   // 32
     std::vector<unsigned char> client_x25519_pub_;   // 32
     std::vector<unsigned char> client_ed25519_pub_;  // 32
+    std::vector<unsigned char> ecdh_secret_;         // 32, filled in round 1
 
     EVP_CIPHER_CTX* aes_ctx_{nullptr};
 };

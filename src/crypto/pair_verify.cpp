@@ -156,6 +156,9 @@ bool PairVerifySession::handle_message1(const unsigned char* in,
         state_ = State::Failed;
         return false;
     }
+    // Keep a copy — AirPlay 2 SETUP re-hashes the fairplay-decrypted AES
+    // stream key against this secret to obtain the actual stream key.
+    ecdh_secret_ = shared;
 
     // 3. Derive AES key / IV
     std::vector<unsigned char> aes_key, aes_iv;
