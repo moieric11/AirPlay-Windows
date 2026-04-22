@@ -103,18 +103,30 @@ endif()
 # Without it, decryption is disabled and we only log the encrypted NAL units.
 if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/playfair/playfair.c")
     message(STATUS "playfair: using provisioned decryption library")
-    target_sources(airplay-windows PRIVATE
+    set(_playfair_srcs
         third_party/playfair/playfair.c
         third_party/playfair/hand_garble.c
         third_party/playfair/omg_hax.c
         third_party/playfair/modified_md5.c
         third_party/playfair/sap_hash.c)
+    target_sources(airplay-windows PRIVATE ${_playfair_srcs})
     # UxPlay's source uses `#include "playfair/playfair.h"` from fairplay_playfair.c
     # and `#include "playfair.h"` from within playfair/*.c, so we expose both.
     target_include_directories(airplay-windows PRIVATE
         third_party
         third_party/playfair)
     target_compile_definitions(airplay-windows PRIVATE HAVE_PLAYFAIR=1)
+
+    # Quiet down playfair's legacy-C warnings (intentional byte truncations,
+    # unused-variable debug leftovers, a spurious C4701 in modified_md5.c).
+    # We keep our own source compiled at /W4 to catch real issues.
+    if(MSVC)
+        set_source_files_properties(${_playfair_srcs} PROPERTIES
+            COMPILE_FLAGS "/wd4100 /wd4101 /wd4189 /wd4244 /wd4305 /wd4701")
+    else()
+        set_source_files_properties(${_playfair_srcs} PROPERTIES
+            COMPILE_FLAGS "-w")
+    endif()
 else()
     message(STATUS "playfair: not provisioned — fairplay_decrypt() will be a no-op")
 endif()
