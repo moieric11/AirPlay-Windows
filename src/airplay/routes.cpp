@@ -440,6 +440,86 @@ Response handle_unimplemented(const Request& req, const char* what) {
     return r;
 }
 
+// POST /reverse — reverse event channel setup. iOS keeps this TCP socket
+// open so the server can push playback events (state, metadata, scrub,
+// session end, …) back. We respond 101 Switching Protocols with
+// `Upgrade: PTTH/1.0` (Push-Tunneled HTTP 1.0, Apple-specific). The
+// connection stays alive afterwards — our server's per-connection loop
+// will just block on the next reader.read() since iOS rarely sends
+// additional requests on this socket. For now we don't push any events
+// (reconnaissance step 3a); replying 101 is enough to stop the retry
+// storm we saw with the previous 501 stub.
+Response handle_reverse(const Request& req) {
+    Response r;
+    r.status_code = 101;
+    r.status_text = "Switching Protocols";
+    r.version     = "HTTP/1.1";
+    copy_cseq(req, r);
+    r.set_header("Upgrade",    "PTTH/1.0");
+    r.set_header("Connection", "Upgrade");
+    // Echo iOS's session id back so it correlates this channel with the
+    // RTSP control socket.
+    auto sid = req.header("x-apple-session-id");
+    if (!sid.empty()) r.set_header("X-Apple-Session-ID", sid);
+    auto purpose = req.header("x-apple-purpose");
+    LOG_INFO << "/reverse channel opened (X-Apple-Purpose=\"" << purpose
+             << "\", session=" << sid << ')';
+    return r;
+}
+
+// GET /server-info — capabilities plist the AirPlay Streaming path queries
+// before trying to stream. Reuses the same info_plist builder as GET /info;
+// iOS happily accepts a superset of fields here.
+Response handle_server_info(const DeviceContext& ctx, const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    r.set_header("Content-Type", "application/x-apple-binary-plist");
+    r.body = build_info_plist(ctx);
+    LOG_INFO << "/server-info served (" << r.body.size() << "B)";
+    return r;
+}
+
+// Dump a request body as readable text when possible, otherwise as hex.
+// Clips at 256 bytes to keep logs manageable.
+std::string snapshot_body(const std::vector<unsigned char>& body) {
+    if (body.empty()) return "(empty)";
+    const std::size_t max = std::min<std::size_t>(body.size(), 256);
+    bool printable = true;
+    for (std::size_t i = 0; i < max; ++i) {
+        unsigned char c = body[i];
+        if (c < 0x20 && c != '\r' && c != '\n' && c != '\t') { printable = false; break; }
+        if (c > 0x7e) { printable = false; break; }
+    }
+    std::ostringstream os;
+    if (printable) {
+        os << '"';
+        os.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(max));
+        os << (body.size() > max ? "...\"" : "\"");
+    } else {
+        for (std::size_t i = 0; i < max; ++i) {
+            char tmp[4];
+            std::snprintf(tmp, sizeof(tmp), "%02x ", body[i]);
+            os << tmp;
+        }
+        if (body.size() > max) os << "..." << body.size() << "B total";
+    }
+    return os.str();
+}
+
+// Generic 200 OK stub that logs the body. Used for all the AirPlay
+// Streaming routes we haven't implemented yet (/play, /stop, /rate,
+// /scrub, /setProperty, /getProperty, /audioMode, /action, /command, …)
+// so we can observe what iOS sends during a YouTube / Netflix session.
+Response handle_stream_stub(const Request& req, const char* tag) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    LOG_INFO << "[streaming] " << tag << " " << req.uri
+             << "  body=" << req.body.size() << "B  " << snapshot_body(req.body);
+    auto sid = req.header("x-apple-session-id");
+    if (!sid.empty()) LOG_INFO << "  X-Apple-Session-ID=" << sid;
+    return r;
+}
+
 } // namespace
 
 Response dispatch(const DeviceContext& ctx, ClientSession& session,
@@ -472,6 +552,22 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "TEARDOWN")    return handle_teardown(session, req);
     if (req.method == "GET_PARAMETER")  return handle_get_parameter(req);
     if (req.method == "SET_PARAMETER")  return handle_set_parameter(req);
+
+    // AirPlay Streaming reconnaissance (step 3a): answer the routes iOS
+    // hammers at session setup so we stop the retry storm and can observe
+    // what else it sends for YouTube / Netflix / Apple TV+ playback.
+    if (req.method == "POST" && req.uri == "/reverse")          return handle_reverse(req);
+    if (req.method == "GET"  && req.uri == "/server-info")      return handle_server_info(ctx, req);
+    if (req.method == "POST" && req.uri == "/audioMode")        return handle_stream_stub(req, "audioMode");
+    if (req.method == "POST" && req.uri == "/play")             return handle_stream_stub(req, "play");
+    if (req.method == "POST" && req.uri == "/stop")             return handle_stream_stub(req, "stop");
+    if (req.method == "POST" && req.uri == "/rate")             return handle_stream_stub(req, "rate");
+    if (req.method == "POST" && req.uri == "/scrub")            return handle_stream_stub(req, "scrub");
+    if (req.method == "POST" && req.uri == "/setProperty")      return handle_stream_stub(req, "setProperty");
+    if (req.method == "POST" && req.uri == "/getProperty")      return handle_stream_stub(req, "getProperty");
+    if (req.method == "GET"  && req.uri == "/playback-info")    return handle_stream_stub(req, "playback-info");
+    if (req.method == "POST" && req.uri == "/action")           return handle_stream_stub(req, "action");
+    if (req.method == "POST" && req.uri == "/command")          return handle_stream_stub(req, "command");
 
     return handle_unimplemented(req, "unknown route");
 }
