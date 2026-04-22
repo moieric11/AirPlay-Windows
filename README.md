@@ -4,20 +4,25 @@ Récepteur AirPlay 2 (mirroring) pour Windows, porté depuis
 [UxPlay](https://github.com/FDH2/UxPlay) (GPL-3.0) avec un stack 100 %
 natif Windows (pas de Bonjour SDK ni de dépendance Apple au runtime).
 
-> **État actuel — validé contre un iPhone 16 (iOS 18) en production.**
+> **État actuel — flux H.264 déchiffré en direct depuis un iPhone 16 / iOS 18.**
 >
-> Un iPhone du même réseau Wi-Fi voit `AirPlay-Windows` dans son Centre
-> de contrôle, complète tout le handshake de sécurité, et pousse
-> effectivement son flux H.264 chiffré vers le PC. Le récepteur reçoit
-> ~3 Mo/session, parse chaque frame (SPS_PPS, IDR, NON_IDR, stream
-> reports) et **identifie correctement le codec et la résolution** en
-> temps réel :
+> Un iPhone du même Wi-Fi voit `AirPlay-Windows` dans son Centre de
+> contrôle, traverse l'intégralité du handshake (pair-verify + FairPlay
+> + SETUP + RECORD), envoie son flux H.264 chiffré via TCP. Le récepteur
+> récupère la clé AES de session (via FairPlay playfair + post-hash
+> ECDH), déchiffre chaque frame à la volée, et **les NAL units qui en
+> sortent sont conformes à la spec H.264** (forbidden_zero_bit=0, NAL
+> types 1/5/6/7/8, longueurs exactes) :
 >
 > ```
 > mirror video: H.264 High level 3.1, 498x1080
+> mirror decrypted frame[2]: VIDEO_IDR    first NAL len=6575 type=5  ref_idc=1
+> mirror decrypted frame[3]: VIDEO_NON_IDR first NAL len=406  type=1  ref_idc=1
 > ```
 >
-> Ce qui reste pour afficher la vidéo à l'écran est documenté plus bas.
+> Tout le protocole et toute la cryptographie sont derrière nous. Ce
+> qui reste est du travail applicatif pur (split NAL + décodeur +
+> renderer), documenté plus bas.
 
 ## Ce qui fonctionne
 
@@ -34,10 +39,12 @@ natif Windows (pas de Bonjour SDK ni de dépendance Apple au runtime).
 | Client NTP (poll iOS timing server)         | ✅   | `lib/raop_ntp.c`                             |
 | Mirror TCP listener + frame parser          | ✅   | `lib/raop_rtp_mirror.c`                      |
 | Parse SPS (profile/level/résolution)        | ✅   | H.264 spec, standalone                       |
-| FairPlay decrypt (ekey → AES key)           | ❌   | `lib/playfair/` — cf. `docs/FAIRPLAY.md`     |
-| Décryption AES-CTR des NAL H.264            | ❌   | en aval de FairPlay decrypt                  |
+| **FairPlay decrypt (ekey → AES key)**       | ✅   | `lib/playfair/*` (provisioned locally)       |
+| **AES post-hash avec ECDH secret**          | ✅   | `raop_handler_setup` (modern-client path)    |
+| **AES-CTR des NAL H.264 (in-place decrypt)**| ✅   | `lib/mirror_buffer.c`                        |
+| Split NAL + conversion Annex-B              | ❌   | `raop_rtp_mirror_thread` — cf. roadmap       |
 | Décodeur H.264 (FFmpeg)                     | ❌   | à intégrer                                   |
-| Renderer (SDL2 / DirectX)                   | ❌   | à intégrer                                   |
+| Renderer (SDL2 / Direct3D 11)               | ❌   | à intégrer                                   |
 | Audio (RAOP, ALAC/AAC)                      | ❌   | `lib/raop.c`                                 |
 
 ## Stratégie
@@ -117,14 +124,22 @@ python3 tools/test_pair_verify.py
 
 ## Prochaines étapes
 
-1. **FairPlay decrypt niveau B** — porter `lib/playfair/` d'UxPlay
-   (`hand_garble.c`, `omg_hax.c`, `modified_md5.c`, `sap_hash.c` +
-   la table `omg_hax.h` de 483 Ko). Dès que `fairplay_decrypt(ekey)`
-   renvoie une clé AES valide, toutes les frames chiffrées peuvent
-   être déchiffrées en AES-CTR.
-2. **H.264 decoder** via FFmpeg (vcpkg).
-3. **Renderer** SDL2 ou DirectX 11.
-4. **Audio RAOP** sur le stream type 96 (ALAC/AAC).
+Plus aucune étape n'implique de protocole AirPlay ou de cryptographie —
+tout est à partir de H.264 en clair :
+
+1. **Split NAL unités + conversion Annex-B** : chaque payload décrypté
+   contient une ou plusieurs NAL units préfixées par leur longueur BE
+   (format AVCC). Remplacer chaque length par le start-code
+   `00 00 00 01` donne de l'Annex-B consommable par FFmpeg. Stocker
+   les SPS/PPS clair (type 7/8) à part pour les prepender à chaque
+   IDR à envoyer au décodeur.
+2. **H.264 decoder** via FFmpeg (vcpkg → `libavcodec`). Alimenter
+   `avcodec_send_packet` avec (SPS/PPS + IDR) au démarrage, puis
+   les P-frames successifs via `avcodec_receive_frame`.
+3. **Renderer** Direct3D 11 ou SDL2 pour afficher les `AVFrame`
+   YUV → RGB.
+4. **Audio RAOP** (stream type 96) sur le chemin UDP : AES-128-CBC
+   (contrairement à CTR pour vidéo), décodage ALAC/AAC.
 
 ## Références
 
