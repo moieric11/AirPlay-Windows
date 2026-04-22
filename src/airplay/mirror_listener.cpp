@@ -1,4 +1,5 @@
 #include "airplay/mirror_listener.h"
+#include "airplay/h264_nal.h"
 #include "airplay/h264_sps.h"
 #include "log.h"
 
@@ -51,13 +52,6 @@ uint32_t get_u32_le(const unsigned char* b, int off) {
          | (static_cast<uint32_t>(b[off + 1]) <<  8)
          | (static_cast<uint32_t>(b[off + 2]) << 16)
          | (static_cast<uint32_t>(b[off + 3]) << 24);
-}
-
-uint32_t get_u32_be(const unsigned char* b, int off) {
-    return (static_cast<uint32_t>(b[off + 0]) << 24)
-         | (static_cast<uint32_t>(b[off + 1]) << 16)
-         | (static_cast<uint32_t>(b[off + 2]) <<  8)
-         |  static_cast<uint32_t>(b[off + 3]);
 }
 
 // SPS_PPS packet payload is the AVCC "avcC" decoder configuration record
@@ -260,6 +254,7 @@ void MirrorListener::reader_loop(socket_t client) {
     std::array<unsigned char, kHeaderSize> header{};
     std::map<uint16_t, uint64_t> counts;
     std::map<uint16_t, uint64_t> bytes_by_type;
+    std::map<int, uint64_t>      nal_counts;
     uint64_t frames       = 0;
     uint64_t total_header = 0;
     uint64_t total_body   = 0;
@@ -316,31 +311,40 @@ void MirrorListener::reader_loop(socket_t client) {
             log_sps_from_sps_pps_payload(payload);
         }
 
-        // Encrypted frames (IDR + non-IDR): if the decrypt context is up,
-        // AES-CTR-decrypt the payload in place. Log a sanity line on the
-        // first decrypted frame — the payload should start with a 4-byte
-        // big-endian NAL length followed by an H.264 NAL header whose
-        // forbidden_zero_bit is 0.
+        // Encrypted frames (IDR + non-IDR): AES-CTR-decrypt in place, then
+        // split the resulting cleartext AVCC stream into individual NAL
+        // units while converting to Annex-B (start-code-prefixed).
         const bool encrypted = (ftype == kFrameVideoIdr ||
                                 ftype == kFrameVideoNonIdr);
         if (encrypted && decrypt_ && payload_size >= 5) {
             if (!decrypt_->decrypt(payload.data(), static_cast<int>(payload_size))) {
-                LOG_WARN << "mirror: AES-CTR decrypt failed on frame "
-                         << frames << " (size=" << payload_size << ')';
-            } else if (counts[ftype] == 1) {
-                // Parse first NAL header: bytes 0..3 = length BE, byte 4 = NAL byte.
-                uint32_t nal_len = get_u32_be(payload.data(), 0);
-                uint8_t  nh      = payload[4];
-                const int nalu_type = nh & 0x1f;
-                const int ref_idc   = (nh >> 5) & 0x3;
-                const bool forbidden = (nh & 0x80) != 0;
-                LOG_INFO << "mirror decrypted frame[" << frames << "]: "
-                         << frame_name(ftype)
-                         << "  first NAL len=" << nal_len
-                         << " type=" << nalu_type
-                         << " ref_idc=" << ref_idc
-                         << (forbidden ? " FORBIDDEN_BIT_SET(!)" : "");
-                LOG_INFO << "  clear bytes: " << hex_dump(payload.data(), payload.size());
+                LOG_WARN << "mirror: AES-CTR decrypt failed on frame " << frames;
+            } else {
+                std::vector<NalUnit> nals;
+                const bool ok = parse_nals_avcc_to_annexb(
+                    payload.data(), payload_size, nals);
+
+                if (!ok) {
+                    LOG_WARN << "mirror frame[" << frames << "]: malformed NAL "
+                                "stream after decrypt ("
+                             << nals.size() << " NAL(s) parsed before stopping)";
+                } else {
+                    for (const auto& n : nals) nal_counts[n.type]++;
+                    // Verbose: first IDR, first non-IDR, and any multi-NAL frame.
+                    const bool first_of_kind = (counts[ftype] == 1);
+                    const bool multi_nal     = (nals.size() > 1);
+                    if (first_of_kind || multi_nal) {
+                        LOG_INFO << "mirror frame[" << frames << "] "
+                                 << frame_name(ftype) << " → "
+                                 << nals.size() << " NAL(s):";
+                        for (const auto& n : nals) {
+                            LOG_INFO << "  NAL " << nal_type_name(n.type)
+                                     << "(type=" << n.type
+                                     << ", ref_idc=" << n.ref_idc
+                                     << ", size=" << n.size << "B)";
+                        }
+                    }
+                }
             }
         }
 
@@ -355,6 +359,13 @@ void MirrorListener::reader_loop(socket_t client) {
     for (const auto& [t, c] : counts) {
         LOG_INFO << "  " << frame_name(t) << " (0x" << std::hex << t << std::dec
                  << "): " << c << " frames, " << bytes_by_type[t] << " B";
+    }
+    if (!nal_counts.empty()) {
+        LOG_INFO << "NAL units decoded (after decrypt + AVCC→Annex-B):";
+        for (const auto& [t, c] : nal_counts) {
+            LOG_INFO << "  " << nal_type_name(t) << " (type=" << t << "): "
+                     << c << " NAL(s)";
+        }
     }
 }
 
