@@ -351,6 +351,11 @@ void VideoRenderer::run(const std::string& title) {
         tex = SDL_CreateTextureFromSurface(renderer, surf);
         w = surf->w; h = surf->h;
         SDL_FreeSurface(surf);
+        // Default texture blend mode is NONE, which ignores alpha and renders
+        // the surface as a solid opaque rectangle (every transparent pixel of
+        // the glyph background fills the window with white). Force BLEND so
+        // only the anti-aliased glyph pixels are drawn.
+        if (tex) SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
     };
 
     auto last_video_frame_time = std::chrono::steady_clock::now()
