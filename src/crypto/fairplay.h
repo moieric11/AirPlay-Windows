@@ -49,6 +49,16 @@ public:
     // for the stream-key decryption step. Returns an empty span while
     // state() != Done.
     const std::vector<unsigned char>& keymsg() const { return keymsg_; }
+
+    // Derive the 16-byte AES session key from the 72-byte RSA-wrapped ekey
+    // iOS sends in SETUP. Wraps UxPlay's playfair_decrypt(); only available
+    // when the playfair library is present at build time.
+    //
+    // Returns a 16-byte vector on success, empty on failure (state != Done,
+    // wrong ekey size, or playfair not provisioned — check logs for cause).
+    // Must be called after the handshake has completed (state() == Done).
+    std::vector<unsigned char> decrypt_stream_key(
+        const std::vector<unsigned char>& ekey) const;
 };
 
 } // namespace ap::crypto

@@ -32,6 +32,13 @@ struct ClientSession {
 
     std::unique_ptr<SdpSession>    sdp;       // populated by ANNOUNCE
     std::unique_ptr<StreamSession> streams;   // populated by SETUP
+
+    // Stream decryption keys, populated during AirPlay 2 session SETUP once
+    // fairplay_decrypt() turns the 72-byte ekey into a 16-byte AES key.
+    // Combined with aes_iv and the per-stream streamConnectionID, these
+    // derive the AES-CTR context that decrypts the H.264 NAL units.
+    std::vector<unsigned char> aes_key;    // 16 bytes
+    std::vector<unsigned char> aes_iv;     // 16 bytes
 };
 
 } // namespace ap::airplay

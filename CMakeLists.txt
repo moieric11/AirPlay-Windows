@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(airplay-windows VERSION 0.1.0 LANGUAGES CXX)
+project(airplay-windows VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,6 +95,28 @@ else()
                    "fail at /fp-setup until a real blob is provided")
     target_sources(airplay-windows PRIVATE
         third_party/fairplay_blobs_stub.cpp)
+endif()
+
+# ---- playfair (level-B FairPlay decrypt, swap-ready) --------------------------
+# If third_party/playfair/ exists (copied from UxPlay's lib/playfair/), compile
+# and link its C files so fairplay_decrypt(ekey) can recover the AES stream key.
+# Without it, decryption is disabled and we only log the encrypted NAL units.
+if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/playfair/playfair.c")
+    message(STATUS "playfair: using provisioned decryption library")
+    target_sources(airplay-windows PRIVATE
+        third_party/playfair/playfair.c
+        third_party/playfair/hand_garble.c
+        third_party/playfair/omg_hax.c
+        third_party/playfair/modified_md5.c
+        third_party/playfair/sap_hash.c)
+    # UxPlay's source uses `#include "playfair/playfair.h"` from fairplay_playfair.c
+    # and `#include "playfair.h"` from within playfair/*.c, so we expose both.
+    target_include_directories(airplay-windows PRIVATE
+        third_party
+        third_party/playfair)
+    target_compile_definitions(airplay-windows PRIVATE HAVE_PLAYFAIR=1)
+else()
+    message(STATUS "playfair: not provisioned — fairplay_decrypt() will be a no-op")
 endif()
 
 if(LIBPLIST_TARGET)

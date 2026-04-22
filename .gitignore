@@ -21,3 +21,4 @@ identity.key
 # FairPlay blobs are Apple-copyrighted; provision locally per docs/FAIRPLAY.md
 # but never commit.
 third_party/fairplay_blobs_real.cpp
+third_party/playfair/

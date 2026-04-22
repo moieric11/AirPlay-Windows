@@ -221,12 +221,24 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
             r.status_code = 500; r.status_text = "Internal Server Error";
             return r;
         }
-        // TODO: pass parsed.ekey through fairplay_decrypt() to recover the
-        // AES-128 stream key, then stash it + parsed.eiv on the session.
-        // Requires level-B playfair — see docs/FAIRPLAY.md. For now we just
-        // log and keep going: iPhone only checks fairplay return during
-        // actual stream decryption, not during SETUP itself.
-        LOG_WARN << "airplay2 SETUP: fairplay_decrypt skipped (playfair not yet wired)";
+
+        // FairPlay-decrypt the 72-byte ekey into the 16-byte AES stream key
+        // (requires the playfair library to be provisioned — see docs/FAIRPLAY.md).
+        // UxPlay doesn't abort the SETUP if this fails; it just logs and keeps
+        // going, since iOS only cares about the response shape at this stage.
+        if (session.fairplay) {
+            auto aes_key = session.fairplay->decrypt_stream_key(parsed.ekey);
+            if (aes_key.size() == 16) {
+                session.aes_key = std::move(aes_key);
+                session.aes_iv  = parsed.eiv;
+                LOG_INFO << "airplay2 SETUP: stream AES key recovered (16 B)";
+            } else {
+                LOG_WARN << "airplay2 SETUP: fairplay_decrypt failed — "
+                            "stream will not be decryptable";
+            }
+        } else {
+            LOG_WARN << "airplay2 SETUP: no FairPlaySession (fp-setup skipped?)";
+        }
 
         uint16_t event_port = 0, timing_port = 0;
         if (!session.streams->setup_session(event_port, timing_port)) {

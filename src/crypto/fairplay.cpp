@@ -4,6 +4,15 @@
 
 #include <cstring>
 
+#if defined(HAVE_PLAYFAIR)
+extern "C" {
+    // Signature from UxPlay/lib/playfair/playfair.h (GPL-3.0).
+    void playfair_decrypt(unsigned char* message3,
+                          unsigned char* cipherText,
+                          unsigned char* keyOut);
+}
+#endif
+
 // FairPlay SAP setup/handshake — ported from UxPlay's lib/fairplay_playfair.c
 // (GPL-3.0). UxPlay's approach is "replay", not "compute": the 142-byte msg2
 // is looked up in a 4-entry table indexed by the mode byte of msg1, and
@@ -89,6 +98,38 @@ bool FairPlaySession::handle_msg1(const unsigned char* in, std::size_t /*len*/,
 // msg3 → msg4 : 12-byte fp_header prefix + 20 bytes copied from msg3[144..164].
 // The full 164-byte msg3 is kept on the session so a later decrypt step can
 // combine it with the 72-byte RSAAES key from ANNOUNCE.
+std::vector<unsigned char> FairPlaySession::decrypt_stream_key(
+    const std::vector<unsigned char>& ekey) const {
+#if !defined(HAVE_PLAYFAIR)
+    (void)ekey;
+    LOG_WARN << "decrypt_stream_key: playfair not provisioned at build time";
+    return {};
+#else
+    if (state_ != State::Done) {
+        LOG_ERROR << "decrypt_stream_key: handshake not complete (state="
+                  << static_cast<int>(state_) << ')';
+        return {};
+    }
+    if (keymsg_.size() != kMsg3Len) {
+        LOG_ERROR << "decrypt_stream_key: keymsg size " << keymsg_.size();
+        return {};
+    }
+    if (ekey.size() != 72) {
+        LOG_ERROR << "decrypt_stream_key: ekey size " << ekey.size() << " (want 72)";
+        return {};
+    }
+
+    // playfair_decrypt mutates neither input; the non-const signature is a
+    // historical artifact from UxPlay's C API. We pass copies to stay safe.
+    std::vector<unsigned char> keymsg_copy = keymsg_;
+    std::vector<unsigned char> ekey_copy   = ekey;
+    std::vector<unsigned char> out(16, 0);
+
+    playfair_decrypt(keymsg_copy.data(), ekey_copy.data(), out.data());
+    return out;
+#endif
+}
+
 bool FairPlaySession::handle_msg3(const unsigned char* in, std::size_t /*len*/,
                                   std::vector<unsigned char>& out) {
     if (state_ != State::ExpectMsg3) {
