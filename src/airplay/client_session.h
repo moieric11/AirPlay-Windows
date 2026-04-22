@@ -45,6 +45,12 @@ struct ClientSession {
     // derive the AES-CTR context that decrypts the H.264 NAL units.
     std::vector<unsigned char> aes_key;    // 16 bytes
     std::vector<unsigned char> aes_iv;     // 16 bytes
+
+    // Remember the last "progress: start/curr/end" values so the next
+    // push can spot seeks (curr jumps within the same track) and track
+    // changes (start itself changes). 0 means nothing seen yet.
+    unsigned long long last_progress_start = 0;
+    unsigned long long last_progress_curr  = 0;
 };
 
 } // namespace ap::airplay

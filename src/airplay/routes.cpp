@@ -474,6 +474,28 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
                     elapsed_ticks * 1000ULL / 44100ULL);
                 const uint32_t total_ms   = static_cast<uint32_t>(
                     total_ticks   * 1000ULL / 44100ULL);
+
+                // Skip / seek detection: a new `start` means a fresh track
+                // (iOS re-anchors the RTP clock on each track); a big jump
+                // in `curr` while `start` stays the same is a seek inside
+                // the current track. 44100 ticks ≈ 1 s, so threshold 2 s.
+                if (session.last_progress_start != 0 &&
+                    start != session.last_progress_start) {
+                    LOG_INFO << "skip: new track (start "
+                             << session.last_progress_start << " -> " << start << ')';
+                } else if (session.last_progress_curr != 0) {
+                    const long long delta_ticks =
+                        static_cast<long long>(curr) -
+                        static_cast<long long>(session.last_progress_curr);
+                    if (delta_ticks >  static_cast<long long>(2 * 44100)) {
+                        LOG_INFO << "seek forward: +" << (delta_ticks / 44100) << 's';
+                    } else if (delta_ticks < -static_cast<long long>(44100 / 2)) {
+                        LOG_INFO << "seek back: " << (delta_ticks / 44100) << 's';
+                    }
+                }
+                session.last_progress_start = start;
+                session.last_progress_curr  = curr;
+
                 LOG_INFO << "playback " << (elapsed_ms / 1000) << "s / "
                          << (total_ms / 1000) << "s";
                 if (session.renderer) {
