@@ -110,8 +110,17 @@ void AudioReceiver::stop() {
 void AudioReceiver::thread_fn() {
     unsigned char buf[4096];
     unsigned char cleartext[4096];
-    uint64_t pkts         = 0;
-    uint64_t total_bytes  = 0;
+    uint64_t pkts            = 0;
+    uint64_t total_bytes     = 0;
+    // Packet size histogram: helps see that we actually receive audio of
+    // the expected ~370 B size, plus the sync/RTCP "4-byte" and similar
+    // dwarf packets iOS peppers the stream with.
+    uint64_t hist_0_16 = 0, hist_17_64 = 0, hist_65_256 = 0,
+             hist_257_512 = 0, hist_513_plus = 0;
+    // Number of already-verbose-logged packets per "big enough to be real
+    // audio" bucket, to surface the first few real AAC frames and skip
+    // the leading sentinel packets that swallow all our verbose slots.
+    int big_pkts_logged = 0;
 
     while (running_.load()) {
         int n = ::recvfrom(cfg_.data_sock,
@@ -154,12 +163,28 @@ void AudioReceiver::thread_fn() {
         ++pkts;
         total_bytes += static_cast<uint64_t>(payload_len);
 
-        if (pkts <= 3) {
+        if (payload_len <=  16)      ++hist_0_16;
+        else if (payload_len <=  64) ++hist_17_64;
+        else if (payload_len <= 256) ++hist_65_256;
+        else if (payload_len <= 512) ++hist_257_512;
+        else                         ++hist_513_plus;
+
+        // Verbose log for the first couple of everything, AND for the first
+        // 5 "big enough to be real audio" packets (>= 100 B). That's where
+        // the codec signature lives.
+        const bool first_any = (pkts <= 2);
+        const bool first_big = (payload_len >= 100 && big_pkts_logged < 5);
+        if (first_any || first_big) {
             LOG_INFO << "audio pkt#" << pkts << ": pt=" << static_cast<int>(pt)
                      << " seq=" << seq << " ts=" << ts
-                     << " paylen=" << payload_len;
-            LOG_INFO << "  clear: " << hex_dump(cleartext, static_cast<std::size_t>(outlen));
-        } else if ((pkts % 500) == 0) {
+                     << " paylen=" << payload_len
+                     << " (enc=" << encrypted_len << " tail=" << tail_len << ')';
+            LOG_INFO << "  clear: " << hex_dump(cleartext,
+                                                static_cast<std::size_t>(outlen));
+            if (first_big) ++big_pkts_logged;
+        }
+
+        if ((pkts % 500) == 0) {
             LOG_INFO << "audio: " << pkts << " pkts, "
                      << (total_bytes / 1024) << " KB received";
         }
@@ -167,6 +192,12 @@ void AudioReceiver::thread_fn() {
 
     LOG_INFO << "AudioReceiver stopped (" << pkts << " pkts, "
              << total_bytes << " payload bytes)";
+    LOG_INFO << "  payload size histogram: "
+             << "[0..16]="      << hist_0_16
+             << "  [17..64]="   << hist_17_64
+             << "  [65..256]="  << hist_65_256
+             << "  [257..512]=" << hist_257_512
+             << "  [513+]="     << hist_513_plus;
 }
 
 } // namespace ap::audio
