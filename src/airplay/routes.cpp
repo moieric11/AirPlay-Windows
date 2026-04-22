@@ -1,6 +1,7 @@
 #include "airplay/routes.h"
 #include "airplay/airplay2_setup.h"
 #include "airplay/client_session.h"
+#include "airplay/daap.h"
 #include "airplay/info_plist.h"
 #include "airplay/sdp.h"
 #include "airplay/streams.h"
@@ -10,6 +11,9 @@
 
 #include <openssl/evp.h>
 
+#include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <sstream>
 #include <string>
 
@@ -421,32 +425,76 @@ Response handle_get_parameter(const Request& req) {
     return r;
 }
 
-// SET_PARAMETER carries volume updates, track metadata, progress, etc.
-// Acknowledge with 200 and, for the text/parameters "volume:" entries,
-// forward the dB value to the audio output gain.
+// Save the cover-art JPEG that Apple Music streams via SET_PARAMETER to
+// a fixed on-disk location. Later we'll surface it in the SDL window
+// overlay instead of overwriting a single file.
+void save_cover_art(const unsigned char* data, std::size_t len) {
+    std::ofstream f("cover.jpg", std::ios::binary | std::ios::trunc);
+    if (!f) { LOG_WARN << "cover.jpg: open for write failed"; return; }
+    f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
+    LOG_INFO << "cover art: wrote " << len << " bytes to cover.jpg";
+}
+
+// SET_PARAMETER carries three very different payloads depending on what
+// iOS wants to tell us. Dispatch on Content-Type so each gets the right
+// parser, and log a human-readable summary.
 Response handle_set_parameter(ClientSession& session, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
     if (req.body.empty()) return r;
 
-    const std::string body_str(
-        reinterpret_cast<const char*>(req.body.data()),
-        std::min<std::size_t>(req.body.size(), 128));
-    LOG_INFO << "SET_PARAMETER body=\"" << body_str << '"';
+    const auto ctype = req.header("content-type");
 
-    // iOS sends e.g. "volume: -1.875000\r\n" (AirPlay convention: 0 dB
-    // = max, -144 dB = mute). Plug that into the audio output so the
-    // iPhone's volume slider actually does something.
-    const std::string marker = "volume:";
-    auto pos = body_str.find(marker);
-    if (pos != std::string::npos && session.streams) {
-        try {
-            float db = std::stof(body_str.substr(pos + marker.size()));
-            session.streams->set_audio_volume_db(db);
-        } catch (...) {
-            LOG_WARN << "SET_PARAMETER: could not parse volume value";
+    // ---- text/parameters: "volume:", "progress:", "rate:" etc. ----------
+    if (ctype.find("text/parameters") != std::string::npos ||
+        ctype.empty()) {  // some iOS firmware omits the header
+        const std::string body_str(
+            reinterpret_cast<const char*>(req.body.data()),
+            std::min<std::size_t>(req.body.size(), 256));
+
+        if (body_str.compare(0, 7, "volume:") == 0) {
+            try {
+                float db = std::stof(body_str.substr(7));
+                if (session.streams) session.streams->set_audio_volume_db(db);
+            } catch (...) {
+                LOG_WARN << "SET_PARAMETER: bad volume value";
+            }
+        } else if (body_str.compare(0, 9, "progress:") == 0) {
+            // "progress: rtp_start/rtp_current/rtp_end" — not critical
+            // for playback, keep as-is for future scrub UI.
+            LOG_INFO << "playback " << body_str;
+        } else {
+            LOG_INFO << "SET_PARAMETER body=\"" << body_str << '"';
         }
+        return r;
     }
+
+    // ---- image/*: cover art -------------------------------------------
+    if (ctype.find("image/") != std::string::npos) {
+        save_cover_art(req.body.data(), req.body.size());
+        return r;
+    }
+
+    // ---- application/x-dmap-tagged: DAAP metadata ---------------------
+    if (ctype.find("dmap") != std::string::npos ||
+        // Sometimes iOS omits the header but the body starts with "mlit".
+        (req.body.size() >= 4 && std::memcmp(req.body.data(), "mlit", 4) == 0)) {
+        DaapMetadata md;
+        if (parse_daap_mlit(req.body.data(), req.body.size(), md)) {
+            LOG_INFO << "metadata: \"" << md.title
+                     << "\" — " << md.artist
+                     << " (" << md.album
+                     << (md.duration_ms ? ", " + std::to_string(md.duration_ms / 1000) + "s"
+                                        : std::string())
+                     << ')';
+        } else {
+            LOG_INFO << "SET_PARAMETER dmap body=" << req.body.size() << " B "
+                        "(no recognisable mlit fields)";
+        }
+        return r;
+    }
+
+    LOG_INFO << "SET_PARAMETER ctype=\"" << ctype << "\" body=" << req.body.size() << " B";
     return r;
 }
 

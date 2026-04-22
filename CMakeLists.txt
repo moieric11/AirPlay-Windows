@@ -124,6 +124,7 @@ add_executable(airplay-windows
     src/crypto/fairplay.cpp
     src/crypto/mirror_decrypt.cpp
     src/airplay/airplay2_setup.cpp
+    src/airplay/daap.cpp
     src/airplay/h264_nal.cpp
     src/airplay/h264_sps.cpp
     src/airplay/info_plist.cpp
