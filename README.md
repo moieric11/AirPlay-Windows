@@ -4,25 +4,31 @@ Récepteur AirPlay 2 (mirroring) pour Windows, porté depuis
 [UxPlay](https://github.com/FDH2/UxPlay) (GPL-3.0) avec un stack 100 %
 natif Windows (pas de Bonjour SDK ni de dépendance Apple au runtime).
 
-> **État actuel — flux H.264 déchiffré en direct depuis un iPhone 16 / iOS 18.**
+> **État actuel — l'écran d'un iPhone 16 / iOS 18 est capturé et décodé
+> en image RGB sur le PC Windows.**
 >
 > Un iPhone du même Wi-Fi voit `AirPlay-Windows` dans son Centre de
 > contrôle, traverse l'intégralité du handshake (pair-verify + FairPlay
 > + SETUP + RECORD), envoie son flux H.264 chiffré via TCP. Le récepteur
-> récupère la clé AES de session (via FairPlay playfair + post-hash
-> ECDH), déchiffre chaque frame à la volée, et **les NAL units qui en
-> sortent sont conformes à la spec H.264** (forbidden_zero_bit=0, NAL
-> types 1/5/6/7/8, longueurs exactes) :
+> récupère la clé AES de session (FairPlay playfair + post-hash ECDH),
+> déchiffre chaque frame en AES-CTR, parse les NAL AVCC en Annex-B,
+> puis alimente libavcodec pour obtenir une `AVFrame YUV420P 498×1080`.
+> La première image de chaque session est dumpée en RGB24 dans
+> `first_frame.ppm` — ouverte dans GIMP ou IrfanView, c'est l'écran de
+> l'iPhone :
 >
 > ```
+> H264Decoder ready (libavcodec Lavc62.28.100)
 > mirror video: H.264 High level 3.1, 498x1080
-> mirror decrypted frame[2]: VIDEO_IDR    first NAL len=6575 type=5  ref_idc=1
-> mirror decrypted frame[3]: VIDEO_NON_IDR first NAL len=406  type=1  ref_idc=1
+> H264Decoder: SPS=18B, PPS=4B cached
+> mirror frame[2] VIDEO_IDR → 1 NAL(s):
+>   NAL IDR_SLICE(type=5, ref_idc=1, size=6578B)
+> decoded first frame: 498x1080
+> H264Decoder: dumped 498x1080 frame to first_frame.ppm
 > ```
 >
-> Tout le protocole et toute la cryptographie sont derrière nous. Ce
-> qui reste est du travail applicatif pur (split NAL + décodeur +
-> renderer), documenté plus bas.
+> Reste à faire : un renderer temps réel (SDL2/Direct3D 11) pour
+> afficher un flux continu au lieu d'un PPM ponctuel, puis l'audio.
 
 ## Ce qui fonctionne
 
@@ -42,9 +48,10 @@ natif Windows (pas de Bonjour SDK ni de dépendance Apple au runtime).
 | **FairPlay decrypt (ekey → AES key)**       | ✅   | `lib/playfair/*` (provisioned locally)       |
 | **AES post-hash avec ECDH secret**          | ✅   | `raop_handler_setup` (modern-client path)    |
 | **AES-CTR des NAL H.264 (in-place decrypt)**| ✅   | `lib/mirror_buffer.c`                        |
-| Split NAL + conversion Annex-B              | ❌   | `raop_rtp_mirror_thread` — cf. roadmap       |
-| Décodeur H.264 (FFmpeg)                     | ❌   | à intégrer                                   |
-| Renderer (SDL2 / Direct3D 11)               | ❌   | à intégrer                                   |
+| **Split NAL + conversion Annex-B**          | ✅   | `raop_rtp_mirror_thread` (port-by-port)      |
+| **Décodeur H.264 (libavcodec)**             | ✅   | FFmpeg — SPS/PPS extraits de l'avcC et prepended |
+| **Dump 1ère frame en PPM (YUV→RGB)**        | ✅   | libswscale                                   |
+| Renderer temps réel (SDL2 / Direct3D 11)    | ❌   | à intégrer                                   |
 | Audio (RAOP, ALAC/AAC)                      | ❌   | `lib/raop.c`                                 |
 
 ## Stratégie
@@ -124,22 +131,19 @@ python3 tools/test_pair_verify.py
 
 ## Prochaines étapes
 
-Plus aucune étape n'implique de protocole AirPlay ou de cryptographie —
-tout est à partir de H.264 en clair :
+La chaîne bout-en-bout est démontrée (capture PPM fidèle de l'écran
+iPhone). Reste à la rendre utilisable en continu :
 
-1. **Split NAL unités + conversion Annex-B** : chaque payload décrypté
-   contient une ou plusieurs NAL units préfixées par leur longueur BE
-   (format AVCC). Remplacer chaque length par le start-code
-   `00 00 00 01` donne de l'Annex-B consommable par FFmpeg. Stocker
-   les SPS/PPS clair (type 7/8) à part pour les prepender à chaque
-   IDR à envoyer au décodeur.
-2. **H.264 decoder** via FFmpeg (vcpkg → `libavcodec`). Alimenter
-   `avcodec_send_packet` avec (SPS/PPS + IDR) au démarrage, puis
-   les P-frames successifs via `avcodec_receive_frame`.
-3. **Renderer** Direct3D 11 ou SDL2 pour afficher les `AVFrame`
-   YUV → RGB.
-4. **Audio RAOP** (stream type 96) sur le chemin UDP : AES-128-CBC
-   (contrairement à CTR pour vidéo), décodage ALAC/AAC.
+1. **Renderer temps réel** — SDL2 (YUV texture → GPU upload) ou
+   Direct3D 11. Remplace le dump PPM ponctuel par une fenêtre qui
+   affiche le flux iPhone en direct. La `H264Decoder` produit déjà
+   des `AVFrame YUV420P`, le renderer consomme ces frames depuis
+   le thread de `MirrorListener`.
+2. **Audio RAOP** (stream type 96) sur le chemin UDP. Protocole
+   différent du vidéo : AES-128-CBC (pas CTR), format ALAC/AAC,
+   paquets RTP standard avec en-tête de 12 octets. Utilise
+   `libavcodec` pour la décompression ALAC/AAC → PCM, puis
+   WASAPI pour le rendu audio Windows.
 
 ## Références
 

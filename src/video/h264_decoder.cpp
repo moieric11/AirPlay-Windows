@@ -155,14 +155,39 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
     impl_->last_w = width;
     impl_->last_h = height;
 
-    // YUV → RGB24 into last_rgb for dump.
+    // iOS delivers full-range YUV as "YUVJ420P". That pixel format is
+    // deprecated in modern libswscale (prints a warning per frame) — remap
+    // to the regular YUV420P and tell sws the source range is full via
+    // sws_setColorspaceDetails so the colour conversion stays correct.
+    AVPixelFormat src_fmt = static_cast<AVPixelFormat>(impl_->frame->format);
+    bool src_full_range = false;
+    switch (src_fmt) {
+        case AV_PIX_FMT_YUVJ420P: src_fmt = AV_PIX_FMT_YUV420P; src_full_range = true; break;
+        case AV_PIX_FMT_YUVJ422P: src_fmt = AV_PIX_FMT_YUV422P; src_full_range = true; break;
+        case AV_PIX_FMT_YUVJ444P: src_fmt = AV_PIX_FMT_YUV444P; src_full_range = true; break;
+        default: break;
+    }
+
     impl_->sws = sws_getCachedContext(
-        impl_->sws, width, height, static_cast<AVPixelFormat>(impl_->frame->format),
+        impl_->sws, width, height, src_fmt,
         width, height, AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr);
     if (impl_->sws) {
+        // Propagate the "source is full range" flag.
+        const int* inv_tbl = nullptr;
+        const int* tbl     = nullptr;
+        int src_range = 0, dst_range = 0, brightness = 0, contrast = 0, saturation = 0;
+        sws_getColorspaceDetails(impl_->sws,
+            const_cast<int**>(&inv_tbl), &src_range,
+            const_cast<int**>(&tbl),     &dst_range,
+            &brightness, &contrast, &saturation);
+        src_range = src_full_range ? 1 : 0;
+        sws_setColorspaceDetails(impl_->sws,
+            inv_tbl, src_range, tbl, dst_range,
+            brightness, contrast, saturation);
+
         impl_->last_rgb.assign(static_cast<std::size_t>(width) * height * 3, 0);
-        uint8_t* dst[1]       = { impl_->last_rgb.data() };
-        int      dst_stride[1]= { width * 3 };
+        uint8_t* dst[1]        = { impl_->last_rgb.data() };
+        int      dst_stride[1] = { width * 3 };
         sws_scale(impl_->sws, impl_->frame->data, impl_->frame->linesize,
                   0, height, dst, dst_stride);
     }
