@@ -2,6 +2,7 @@
 
 #include "airplay/mirror_listener.h"
 #include "airplay/ntp_client.h"
+#include "audio/audio_receiver.h"
 #include "net/socket.h"
 
 #include <cstdint>
@@ -54,13 +55,22 @@ public:
     bool setup_legacy(const std::string& transport_header, StreamPorts& allocated);
     bool setup_session(uint16_t& event_port, uint16_t& timing_port);
 
-    // For type 110 (mirror TCP), if `aes_key_audio` is non-empty and
-    // `stream_connection_id` is set, the listener is wired to AES-CTR-decrypt
-    // incoming NAL payloads in place. Otherwise the listener still binds,
-    // accepts, and logs the raw encrypted byte stream.
+    // Per-stream setup options.
+    //   Type 110 (mirror video, TCP): aes_key + stream_connection_id drive
+    //     the AES-CTR decryption of the H.264 NAL payloads.
+    //   Type 96 (audio, UDP):         aes_key + aes_iv feed the AES-CBC
+    //     decryptor; ct + sample_rate select the codec used by the
+    //     downstream decoder.
+    struct StreamOpts {
+        std::vector<unsigned char> aes_key;
+        std::vector<unsigned char> aes_iv;
+        uint64_t                   stream_connection_id = 0;
+        int                        ct          = 0;
+        int                        sample_rate = 44100;
+    };
+
     bool setup_stream(int type, uint16_t& data_port, uint16_t& control_port,
-                      const std::vector<unsigned char>& aes_key_audio = {},
-                      uint64_t stream_connection_id = 0);
+                      const StreamOpts& opts);
 
     // Start the NTP client thread that polls iOS's timing server at
     // (remote_ip, remote_port) from our timing socket bound by setup_session().
@@ -85,10 +95,11 @@ private:
     // AirPlay 2 path state.
     socket_t    event_sock_     = INVALID_SOCK;
     socket_t    ap2_timing_sock = INVALID_SOCK;
-    std::vector<StreamChannel>      channels_;      // audio streams (UDP)
-    std::unique_ptr<MirrorListener> mirror_;        // video stream (TCP)
-    std::unique_ptr<NtpClient>      ntp_;
-    ap::video::VideoRenderer*       renderer_{nullptr};
+    std::vector<StreamChannel>                    channels_;   // audio streams (UDP)
+    std::unique_ptr<MirrorListener>               mirror_;     // video stream (TCP)
+    std::unique_ptr<NtpClient>                    ntp_;
+    std::unique_ptr<ap::audio::AudioReceiver>     audio_;      // type 96 UDP
+    ap::video::VideoRenderer*                     renderer_{nullptr};
 
     std::string session_id_;
 };

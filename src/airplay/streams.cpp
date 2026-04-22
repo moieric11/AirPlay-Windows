@@ -143,8 +143,7 @@ bool StreamSession::setup_session(uint16_t& event_port, uint16_t& timing_port) {
 bool StreamSession::setup_stream(int type,
                                  uint16_t& data_port,
                                  uint16_t& control_port,
-                                 const std::vector<unsigned char>& aes_key_audio,
-                                 uint64_t stream_connection_id) {
+                                 const StreamOpts& opts) {
     control_port = 0;
 
     // Type 110 (mirror video) uses a TCP byte stream, not UDP RTP. iOS will
@@ -153,11 +152,9 @@ bool StreamSession::setup_stream(int type,
     if (type == 110) {
         mirror_ = std::make_unique<MirrorListener>();
 
-        // Wire AES-CTR decryption before starting the accept loop. iOS might
-        // already be opening the TCP connection by the time listen() returns,
-        // so decrypt must be ready first.
-        if (!aes_key_audio.empty() && stream_connection_id != 0) {
-            if (!mirror_->enable_decrypt(aes_key_audio, stream_connection_id)) {
+        // Wire AES-CTR decryption before starting the accept loop.
+        if (!opts.aes_key.empty() && opts.stream_connection_id != 0) {
+            if (!mirror_->enable_decrypt(opts.aes_key, opts.stream_connection_id)) {
                 LOG_WARN << "SETUP stream 110: could not init AES-CTR decrypt "
                             "(stream will be logged encrypted)";
             }
@@ -188,6 +185,41 @@ bool StreamSession::setup_stream(int type,
     auto [c_sock, c_port] = bind_udp();
     if (c_sock == INVALID_SOCK) { ap::net::close_socket(d_sock); return false; }
 
+    data_port    = d_port;
+    control_port = c_port;
+    LOG_INFO << "SETUP session=" << session_id_ << " stream type=" << type
+             << " (UDP) data=" << d_port << " control=" << c_port;
+
+    if (type == 96) {
+        // Start the audio receiver on the data socket. It takes ownership.
+        audio_ = std::make_unique<ap::audio::AudioReceiver>();
+        ap::audio::AudioReceiver::Config ac;
+        ac.data_sock   = d_sock;
+        ac.aes_key     = opts.aes_key;
+        ac.aes_iv      = opts.aes_iv;
+        ac.ct          = opts.ct;
+        ac.sample_rate = opts.sample_rate;
+        if (!audio_->start(std::move(ac))) {
+            LOG_WARN << "SETUP stream 96: AudioReceiver failed to start "
+                        "(UDP socket left bound, no decrypt)";
+            // If start() failed before taking ownership, we close the sock here.
+            ap::net::close_socket(d_sock);
+            audio_.reset();
+        }
+
+        // Control socket: iOS sends retransmit/feedback packets here; we
+        // just keep it bound so iOS isn't flooded with ICMP unreachables.
+        StreamChannel ch;
+        ch.type         = type;
+        ch.data_port    = d_port;
+        ch.control_port = c_port;
+        ch.data_sock    = INVALID_SOCK;   // consumed by AudioReceiver
+        ch.control_sock = c_sock;
+        channels_.push_back(ch);
+        return true;
+    }
+
+    // Fallback: keep both sockets in channels_ untouched.
     StreamChannel ch;
     ch.type         = type;
     ch.data_port    = d_port;
@@ -195,11 +227,6 @@ bool StreamSession::setup_stream(int type,
     ch.data_sock    = d_sock;
     ch.control_sock = c_sock;
     channels_.push_back(ch);
-
-    data_port    = d_port;
-    control_port = c_port;
-    LOG_INFO << "SETUP session=" << session_id_ << " stream type=" << type
-             << " (UDP) data=" << d_port << " control=" << c_port;
     return true;
 }
 
@@ -208,6 +235,10 @@ void StreamSession::stop_stream(int type) {
     if (type == 110 && mirror_) {
         mirror_->stop();
         mirror_.reset();
+    }
+    if (type == 96 && audio_) {
+        audio_->stop();
+        audio_.reset();
     }
     // Remove any audio channels matching the type.
     for (auto it = channels_.begin(); it != channels_.end(); ) {
@@ -233,6 +264,7 @@ bool StreamSession::start_ntp(const std::string& remote_ip, uint16_t remote_port
 void StreamSession::teardown() {
     if (ntp_)    { ntp_->stop();    ntp_.reset(); }
     if (mirror_) { mirror_->stop(); mirror_.reset(); }
+    if (audio_)  { audio_->stop();  audio_.reset(); }
 
     for (auto* sp : { &data_sock_, &ctrl_sock_, &timing_sock_,
                        &event_sock_, &ap2_timing_sock }) {
