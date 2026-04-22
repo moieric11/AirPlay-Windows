@@ -111,16 +111,18 @@ void AudioReceiver::thread_fn() {
     unsigned char buf[4096];
     unsigned char cleartext[4096];
     uint64_t pkts            = 0;
+    uint64_t dedup_dropped   = 0;
     uint64_t total_bytes     = 0;
-    // Packet size histogram: helps see that we actually receive audio of
-    // the expected ~370 B size, plus the sync/RTCP "4-byte" and similar
-    // dwarf packets iOS peppers the stream with.
     uint64_t hist_0_16 = 0, hist_17_64 = 0, hist_65_256 = 0,
              hist_257_512 = 0, hist_513_plus = 0;
-    // Number of already-verbose-logged packets per "big enough to be real
-    // audio" bucket, to surface the first few real AAC frames and skip
-    // the leading sentinel packets that swallow all our verbose slots.
     int big_pkts_logged = 0;
+
+    // RAOP retransmits lost packets; iOS typically sends each seq 2-3 times
+    // for resilience. We keep a bitset of recently-seen seqs so the decoder
+    // only sees each audio frame once. seq is 16-bit — we use a 65 536-bit
+    // bitset via a boolean vector (8 KB).
+    std::vector<bool> seen_seq(65536, false);
+    uint32_t seq_wrap_base = 0;   // if we cross the 16-bit boundary we bump this
 
     while (running_.load()) {
         int n = ::recvfrom(cfg_.data_sock,
@@ -169,20 +171,50 @@ void AudioReceiver::thread_fn() {
         else if (payload_len <= 512) ++hist_257_512;
         else                         ++hist_513_plus;
 
+        // Dedup only the "big enough to be real audio" packets — the dwarf
+        // sync packets (4 B) are not audio frames, they come with their own
+        // overlapping seq values we don't want to blacklist.
+        const bool real_audio = (payload_len >= 100);
+        bool is_duplicate     = false;
+        if (real_audio) {
+            if (seen_seq[seq]) {
+                is_duplicate = true;
+                ++dedup_dropped;
+            } else {
+                seen_seq[seq] = true;
+                // Clear a sliding 8k-wide window behind the new seq so the
+                // bitset doesn't stay full forever once we wrap past 65k.
+                const uint16_t erase_from = static_cast<uint16_t>(seq - 8192);
+                // erase a small contiguous region every 1024 packets to cap
+                // the work per packet.
+                if ((pkts & 0x3ff) == 0) {
+                    for (int k = 0; k < 1024; ++k) {
+                        seen_seq[static_cast<uint16_t>(erase_from + k)] = false;
+                    }
+                }
+            }
+        }
+
         // Verbose log for the first couple of everything, AND for the first
-        // 5 "big enough to be real audio" packets (>= 100 B). That's where
-        // the codec signature lives.
+        // 5 non-duplicate "big enough to be real audio" packets. That's
+        // where the codec signature lives.
         const bool first_any = (pkts <= 2);
-        const bool first_big = (payload_len >= 100 && big_pkts_logged < 5);
+        const bool first_big = (real_audio && !is_duplicate && big_pkts_logged < 5);
         if (first_any || first_big) {
             LOG_INFO << "audio pkt#" << pkts << ": pt=" << static_cast<int>(pt)
                      << " seq=" << seq << " ts=" << ts
                      << " paylen=" << payload_len
-                     << " (enc=" << encrypted_len << " tail=" << tail_len << ')';
+                     << " (enc=" << encrypted_len << " tail=" << tail_len
+                     << (is_duplicate ? " DUP" : "") << ')';
             LOG_INFO << "  clear: " << hex_dump(cleartext,
                                                 static_cast<std::size_t>(outlen));
             if (first_big) ++big_pkts_logged;
         }
+
+        // TODO next: if (!is_duplicate && real_audio) feed (cleartext, outlen)
+        // into the AAC-ELD decoder → PCM → WASAPI. Currently the cleartext
+        // is discarded after logging.
+        (void)is_duplicate;
 
         if ((pkts % 500) == 0) {
             LOG_INFO << "audio: " << pkts << " pkts, "
@@ -191,7 +223,8 @@ void AudioReceiver::thread_fn() {
     }
 
     LOG_INFO << "AudioReceiver stopped (" << pkts << " pkts, "
-             << total_bytes << " payload bytes)";
+             << total_bytes << " payload bytes, "
+             << dedup_dropped << " duplicate audio frames dropped)";
     LOG_INFO << "  payload size histogram: "
              << "[0..16]="      << hist_0_16
              << "  [17..64]="   << hist_17_64
