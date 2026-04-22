@@ -57,6 +57,35 @@ endif()
 # AirPlay pair-setup / pair-verify handshake.
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
+# ---- FFmpeg (required for H.264 decoding) -------------------------------------
+# Uses libavcodec to decode the clear H.264 NAL units the mirror stream
+# produces after AES-CTR decrypt + AVCC→Annex-B conversion. libswscale is
+# for YUV→RGB conversion when dumping debug frames to PPM.
+set(FFMPEG_TARGETS "")
+if(PkgConfig_FOUND)
+    pkg_check_modules(AVCODEC  IMPORTED_TARGET libavcodec)
+    pkg_check_modules(AVUTIL   IMPORTED_TARGET libavutil)
+    pkg_check_modules(SWSCALE  IMPORTED_TARGET libswscale)
+    if(AVCODEC_FOUND AND AVUTIL_FOUND AND SWSCALE_FOUND)
+        set(FFMPEG_TARGETS PkgConfig::AVCODEC PkgConfig::AVUTIL PkgConfig::SWSCALE)
+    endif()
+endif()
+if(NOT FFMPEG_TARGETS)
+    # vcpkg path (Windows): use its FindFFMPEG module.
+    find_package(FFMPEG QUIET)
+    if(FFMPEG_FOUND)
+        set(FFMPEG_TARGETS ${FFMPEG_LIBRARIES})
+        set(FFMPEG_INCLUDE_DIRS_OK "${FFMPEG_INCLUDE_DIRS}")
+    endif()
+endif()
+if(NOT FFMPEG_TARGETS)
+    message(FATAL_ERROR
+        "FFmpeg (libavcodec + libavutil + libswscale) not found.\n"
+        "  Windows: vcpkg.json already declares the dependency — rerun cmake "
+        "with the vcpkg toolchain.\n"
+        "  Linux:   apt install libavcodec-dev libswscale-dev")
+endif()
+
 # ---- Sources ------------------------------------------------------------------
 add_executable(airplay-windows
     src/main.cpp
@@ -79,10 +108,14 @@ add_executable(airplay-windows
     src/airplay/server.cpp
     src/airplay/streams.cpp
     src/airplay/routes.cpp
+    src/video/h264_decoder.cpp
 )
 
 target_include_directories(airplay-windows PRIVATE src)
-target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto)
+target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS})
+if(DEFINED FFMPEG_INCLUDE_DIRS_OK)
+    target_include_directories(airplay-windows PRIVATE ${FFMPEG_INCLUDE_DIRS_OK})
+endif()
 
 # ---- FairPlay SAP blobs (swap-ready) ------------------------------------------
 # By default we link the zero-filled stub. If the user drops a real blob

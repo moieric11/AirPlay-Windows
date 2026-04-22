@@ -167,6 +167,12 @@ bool MirrorListener::enable_decrypt(
         decrypt_.reset();
         return false;
     }
+    decoder_ = std::make_unique<ap::video::H264Decoder>();
+    if (!decoder_->init()) {
+        LOG_WARN << "H264Decoder init failed — decrypted NALs will be logged "
+                    "but not decoded";
+        decoder_.reset();
+    }
     return true;
 }
 
@@ -304,11 +310,19 @@ void MirrorListener::reader_loop(socket_t client) {
                      << "  ts=" << ts;
         }
 
-        // Only once, on the first SPS/PPS frame, log the raw bytes and try
-        // to decode the SPS into a human-readable video description.
-        if (ftype == kFrameSpsPps && counts[kFrameSpsPps] == 1 && !payload.empty()) {
-            LOG_INFO << "mirror SPS/PPS hex: " << hex_dump(payload.data(), payload.size());
-            log_sps_from_sps_pps_payload(payload);
+        // On the first SPS/PPS frame, log the raw bytes + human-readable
+        // video characteristics. Every SPS/PPS (initial and resolution
+        // changes) is forwarded to the decoder.
+        if (ftype == kFrameSpsPps && !payload.empty()) {
+            if (counts[kFrameSpsPps] == 1) {
+                LOG_INFO << "mirror SPS/PPS hex: "
+                         << hex_dump(payload.data(), payload.size());
+                log_sps_from_sps_pps_payload(payload);
+            }
+            if (decoder_) {
+                decoder_->set_parameter_sets_from_avcc(payload.data(),
+                                                       payload.size());
+            }
         }
 
         // Encrypted frames (IDR + non-IDR): AES-CTR-decrypt in place, then
@@ -344,6 +358,29 @@ void MirrorListener::reader_loop(socket_t client) {
                                      << ", size=" << n.size << "B)";
                         }
                     }
+
+                    // Feed the Annex-B NAL bytes to libavcodec. The payload is
+                    // already in Annex-B form after parse_nals_avcc_to_annexb.
+                    if (decoder_) {
+                        const bool is_idr = (ftype == kFrameVideoIdr);
+                        bool got_frame = false;
+                        int  dw = 0, dh = 0;
+                        decoder_->decode(payload.data(), payload_size, is_idr,
+                                         got_frame, dw, dh);
+                        if (got_frame) {
+                            // Only log the first couple of decoded frames to
+                            // keep the log quiet; dump the very first one to
+                            // a PPM so we have visual proof the chain works.
+                            if (decoder_->frames_decoded() == 1) {
+                                LOG_INFO << "decoded first frame: "
+                                         << dw << 'x' << dh;
+                                decoder_->dump_last_frame_ppm("first_frame.ppm");
+                            } else if (decoder_->frames_decoded() % 100 == 0) {
+                                LOG_INFO << "decoded " << decoder_->frames_decoded()
+                                         << " frames (" << dw << 'x' << dh << ')';
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -366,6 +403,10 @@ void MirrorListener::reader_loop(socket_t client) {
             LOG_INFO << "  " << nal_type_name(t) << " (type=" << t << "): "
                      << c << " NAL(s)";
         }
+    }
+    if (decoder_) {
+        LOG_INFO << "H264Decoder: " << decoder_->frames_decoded()
+                 << " frame(s) decoded this session";
     }
 }
 

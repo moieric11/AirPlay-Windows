@@ -2,6 +2,7 @@
 
 #include "crypto/mirror_decrypt.h"
 #include "net/socket.h"
+#include "video/h264_decoder.h"
 
 #include <atomic>
 #include <cstdint>
@@ -60,6 +61,7 @@ private:
     std::thread       thread_;
 
     std::unique_ptr<ap::crypto::MirrorDecrypt> decrypt_;
+    std::unique_ptr<ap::video::H264Decoder>    decoder_;
 };
 
 } // namespace ap::airplay

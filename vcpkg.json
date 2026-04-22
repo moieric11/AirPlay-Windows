@@ -3,6 +3,12 @@
   "version-string": "0.1.0",
   "dependencies": [
     "libplist",
-    "openssl"
-  ]
+    "openssl",
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": ["avcodec", "swscale"]
+    }
+  ],
+  "builtin-baseline": "9bdf622306cc71f2e605154578976af66c59af43"
 }
