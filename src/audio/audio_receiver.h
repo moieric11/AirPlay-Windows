@@ -54,6 +54,9 @@ public:
     bool start(Config cfg);
     void stop();
 
+    // Thread-safe: hand to SdlAudioOutput when it exists.
+    void set_volume_db(float db);
+
 private:
     void thread_fn();
 

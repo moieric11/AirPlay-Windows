@@ -261,6 +261,10 @@ bool StreamSession::start_ntp(const std::string& remote_ip, uint16_t remote_port
     return ntp_->start(ap2_timing_sock, remote_ip, remote_port);
 }
 
+void StreamSession::set_audio_volume_db(float db) {
+    if (audio_) audio_->set_volume_db(db);
+}
+
 void StreamSession::teardown() {
     if (ntp_)    { ntp_->stop();    ntp_.reset(); }
     if (mirror_) { mirror_->stop(); mirror_.reset(); }

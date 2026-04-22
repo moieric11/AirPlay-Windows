@@ -81,6 +81,9 @@ public:
     // Partial teardown for AirPlay 2 stream-level TEARDOWN requests.
     void stop_stream(int type);
 
+    // Thread-safe: forwards to AudioReceiver if a type-96 stream is alive.
+    void set_audio_volume_db(float db);
+
     void teardown();
 
     const std::string& session_id() const { return session_id_; }

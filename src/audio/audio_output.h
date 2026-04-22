@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 namespace ap::audio {
@@ -25,16 +26,24 @@ public:
 
     // Enqueue interleaved int16 samples. `count` is the total number of
     // int16 samples (NOT frames) — for stereo, that's 2 * frame_count.
-    // Non-blocking.
+    // Non-blocking. The current volume gain is applied in-place to an
+    // internal scratch buffer before SDL_QueueAudio.
     void push(const int16_t* samples, int count);
+
+    // Set playback gain from a dB value in AirPlay's convention:
+    //   0 dB   = full volume
+    //   -144 dB or below = mute
+    // Internally converted to a linear multiplier. Thread-safe.
+    void set_volume_db(float db);
 
     // Bytes currently queued (not yet played). Useful for back-pressure.
     uint32_t queued_bytes() const;
 
 private:
-    unsigned int device_{0};   // SDL_AudioDeviceID is uint32_t
-    int          channels_{0};
-    int          sample_rate_{0};
+    unsigned int       device_{0};   // SDL_AudioDeviceID is uint32_t
+    int                channels_{0};
+    int                sample_rate_{0};
+    std::atomic<float> gain_{1.0f};  // linear multiplier, 0.0 = muted
 };
 
 } // namespace ap::audio

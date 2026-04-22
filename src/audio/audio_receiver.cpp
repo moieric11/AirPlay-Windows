@@ -118,6 +118,10 @@ bool AudioReceiver::start(Config cfg) {
     return true;
 }
 
+void AudioReceiver::set_volume_db(float db) {
+    if (output_) output_->set_volume_db(db);
+}
+
 void AudioReceiver::stop() {
     if (!running_.exchange(false)) return;
 
@@ -151,7 +155,6 @@ void AudioReceiver::thread_fn() {
     // only sees each audio frame once. seq is 16-bit — we use a 65 536-bit
     // bitset via a boolean vector (8 KB).
     std::vector<bool> seen_seq(65536, false);
-    uint32_t seq_wrap_base = 0;   // if we cross the 16-bit boundary we bump this
 
     while (running_.load()) {
         int n = ::recvfrom(cfg_.data_sock,

@@ -101,9 +101,17 @@ AacDecoder::AacDecoder()  : impl_(std::make_unique<Impl>()) {}
 AacDecoder::~AacDecoder() = default;
 
 bool AacDecoder::init(const Config& cfg) {
-    impl_->codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
+    // RAOP ct values:
+    //   2       = ALAC
+    //   3       = AAC-LC
+    //   4 / 8   = AAC-ELD (8 is "AAC-ELD 44.1k" per observed streams)
+    const bool is_alac = (cfg.ct == 2);
+
+    const AVCodecID codec_id = is_alac ? AV_CODEC_ID_ALAC : AV_CODEC_ID_AAC;
+    impl_->codec = avcodec_find_decoder(codec_id);
     if (!impl_->codec) {
-        LOG_ERROR << "AacDecoder: libavcodec has no AAC decoder";
+        LOG_ERROR << "AacDecoder: libavcodec has no "
+                  << (is_alac ? "ALAC" : "AAC") << " decoder";
         return false;
     }
     impl_->ctx   = avcodec_alloc_context3(impl_->codec);
@@ -120,28 +128,58 @@ bool AacDecoder::init(const Config& cfg) {
                                                      : AV_CH_LAYOUT_MONO;
 #endif
 
-    auto asc = build_asc_aac_eld(cfg.sample_rate, cfg.channels, cfg.spf);
-    impl_->ctx->extradata_size = static_cast<int>(asc.size());
+    std::vector<uint8_t> extradata;
+    if (is_alac) {
+        // Minimal ALAC "magic cookie" (36 bytes, Apple spec):
+        //   frameLength, compatibleVersion, bitDepth, rice params,
+        //   channels, maxRun, maxFrameBytes, avgBitRate, sampleRate.
+        // We fill sane defaults for AirPlay 1 audio and let libavcodec
+        // adapt from the first frames.
+        extradata = {
+            0x00, 0x00, 0x00, 0x24,  //  size
+            'a','l','a','c',         //  atom tag
+            0x00, 0x00, 0x00, 0x00,  //  version + flags
+            0x00, 0x00, 0x01, 0x60,  //  frameLength = 352
+            0x00,                    //  compatibleVersion
+            0x10,                    //  bitDepth = 16
+            0x28,                    //  pb = 40
+            0x0a,                    //  mb = 10
+            0x0e,                    //  kb = 14
+            static_cast<uint8_t>(cfg.channels), // numChannels
+            0x00, 0xff,              //  maxRun
+            0x00, 0x00, 0x00, 0x00,  //  maxFrameBytes
+            0x00, 0x00, 0x00, 0x00,  //  avgBitRate
+            0x00, 0x00, static_cast<uint8_t>((cfg.sample_rate >> 8) & 0xff),
+                       static_cast<uint8_t>(cfg.sample_rate & 0xff),
+        };
+    } else {
+        extradata = build_asc_aac_eld(cfg.sample_rate, cfg.channels, cfg.spf);
+    }
+
+    impl_->ctx->extradata_size = static_cast<int>(extradata.size());
     impl_->ctx->extradata = static_cast<uint8_t*>(
-        av_mallocz(asc.size() + AV_INPUT_BUFFER_PADDING_SIZE));
-    std::memcpy(impl_->ctx->extradata, asc.data(), asc.size());
+        av_mallocz(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+    std::memcpy(impl_->ctx->extradata, extradata.data(), extradata.size());
 
     if (avcodec_open2(impl_->ctx, impl_->codec, nullptr) != 0) {
-        LOG_ERROR << "AacDecoder: avcodec_open2(AAC) failed";
+        LOG_ERROR << "AacDecoder: avcodec_open2("
+                  << (is_alac ? "ALAC" : "AAC") << ") failed";
         return false;
     }
 
     impl_->sample_rate = cfg.sample_rate;
     impl_->channels    = cfg.channels;
 
-    std::string asc_hex;
-    for (uint8_t b : asc) {
+    std::string extra_hex;
+    for (uint8_t b : extradata) {
         char tmp[4]; std::snprintf(tmp, sizeof(tmp), "%02x ", b);
-        asc_hex += tmp;
+        extra_hex += tmp;
     }
-    LOG_INFO << "AacDecoder ready: AAC-ELD " << cfg.channels << "ch @"
-             << cfg.sample_rate << "Hz spf=" << cfg.spf
-             << " ASC=" << asc_hex;
+    LOG_INFO << "AacDecoder ready: "
+             << (is_alac ? "ALAC" : "AAC-ELD") << " " << cfg.channels
+             << "ch @" << cfg.sample_rate << "Hz"
+             << (is_alac ? "" : " spf=") << (is_alac ? "" : std::to_string(cfg.spf))
+             << " extradata=" << extra_hex;
     return true;
 }
 

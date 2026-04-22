@@ -422,15 +422,30 @@ Response handle_get_parameter(const Request& req) {
 }
 
 // SET_PARAMETER carries volume updates, track metadata, progress, etc.
-// Acknowledge with 200; logging the body helps diagnose what iOS is trying
-// to tell us.
-Response handle_set_parameter(const Request& req) {
+// Acknowledge with 200 and, for the text/parameters "volume:" entries,
+// forward the dB value to the audio output gain.
+Response handle_set_parameter(ClientSession& session, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
-    if (!req.body.empty()) {
-        std::string body_str(reinterpret_cast<const char*>(req.body.data()),
-                             std::min<std::size_t>(req.body.size(), 128));
-        LOG_INFO << "SET_PARAMETER body=\"" << body_str << '"';
+    if (req.body.empty()) return r;
+
+    const std::string body_str(
+        reinterpret_cast<const char*>(req.body.data()),
+        std::min<std::size_t>(req.body.size(), 128));
+    LOG_INFO << "SET_PARAMETER body=\"" << body_str << '"';
+
+    // iOS sends e.g. "volume: -1.875000\r\n" (AirPlay convention: 0 dB
+    // = max, -144 dB = mute). Plug that into the audio output so the
+    // iPhone's volume slider actually does something.
+    const std::string marker = "volume:";
+    auto pos = body_str.find(marker);
+    if (pos != std::string::npos && session.streams) {
+        try {
+            float db = std::stof(body_str.substr(pos + marker.size()));
+            session.streams->set_audio_volume_db(db);
+        } catch (...) {
+            LOG_WARN << "SET_PARAMETER: could not parse volume value";
+        }
     }
     return r;
 }
@@ -557,7 +572,7 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "RECORD")      return handle_record  (session, req);
     if (req.method == "TEARDOWN")    return handle_teardown(session, req);
     if (req.method == "GET_PARAMETER")  return handle_get_parameter(req);
-    if (req.method == "SET_PARAMETER")  return handle_set_parameter(req);
+    if (req.method == "SET_PARAMETER")  return handle_set_parameter(session, req);
 
     // AirPlay Streaming reconnaissance (step 3a): answer the routes iOS
     // hammers at session setup so we stop the retry storm and can observe
