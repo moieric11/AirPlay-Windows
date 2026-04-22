@@ -461,9 +461,27 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
                 LOG_WARN << "SET_PARAMETER: bad volume value";
             }
         } else if (body_str.compare(0, 9, "progress:") == 0) {
-            // "progress: rtp_start/rtp_current/rtp_end" — not critical
-            // for playback, keep as-is for future scrub UI.
-            LOG_INFO << "playback " << body_str;
+            // "progress: rtp_start/rtp_current/rtp_end" — three RTP
+            // timestamps at the AirPlay audio sample rate (always
+            // 44100 Hz for AAC-ELD / ALAC in the AirPlay 2 path).
+            unsigned long long start = 0, curr = 0, end = 0;
+            if (std::sscanf(body_str.c_str() + 9, " %llu/%llu/%llu",
+                            &start, &curr, &end) == 3 && end >= start) {
+                const uint64_t elapsed_ticks =
+                    curr > start ? curr - start : 0;
+                const uint64_t total_ticks   = end - start;
+                const uint32_t elapsed_ms = static_cast<uint32_t>(
+                    elapsed_ticks * 1000ULL / 44100ULL);
+                const uint32_t total_ms   = static_cast<uint32_t>(
+                    total_ticks   * 1000ULL / 44100ULL);
+                LOG_INFO << "playback " << (elapsed_ms / 1000) << "s / "
+                         << (total_ms / 1000) << "s";
+                if (session.renderer) {
+                    session.renderer->push_progress(elapsed_ms, total_ms);
+                }
+            } else {
+                LOG_INFO << "playback " << body_str;
+            }
         } else {
             LOG_INFO << "SET_PARAMETER body=\"" << body_str << '"';
         }

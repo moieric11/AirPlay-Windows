@@ -6,6 +6,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -262,6 +263,12 @@ void VideoRenderer::push_cover_art(const uint8_t* jpeg, std::size_t size) {
     cv_.notify_one();
 }
 
+void VideoRenderer::push_progress(uint32_t elapsed_ms, uint32_t total_ms) {
+    progress_elapsed_ms_.store(elapsed_ms, std::memory_order_relaxed);
+    progress_total_ms_.store(total_ms,   std::memory_order_relaxed);
+    cv_.notify_one();
+}
+
 void VideoRenderer::push_metadata(const std::string& title,
                                   const std::string& artist,
                                   const std::string& album) {
@@ -336,9 +343,11 @@ void VideoRenderer::run(const std::string& title) {
     } else {
         LOG_WARN << "TTF_Init failed: " << TTF_GetError();
     }
-    SDL_Texture* title_tex  = nullptr; int title_w  = 0, title_h  = 0;
-    SDL_Texture* artist_tex = nullptr; int artist_w = 0, artist_h = 0;
-    SDL_Texture* album_tex  = nullptr; int album_w  = 0, album_h  = 0;
+    SDL_Texture* title_tex    = nullptr; int title_w    = 0, title_h    = 0;
+    SDL_Texture* artist_tex   = nullptr; int artist_w   = 0, artist_h   = 0;
+    SDL_Texture* album_tex    = nullptr; int album_w    = 0, album_h    = 0;
+    SDL_Texture* progress_tex = nullptr; int progress_w = 0, progress_h = 0;
+    std::string  last_progress_text;
 
     auto make_text = [&](const std::vector<TTF_Font*>& fonts,
                          const std::string& s, SDL_Color c,
@@ -500,13 +509,46 @@ void VideoRenderer::run(const std::string& title) {
             draw_text(title_tex,  title_w,  title_h);
             draw_text(artist_tex, artist_w, artist_h);
             draw_text(album_tex,  album_w,  album_h);
+
+            // Progress row: "M:SS / M:SS" + thin bar. Only when the sender
+            // reported a non-zero track length (otherwise a zero total would
+            // hide the bar anyway, and dividing by zero would crash).
+            const uint32_t total_ms   = progress_total_ms_.load(std::memory_order_relaxed);
+            const uint32_t elapsed_ms = progress_elapsed_ms_.load(std::memory_order_relaxed);
+            if (total_ms > 0) {
+                auto fmt = [](uint32_t ms) {
+                    const uint32_t s = ms / 1000;
+                    char buf[16];
+                    std::snprintf(buf, sizeof(buf), "%u:%02u", s / 60, s % 60);
+                    return std::string(buf);
+                };
+                std::string txt = fmt(elapsed_ms) + " / " + fmt(total_ms);
+                if (txt != last_progress_text || !progress_tex) {
+                    make_text(fonts_small, txt, SDL_Color{200, 200, 200, 255},
+                              progress_tex, progress_w, progress_h);
+                    last_progress_text = std::move(txt);
+                }
+                draw_text(progress_tex, progress_w, progress_h);
+
+                const int bar_h = 4;
+                const int bar_w = win_w - 2 * pad_x;
+                SDL_Rect bg{pad_x, y + 2, bar_w, bar_h};
+                SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
+                SDL_RenderFillRect(renderer, &bg);
+                const double frac =
+                    std::min(1.0, static_cast<double>(elapsed_ms) / total_ms);
+                SDL_Rect fg{pad_x, y + 2, static_cast<int>(bar_w * frac), bar_h};
+                SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255);
+                SDL_RenderFillRect(renderer, &fg);
+            }
         }
         SDL_RenderPresent(renderer);
     }
 
-    if (title_tex)  SDL_DestroyTexture(title_tex);
-    if (artist_tex) SDL_DestroyTexture(artist_tex);
-    if (album_tex)  SDL_DestroyTexture(album_tex);
+    if (title_tex)    SDL_DestroyTexture(title_tex);
+    if (artist_tex)   SDL_DestroyTexture(artist_tex);
+    if (album_tex)    SDL_DestroyTexture(album_tex);
+    if (progress_tex) SDL_DestroyTexture(progress_tex);
     if (video_tex)  SDL_DestroyTexture(video_tex);
     if (cover_tex)  SDL_DestroyTexture(cover_tex);
     for (TTF_Font* f : fonts_big)   if (f) TTF_CloseFont(f);

@@ -55,6 +55,10 @@ public:
                        const std::string& artist,
                        const std::string& album);
 
+    // Push playback progress (already converted from RTP timestamps to
+    // milliseconds by the caller). total_ms == 0 hides the UI. Thread-safe.
+    void push_progress(uint32_t elapsed_ms, uint32_t total_ms);
+
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
     bool user_closed() const { return closed_.load(); }
@@ -87,6 +91,12 @@ private:
     std::string                meta_artist_;
     std::string                meta_album_;
     bool                       meta_dirty_{false};
+
+    // Progress is polled by the render thread every frame; atomics are
+    // sufficient (the two are read independently but both change together
+    // and a slightly stale pair produces no visible glitch).
+    std::atomic<uint32_t>      progress_elapsed_ms_{0};
+    std::atomic<uint32_t>      progress_total_ms_{0};
 };
 
 } // namespace ap::video
