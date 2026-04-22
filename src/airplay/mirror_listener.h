@@ -3,6 +3,7 @@
 #include "crypto/mirror_decrypt.h"
 #include "net/socket.h"
 #include "video/h264_decoder.h"
+#include "video/video_renderer.h"
 
 #include <atomic>
 #include <cstdint>
@@ -52,6 +53,10 @@ public:
     bool enable_decrypt(const std::vector<unsigned char>& aes_key_audio,
                         uint64_t stream_connection_id);
 
+    // Attach an external renderer — decoded frames (YUV420P) are pushed to
+    // it on the reader thread. The listener does not own the renderer.
+    void attach_renderer(ap::video::VideoRenderer* renderer) { renderer_ = renderer; }
+
 private:
     void accept_loop();
     void reader_loop(socket_t client);
@@ -62,6 +67,7 @@ private:
 
     std::unique_ptr<ap::crypto::MirrorDecrypt> decrypt_;
     std::unique_ptr<ap::video::H264Decoder>    decoder_;
+    ap::video::VideoRenderer*                  renderer_{nullptr};
 };
 
 } // namespace ap::airplay

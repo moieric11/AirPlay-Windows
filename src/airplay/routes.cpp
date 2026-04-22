@@ -211,7 +211,10 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
         return r;
     }
 
-    if (!session.streams) session.streams = std::make_unique<StreamSession>();
+    if (!session.streams) {
+        session.streams = std::make_unique<StreamSession>();
+        session.streams->set_renderer(session.renderer);
+    }
 
     Airplay2SetupResponse response;
 

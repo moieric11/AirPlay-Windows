@@ -162,6 +162,7 @@ bool StreamSession::setup_stream(int type,
                             "(stream will be logged encrypted)";
             }
         }
+        if (renderer_) mirror_->attach_renderer(renderer_);
 
         uint16_t p = 0;
         if (!mirror_->start(p)) {

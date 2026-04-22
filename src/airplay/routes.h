@@ -6,6 +6,7 @@
 #include <vector>
 
 namespace ap::crypto { class Identity; }
+namespace ap::video  { class VideoRenderer; }
 
 namespace ap::airplay {
 
@@ -27,6 +28,10 @@ struct DeviceContext {
     // Non-owning pointer to the loaded identity. The dispatcher uses it to
     // sign pair-verify challenges. Lifetime: owned by main().
     const ap::crypto::Identity* identity = nullptr;
+
+    // Non-owning pointer to the shared renderer. Handed down to each
+    // StreamSession so mirror frames can be drawn. May be null (headless).
+    ap::video::VideoRenderer*   renderer = nullptr;
 };
 
 struct ClientSession;

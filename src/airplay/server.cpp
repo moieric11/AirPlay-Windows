@@ -24,7 +24,7 @@ void Server::handle_client(ap::net::ClientSocket client) {
     auto colon = peer_ip.rfind(':');
     if (colon != std::string::npos) peer_ip.resize(colon);
 
-    ClientSession session(*ctx_.identity, peer_ip);
+    ClientSession session(*ctx_.identity, peer_ip, ctx_.renderer);
 
     while (reader.read(static_cast<int>(client.fd), req)) {
         Response res = dispatch(ctx_, session, req);

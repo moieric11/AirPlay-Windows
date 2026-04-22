@@ -8,7 +8,8 @@
       "name": "ffmpeg",
       "default-features": false,
       "features": ["avcodec", "swscale"]
-    }
+    },
+    "sdl2"
   ],
   "builtin-baseline": "9bdf622306cc71f2e605154578976af66c59af43"
 }

@@ -368,9 +368,6 @@ void MirrorListener::reader_loop(socket_t client) {
                         decoder_->decode(payload.data(), payload_size, is_idr,
                                          got_frame, dw, dh);
                         if (got_frame) {
-                            // Only log the first couple of decoded frames to
-                            // keep the log quiet; dump the very first one to
-                            // a PPM so we have visual proof the chain works.
                             if (decoder_->frames_decoded() == 1) {
                                 LOG_INFO << "decoded first frame: "
                                          << dw << 'x' << dh;
@@ -378,6 +375,16 @@ void MirrorListener::reader_loop(socket_t client) {
                             } else if (decoder_->frames_decoded() % 100 == 0) {
                                 LOG_INFO << "decoded " << decoder_->frames_decoded()
                                          << " frames (" << dw << 'x' << dh << ')';
+                            }
+
+                            // Push the decoded YUV420P planes to the
+                            // renderer (if any) so it shows up on screen.
+                            if (renderer_) {
+                                const uint8_t *y = nullptr, *u = nullptr, *v = nullptr;
+                                int ys = 0, us = 0, vs = 0, fw = 0, fh = 0;
+                                if (decoder_->last_frame_yuv(y, ys, u, us, v, vs, fw, fh)) {
+                                    renderer_->push_frame(y, ys, u, us, v, vs, fw, fh);
+                                }
                             }
                         }
                     }

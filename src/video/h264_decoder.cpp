@@ -36,6 +36,7 @@ struct H264Decoder::Impl {
     int                  last_w      = 0;
     int                  last_h      = 0;
     std::vector<uint8_t> last_rgb;       // WxHx3 filled on every successful decode
+    bool                 last_is_yuv420 = false;
     uint64_t             frames_out  = 0;
 
     ~Impl() {
@@ -154,6 +155,8 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
     height  = impl_->frame->height;
     impl_->last_w = width;
     impl_->last_h = height;
+    impl_->last_is_yuv420 = (impl_->frame->format == AV_PIX_FMT_YUV420P ||
+                             impl_->frame->format == AV_PIX_FMT_YUVJ420P);
 
     // iOS delivers full-range YUV as "YUVJ420P". That pixel format is
     // deprecated in modern libswscale (prints a warning per frame) — remap
@@ -207,6 +210,20 @@ bool H264Decoder::dump_last_frame_ppm(const std::string& path) {
     LOG_INFO << "H264Decoder: dumped " << impl_->last_w << 'x' << impl_->last_h
              << " frame to " << path;
     return true;
+}
+
+bool H264Decoder::last_frame_yuv(const uint8_t*& y, int& y_stride,
+                                 const uint8_t*& u, int& u_stride,
+                                 const uint8_t*& v, int& v_stride,
+                                 int& width, int& height) const {
+    if (!impl_ || !impl_->last_is_yuv420 || !impl_->frame ||
+        impl_->last_w == 0) return false;
+    y = impl_->frame->data[0];      y_stride = impl_->frame->linesize[0];
+    u = impl_->frame->data[1];      u_stride = impl_->frame->linesize[1];
+    v = impl_->frame->data[2];      v_stride = impl_->frame->linesize[2];
+    width  = impl_->last_w;
+    height = impl_->last_h;
+    return y && u && v;
 }
 
 uint64_t H264Decoder::frames_decoded() const { return impl_ ? impl_->frames_out : 0; }

@@ -86,6 +86,32 @@ if(NOT FFMPEG_TARGETS)
         "  Linux:   apt install libavcodec-dev libswscale-dev")
 endif()
 
+# ---- SDL2 (required for the video renderer window) ----------------------------
+# Used by video/VideoRenderer to create a real-time window displaying the
+# decoded iPhone screen. pkg-config on Linux, SDL2 CMake config on Windows
+# (installed by vcpkg).
+set(SDL2_TARGET "")
+if(PkgConfig_FOUND)
+    pkg_check_modules(SDL2 IMPORTED_TARGET sdl2)
+    if(SDL2_FOUND)
+        set(SDL2_TARGET PkgConfig::SDL2)
+    endif()
+endif()
+if(NOT SDL2_TARGET)
+    find_package(SDL2 CONFIG QUIET)
+    if(TARGET SDL2::SDL2)
+        set(SDL2_TARGET SDL2::SDL2)
+    elseif(TARGET SDL2::SDL2-static)
+        set(SDL2_TARGET SDL2::SDL2-static)
+    endif()
+endif()
+if(NOT SDL2_TARGET)
+    message(FATAL_ERROR
+        "SDL2 not found.\n"
+        "  Windows: rerun cmake with the vcpkg toolchain.\n"
+        "  Linux:   apt install libsdl2-dev")
+endif()
+
 # ---- Sources ------------------------------------------------------------------
 add_executable(airplay-windows
     src/main.cpp
@@ -109,10 +135,11 @@ add_executable(airplay-windows
     src/airplay/streams.cpp
     src/airplay/routes.cpp
     src/video/h264_decoder.cpp
+    src/video/video_renderer.cpp
 )
 
 target_include_directories(airplay-windows PRIVATE src)
-target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS})
+target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET})
 if(DEFINED FFMPEG_INCLUDE_DIRS_OK)
     target_include_directories(airplay-windows PRIVATE ${FFMPEG_INCLUDE_DIRS_OK})
 endif()

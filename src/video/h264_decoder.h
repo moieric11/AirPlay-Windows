@@ -41,6 +41,14 @@ public:
 
     bool dump_last_frame_ppm(const std::string& path);
 
+    // Raw YUV420P pointers to the most recently decoded frame. Only valid
+    // until the next decode() call. Returns false when nothing is available
+    // yet or the last frame was not 4:2:0.
+    bool last_frame_yuv(const uint8_t*& y, int& y_stride,
+                        const uint8_t*& u, int& u_stride,
+                        const uint8_t*& v, int& v_stride,
+                        int& width, int& height) const;
+
     // Number of frames successfully decoded since init().
     uint64_t frames_decoded() const;
 

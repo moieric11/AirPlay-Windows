@@ -12,6 +12,7 @@
 #include "log.h"
 #include "mdns/mdns_service.h"
 #include "net/socket.h"
+#include "video/video_renderer.h"
 
 #include <atomic>
 #include <chrono>
@@ -80,9 +81,18 @@ int main() {
     LOG_INFO << "ip="       << ap::net::primary_ipv4();
     LOG_INFO << "pk(Ed25519)=" << ctx.public_key.size() << " bytes";
 
+    // Start the SDL2 renderer window upfront. Streams will push decoded
+    // frames once an iPhone connects.
+    ap::video::VideoRenderer renderer;
+    if (!renderer.start("AirPlay-Windows")) {
+        LOG_WARN << "VideoRenderer could not start — running headless";
+    }
+    ctx.renderer = &renderer;
+
     ap::airplay::Server server;
     if (!server.start(ctx, 7000)) {
         LOG_ERROR << "Failed to start AirPlay server";
+        renderer.stop();
         ap::net::global_shutdown();
         return 1;
     }
@@ -92,14 +102,15 @@ int main() {
         LOG_WARN << "mDNS not available — receiver won't auto-appear on iOS";
     }
 
-    LOG_INFO << "Ready. Press Ctrl-C to exit.";
-    while (!g_stop) {
+    LOG_INFO << "Ready. Close the window or press Ctrl-C to exit.";
+    while (!g_stop && !renderer.user_closed()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     LOG_INFO << "Shutting down...";
     mdns.stop();
     server.stop();
+    renderer.stop();
     ap::net::global_shutdown();
     return 0;
 }

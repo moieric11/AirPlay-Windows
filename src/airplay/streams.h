@@ -47,6 +47,10 @@ public:
     StreamSession(const StreamSession&)            = delete;
     StreamSession& operator=(const StreamSession&) = delete;
 
+    // Non-owning renderer hook. Must be set before setup_stream(110) if you
+    // want decoded frames to hit a window.
+    void set_renderer(ap::video::VideoRenderer* r) { renderer_ = r; }
+
     bool setup_legacy(const std::string& transport_header, StreamPorts& allocated);
     bool setup_session(uint16_t& event_port, uint16_t& timing_port);
 
@@ -84,6 +88,7 @@ private:
     std::vector<StreamChannel>      channels_;      // audio streams (UDP)
     std::unique_ptr<MirrorListener> mirror_;        // video stream (TCP)
     std::unique_ptr<NtpClient>      ntp_;
+    ap::video::VideoRenderer*       renderer_{nullptr};
 
     std::string session_id_;
 };

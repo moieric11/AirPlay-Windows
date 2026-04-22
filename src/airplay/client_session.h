@@ -8,6 +8,7 @@
 #include <memory>
 
 namespace ap::crypto { class Identity; }
+namespace ap::video  { class VideoRenderer; }
 
 namespace ap::airplay {
 
@@ -18,14 +19,19 @@ namespace ap::airplay {
 // Sessions are allocated lazily to avoid paying their cost on connections
 // that never reach the corresponding stage.
 struct ClientSession {
-    ClientSession(const ap::crypto::Identity& id, std::string peer_ip)
-        : identity(id), remote_ip(std::move(peer_ip)) {}
+    ClientSession(const ap::crypto::Identity& id, std::string peer_ip,
+                  ap::video::VideoRenderer* r = nullptr)
+        : identity(id), remote_ip(std::move(peer_ip)), renderer(r) {}
 
     const ap::crypto::Identity& identity;
 
     // iOS IP only (no port). Used as destination for the NTP client probes
     // we send once SETUP is done.
     std::string remote_ip;
+
+    // Non-owning; handed down to the StreamSession on first SETUP so the
+    // mirror stream's decoded frames can be drawn.
+    ap::video::VideoRenderer* renderer{nullptr};
 
     std::unique_ptr<ap::crypto::PairVerifySession> pair_verify;
     std::unique_ptr<ap::crypto::FairPlaySession>   fairplay;
