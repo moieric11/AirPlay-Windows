@@ -52,7 +52,7 @@ plist_t make_display() {
     set_uint(d, "widthPhysical",  0);
     set_uint(d, "heightPhysical", 0);
     set_uint(d, "refreshRate",   60);
-    set_uint(d, "maxFPS",        30);
+    set_uint(d, "maxFPS",        60);
     set_uint(d, "rotation",      0);
     set_bool(d, "overscanned",   false);
     set_str (d, "uuid", "e5f7a168-f1f9-4f51-9f9e-6a9cc0c8cc9f");

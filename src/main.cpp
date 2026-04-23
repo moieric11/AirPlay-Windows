@@ -50,6 +50,9 @@ ap::airplay::DeviceContext build_device_context() {
     // and bit 4 (HLS) — iOS keys the AirPlay Streaming dispatch on
     // these two bits; without them YouTube / Photos stay on the audio
     // fallback path. UxPlay enables them via --hls; we hard-enable.
+    // Bit 42 (HEVC "Screen Multi Codec") stays OFF for now: H264Decoder
+    // is pinned to AV_CODEC_ID_H264 so advertising HEVC would break
+    // decoding on iOS devices that honour the bit.
     ctx.features = "0x5A7FFEF7,0x0";
     ctx.srcvers  = "220.68";
     return ctx;
