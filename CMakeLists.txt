@@ -158,6 +158,7 @@ add_executable(airplay-windows
     src/airplay/server.cpp
     src/airplay/streams.cpp
     src/airplay/fcup.cpp
+    src/airplay/hls_local_server.cpp
     src/airplay/hls_session.cpp
     src/airplay/reverse_channel.cpp
     src/airplay/routes.cpp

@@ -7,6 +7,7 @@
 //   4. Start the native mDNS advertisement (Windows DnsService API).
 //   5. Block until Ctrl-C, then tear everything down cleanly.
 
+#include "airplay/hls_local_server.h"
 #include "airplay/server.h"
 #include "crypto/identity.h"
 #include "log.h"
@@ -102,6 +103,16 @@ int main() {
         return 1;
     }
 
+    // Local HTTP server that fronts the HLS session registry for an
+    // internal media player (see hls_local_server.h). Only used for
+    // YouTube-via-AirPlay-Streaming — harmless if that path never
+    // triggers, since nothing connects to it.
+    ap::airplay::HlsLocalServer hls_server;
+    if (!hls_server.start(7100)) {
+        LOG_WARN << "HLS local server could not bind 7100 — YouTube "
+                    "AirPlay Streaming playback will not work";
+    }
+
     ap::mdns::MdnsService mdns;
     if (!mdns.start(ctx, server.port())) {
         LOG_WARN << "mDNS not available — receiver won't auto-appear on iOS";
@@ -114,6 +125,7 @@ int main() {
 
     LOG_INFO << "Shutting down...";
     mdns.stop();
+    hls_server.stop();
     server.stop();
     renderer.stop();
     ap::net::global_shutdown();

@@ -26,6 +26,26 @@ void HlsSessionRegistry::remove(const std::string& session_id) {
     sessions_.erase(session_id);
 }
 
+bool HlsSessionRegistry::lookup_playlist(const std::string& url,
+                                         std::string& out_bytes,
+                                         bool& out_is_master) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (const auto& [sid, s] : sessions_) {
+        if (s.master_url == url) {
+            out_bytes     = s.master_playlist;
+            out_is_master = true;
+            return !out_bytes.empty();
+        }
+        const auto it = s.media_playlists.find(url);
+        if (it != s.media_playlists.end()) {
+            out_bytes     = it->second;
+            out_is_master = false;
+            return !out_bytes.empty();
+        }
+    }
+    return false;
+}
+
 std::vector<std::string> extract_media_uris(const std::string& master) {
     // Scan for substrings of the form mlhls://localhost/<path>.m3u8
     // (both #EXT-X-MEDIA:URI="..." and #EXT-X-STREAM-INF: children

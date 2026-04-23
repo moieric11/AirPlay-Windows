@@ -37,18 +37,18 @@ public:
     // Remove + free. Called on TEARDOWN / session end.
     void remove(const std::string& session_id);
 
-    // Run `fn` under the registry lock so callers mutating/reading a
-    // HlsSession don't race with the registry teardown path.
-    template <typename Fn>
-    auto with_lock(Fn&& fn) -> decltype(fn()) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return fn();
-    }
+    // Scan every active session for a stored playlist matching `url`
+    // (mlhls://localhost/...). Returns a copy of the bytes and whether
+    // it's the master (vs. a media sub-playlist) of that session. Used
+    // by the local HTTP server to serve the internal media player.
+    bool lookup_playlist(const std::string& url,
+                         std::string& out_bytes,
+                         bool& out_is_master) const;
 
 private:
     HlsSessionRegistry() = default;
 
-    std::mutex                                           mtx_;
+    mutable std::mutex                                   mtx_;
     std::unordered_map<std::string, HlsSession>          sessions_;
 };
 
