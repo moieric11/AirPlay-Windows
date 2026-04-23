@@ -366,6 +366,12 @@ void VideoRenderer::run(const std::string& title) {
         return;
     }
 
+    // Bilinear filtering for any texture we scale (video frames and
+    // cover art). SDL defaults to nearest-neighbour, which gave the
+    // output a hard "blocky" look compared to Apple-certified
+    // receivers. Must be set before SDL_CreateRenderer to take effect.
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+
     SDL_Window*   window   = SDL_CreateWindow(
         title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         kDefaultWinWidth, kDefaultWinHeight,
