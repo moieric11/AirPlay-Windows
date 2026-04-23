@@ -273,7 +273,12 @@ void VideoRenderer::push_progress(uint32_t elapsed_ms, uint32_t total_ms) {
 }
 
 void VideoRenderer::push_playback_rate(float rate) {
-    playing_.store(rate > 0.5f, std::memory_order_relaxed);
+    const bool new_playing = rate > 0.5f;
+    const bool old_playing = playing_.exchange(new_playing, std::memory_order_relaxed);
+    if (old_playing != new_playing) {
+        LOG_INFO << "VideoRenderer playback state: "
+                 << (new_playing ? "PLAYING" : "PAUSED");
+    }
     cv_.notify_one();
 }
 
@@ -503,26 +508,24 @@ void VideoRenderer::run(const std::string& title) {
             SDL_Rect dst = fit_inside(cover_tex_w, cover_tex_h, win_w, top_h);
             SDL_RenderCopy(renderer, cover_tex, nullptr, &dst);
 
-            // Pause indicator: two white bars on a semi-transparent black
-            // disc, centered on the cover. Shown only while rate: 0 is in
-            // effect (iOS is paused). Requires BLEND so the alpha sticks.
+            // Pause indicator: DIAG — bright red, fully opaque, over the
+            // full center rect of the cover. If this isn't visible the
+            // issue is with playing_ state, not with rendering.
             if (!playing_.load(std::memory_order_relaxed)) {
-                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-                const int badge = std::min(dst.w, dst.h) / 6;
+                const int badge = std::min(dst.w, dst.h) / 4;
                 const int cx    = dst.x + dst.w / 2;
                 const int cy    = dst.y + dst.h / 2;
+                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+                SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255);
                 SDL_Rect bg{cx - badge, cy - badge, badge * 2, badge * 2};
-                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 160);
                 SDL_RenderFillRect(renderer, &bg);
-                const int bar_w = badge / 3;
-                const int bar_h = badge;
-                const int gap   = badge / 3;
-                SDL_SetRenderDrawColor(renderer, 255, 255, 255, 230);
-                SDL_Rect b1{cx - gap - bar_w, cy - bar_h / 2, bar_w, bar_h};
-                SDL_Rect b2{cx + gap,         cy - bar_h / 2, bar_w, bar_h};
+                SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+                const int bw = badge / 3;
+                const int bh = badge;
+                SDL_Rect b1{cx - bw - 6, cy - bh / 2, bw, bh};
+                SDL_Rect b2{cx + 6,      cy - bh / 2, bw, bh};
                 SDL_RenderFillRect(renderer, &b1);
                 SDL_RenderFillRect(renderer, &b2);
-                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
             }
 
             // Text lines stacked left-aligned with a small margin.
