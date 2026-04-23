@@ -149,11 +149,29 @@ if(USE_GSTREAMER_HLS)
     if(NOT PkgConfig_FOUND)
         message(FATAL_ERROR "USE_GSTREAMER_HLS=ON requires pkg-config")
     endif()
+    # Windows convenience: -DGSTREAMER_ROOT=C:/Program Files/gstreamer/1.0/msvc_x86_64
+    # propagates into PKG_CONFIG_PATH so pkg_check_modules finds the .pc
+    # files without the user having to export an env var beforehand.
+    # Fall back to the env var path when -D isn't set.
+    if(GSTREAMER_ROOT)
+        message(STATUS "GSTREAMER_ROOT=${GSTREAMER_ROOT} → injecting into PKG_CONFIG_PATH")
+        if(WIN32)
+            set(ENV{PKG_CONFIG_PATH}
+                "${GSTREAMER_ROOT}/lib/pkgconfig;$ENV{PKG_CONFIG_PATH}")
+        else()
+            set(ENV{PKG_CONFIG_PATH}
+                "${GSTREAMER_ROOT}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+        endif()
+    endif()
     pkg_check_modules(GSTREAMER IMPORTED_TARGET
         gstreamer-1.0 gstreamer-app-1.0)
     if(NOT GSTREAMER_FOUND)
         message(FATAL_ERROR
             "USE_GSTREAMER_HLS=ON but gstreamer-1.0/gstreamer-app-1.0 not found.\n"
+            "  Windows: install GStreamer MSVC x86_64 from\n"
+            "           https://gstreamer.freedesktop.org/download/ and either\n"
+            "             set PKG_CONFIG_PATH before cmake, or pass\n"
+            "             -DGSTREAMER_ROOT=\"C:/Program Files/gstreamer/1.0/msvc_x86_64\"\n"
             "  Linux:   apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev\n"
             "                       libgstreamer-plugins-bad1.0-dev gstreamer1.0-libav\n"
             "                       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad")
