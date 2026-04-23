@@ -75,6 +75,35 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
         }
     }
 
+    // URL-decode the path: FFmpeg percent-encodes reserved characters
+    // like "=" (-> "%3D") when fetching from the manifest, but iOS's
+    // original URL in the playlist contained the literal "=". We need
+    // the decoded form to reconstruct the canonical mlhls:// URL that
+    // the FCUP lookup/fetch keys on.
+    {
+        std::string decoded;
+        decoded.reserve(path.size());
+        for (std::size_t i = 0; i < path.size(); ++i) {
+            if (path[i] == '%' && i + 2 < path.size()) {
+                auto hex = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+                    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+                    return -1;
+                };
+                const int hi = hex(path[i + 1]);
+                const int lo = hex(path[i + 2]);
+                if (hi >= 0 && lo >= 0) {
+                    decoded.push_back(static_cast<char>((hi << 4) | lo));
+                    i += 2;
+                    continue;
+                }
+            }
+            decoded.push_back(path[i]);
+        }
+        path = std::move(decoded);
+    }
+
     auto send_response = [&](int status, const char* status_text,
                              const std::string& body,
                              const char* content_type) {
