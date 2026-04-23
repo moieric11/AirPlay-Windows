@@ -137,10 +137,11 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
     const std::string mlhls_url = "mlhls://localhost/" +
         (path.empty() || path[0] != '/' ? path : path.substr(1));
 
-    // Route "/seg/<n>" to the CDN-URL proxy (see below). The rewritten
-    // media playlists we serve contain these local paths; FFmpeg
-    // fetches them and we resolve the id -> googlevideo.com URL, then
-    // stream the bytes back via libavio (HTTPS natively).
+    // Route "/seg/<n>" to the CDN-URL proxy. Rewritten media playlists
+    // serve these local paths; we resolve id -> googlevideo.com URL
+    // and stream bytes back via libavio (HTTPS natively, with Range
+    // passthrough so HLS clients using byte-range requests get a
+    // proper 206 Partial Content).
     if (path.size() > 5 && path.compare(0, 5, "/seg/") == 0) {
         const std::string cdn_url =
             HlsSessionRegistry::instance().resolve_segment_path(path);
@@ -150,23 +151,92 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
             ap::net::close_socket(client.fd);
             return;
         }
-        LOG_INFO << "HLS GET " << path << " -> proxy "
+
+        // Parse Range: bytes=<start>-<end> from the incoming headers.
+        // Empty end means "to EOF". Negative start means "last N bytes"
+        // (suffix range) — uncommon in HLS, not supported here.
+        int64_t range_start = -1, range_end = -1;
+        {
+            // Lower-case copy of headers for case-insensitive search.
+            std::string lc(headers.size(), ' ');
+            for (std::size_t i = 0; i < headers.size(); ++i) {
+                lc[i] = (headers[i] >= 'A' && headers[i] <= 'Z')
+                            ? headers[i] + 32 : headers[i];
+            }
+            const auto rp = lc.find("\r\nrange:");
+            if (rp != std::string::npos) {
+                const auto eq = headers.find('=', rp);
+                const auto eol = headers.find("\r\n", rp + 2);
+                if (eq != std::string::npos && eol != std::string::npos &&
+                    eq < eol) {
+                    const std::string val = headers.substr(eq + 1, eol - eq - 1);
+                    const auto dash = val.find('-');
+                    try {
+                        if (dash != std::string::npos) {
+                            if (dash > 0) range_start = std::stoll(val.substr(0, dash));
+                            if (dash + 1 < val.size())
+                                range_end = std::stoll(val.substr(dash + 1));
+                        }
+                    } catch (...) {}
+                }
+            }
+        }
+
+        LOG_INFO << "HLS GET " << path
+                 << (range_start >= 0
+                         ? " [Range=" + std::to_string(range_start) + "-" +
+                           (range_end >= 0 ? std::to_string(range_end) : "") + "]"
+                         : std::string{})
+                 << " -> proxy "
                  << cdn_url.substr(0, std::min<std::size_t>(120, cdn_url.size()))
                  << (cdn_url.size() > 120 ? "..." : "");
 
+        AVDictionary* opts = nullptr;
+        if (range_start >= 0) {
+            av_dict_set_int(&opts, "offset", range_start, 0);
+            if (range_end >= 0) {
+                // libavio's end_offset is exclusive.
+                av_dict_set_int(&opts, "end_offset", range_end + 1, 0);
+            }
+        }
         AVIOContext* avio = nullptr;
-        const int rc = avio_open(&avio, cdn_url.c_str(), AVIO_FLAG_READ);
+        const int rc = avio_open2(&avio, cdn_url.c_str(),
+                                  AVIO_FLAG_READ, nullptr, &opts);
+        av_dict_free(&opts);
         if (rc < 0) {
             char err[128]{};
             av_strerror(rc, err, sizeof(err));
-            LOG_WARN << "seg proxy: avio_open failed: " << err;
+            LOG_WARN << "seg proxy: avio_open2 failed: " << err;
             send_response(502, "Bad Gateway", "", "text/plain");
             ap::net::close_socket(client.fd);
             return;
         }
         const int64_t size = avio_size(avio);
-        std::string hdr = "HTTP/1.1 200 OK\r\n"
-                          "Content-Type: application/octet-stream\r\n";
+
+        std::string hdr;
+        if (range_start >= 0) {
+            // 206 Partial Content — we don't know the full resource
+            // size (libavio doesn't expose the upstream Content-Range
+            // total), so use "*" per RFC 7233 §4.2.
+            const int64_t effective_end =
+                (range_end >= 0) ? range_end
+                                 : (size > 0 ? range_start + size - 1 : -1);
+            hdr.append("HTTP/1.1 206 Partial Content\r\n");
+            hdr.append("Content-Type: application/octet-stream\r\n");
+            if (effective_end >= 0) {
+                char crange[96];
+                std::snprintf(crange, sizeof(crange),
+                              "Content-Range: bytes %lld-%lld/*\r\n",
+                              static_cast<long long>(range_start),
+                              static_cast<long long>(effective_end));
+                hdr.append(crange);
+            }
+            hdr.append("Accept-Ranges: bytes\r\n");
+        } else {
+            hdr.append("HTTP/1.1 200 OK\r\n");
+            hdr.append("Content-Type: application/octet-stream\r\n");
+            hdr.append("Accept-Ranges: bytes\r\n");
+        }
         if (size > 0) {
             hdr.append("Content-Length: ").append(std::to_string(size))
                .append("\r\n");
@@ -200,7 +270,8 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
         }
         avio_close(avio);
         LOG_INFO << "HLS GET " << path << " proxy done ("
-                 << total << "B streamed)";
+                 << total << "B streamed, "
+                 << (range_start >= 0 ? "206" : "200") << ')';
         ap::net::close_socket(client.fd);
         return;
     }
