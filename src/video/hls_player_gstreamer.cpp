@@ -174,15 +174,32 @@ bool HlsPlayer::start(const std::string& url, VideoRenderer* renderer) {
 
 void HlsPlayer::stop() {
     if (!impl_->running.exchange(false)) return;
-    if (impl_->loop)      g_main_loop_quit(impl_->loop);
-    if (impl_->loop_thread.joinable()) impl_->loop_thread.join();
+
+    // Drain the pipeline to NULL *before* quitting the main loop so
+    // GStreamer has a chance to flush any in-flight buffer/message
+    // while its thread is still running. Otherwise we can destroy
+    // the bus with callbacks still pending and hit a use-after-free
+    // on the next start().
     if (impl_->pipeline) {
         gst_element_set_state(impl_->pipeline, GST_STATE_NULL);
+    }
+    if (impl_->loop) g_main_loop_quit(impl_->loop);
+    if (impl_->loop_thread.joinable()) impl_->loop_thread.join();
+
+    // appsink is owned by the pipeline (g_object_set on "video-sink"
+    // sank its floating ref). Don't unref it separately — that's a
+    // double-free and crashes on the next start/stop cycle.
+    if (impl_->pipeline) {
         gst_object_unref(impl_->pipeline);
         impl_->pipeline = nullptr;
     }
-    if (impl_->appsink) { gst_object_unref(impl_->appsink); impl_->appsink = nullptr; }
-    if (impl_->loop)    { g_main_loop_unref(impl_->loop);   impl_->loop    = nullptr; }
+    impl_->appsink = nullptr;
+
+    if (impl_->loop) {
+        g_main_loop_unref(impl_->loop);
+        impl_->loop = nullptr;
+    }
+    impl_->renderer = nullptr;
     LOG_INFO << "HlsPlayer(gst) stopped";
 }
 
