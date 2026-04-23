@@ -157,6 +157,7 @@ add_executable(airplay-windows
     src/airplay/sdp.cpp
     src/airplay/server.cpp
     src/airplay/streams.cpp
+    src/airplay/reverse_channel.cpp
     src/airplay/routes.cpp
     src/video/h264_decoder.cpp
     src/video/video_renderer.cpp

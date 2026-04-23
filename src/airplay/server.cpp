@@ -1,5 +1,6 @@
 #include "airplay/server.h"
 #include "airplay/client_session.h"
+#include "airplay/reverse_channel.h"
 #include "log.h"
 
 namespace ap::airplay {
@@ -24,7 +25,8 @@ void Server::handle_client(ap::net::ClientSocket client) {
     auto colon = peer_ip.rfind(':');
     if (colon != std::string::npos) peer_ip.resize(colon);
 
-    ClientSession session(*ctx_.identity, peer_ip, ctx_.renderer);
+    ClientSession session(*ctx_.identity, peer_ip,
+                          static_cast<int>(client.fd), ctx_.renderer);
 
     while (reader.read(static_cast<int>(client.fd), req)) {
         Response res = dispatch(ctx_, session, req);
@@ -34,6 +36,10 @@ void Server::handle_client(ap::net::ClientSocket client) {
             LOG_WARN << client.peer << ": send failed";
             break;
         }
+    }
+    if (!session.reverse_session_id.empty()) {
+        ReverseChannelRegistry::instance().unregister_socket(
+            session.reverse_session_id);
     }
     LOG_INFO << "closing " << client.peer;
     ap::net::close_socket(client.fd);

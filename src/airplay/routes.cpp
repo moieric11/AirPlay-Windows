@@ -3,6 +3,7 @@
 #include "airplay/client_session.h"
 #include "airplay/daap.h"
 #include "airplay/info_plist.h"
+#include "airplay/reverse_channel.h"
 #include "airplay/sdp.h"
 #include "airplay/streams.h"
 #include "crypto/fairplay.h"
@@ -588,7 +589,7 @@ Response handle_unimplemented(const Request& req, const char* what) {
 // additional requests on this socket. For now we don't push any events
 // (reconnaissance step 3a); replying 101 is enough to stop the retry
 // storm we saw with the previous 501 stub.
-Response handle_reverse(const Request& req) {
+Response handle_reverse(ClientSession& session, const Request& req) {
     Response r;
     r.status_code = 101;
     r.status_text = "Switching Protocols";
@@ -603,6 +604,14 @@ Response handle_reverse(const Request& req) {
     auto purpose = req.header("x-apple-purpose");
     LOG_INFO << "/reverse channel opened (X-Apple-Purpose=\"" << purpose
              << "\", session=" << sid << ')';
+
+    // Register this socket in the global registry so handle_play can
+    // push a POST /event FCUP Request on it once iOS calls /play.
+    // Server::handle_client will unregister on TCP close.
+    if (!sid.empty() && session.fd >= 0) {
+        session.reverse_session_id = sid;
+        ReverseChannelRegistry::instance().register_socket(sid, session.fd);
+    }
     return r;
 }
 
@@ -663,17 +672,22 @@ std::string snapshot_body(const std::vector<unsigned char>& body) {
 // certificate from Apple we can't decrypt the stream. YouTube and
 // Photos usually ship plain HLS that we can fetch directly.
 struct PlayRequest {
-    std::string url;
-    std::string session_uuid;
-    double      start_position = 0.0;
-    double      rate           = 1.0;
-    bool        has_fairplay   = false;
+    std::string url;           // Content-Location (HLS master playlist)
+    std::string playback_uuid; // "uuid" key in the body (per-video)
+    std::string session_id;    // X-Apple-Session-ID header (per-session)
+    std::string client_proc;   // clientProcName — "YouTube" is what UxPlay gates on
+    double      start_position_seconds = 0.0;
+    bool        is_binary_plist        = false;
 };
 
-bool parse_play_body(const std::vector<uint8_t>& body, PlayRequest& out) {
+bool parse_play_body(const std::vector<uint8_t>& body,
+                     const std::string& session_id,
+                     PlayRequest& out) {
+    out.session_id = session_id;
 #if defined(HAVE_LIBPLIST)
     if (body.size() >= 8 &&
         std::memcmp(body.data(), "bplist00", 8) == 0) {
+        out.is_binary_plist = true;
         plist_t root = nullptr;
         plist_from_bin(reinterpret_cast<const char*>(body.data()),
                        static_cast<uint32_t>(body.size()), &root);
@@ -696,18 +710,16 @@ bool parse_play_body(const std::vector<uint8_t>& body, PlayRequest& out) {
             }
             return fallback;
         };
-        out.url            = get_string(root, "Content-Location");
-        out.session_uuid   = get_string(root, "X-Apple-Session-UUID");
-        out.start_position = get_real(root, "Start-Position", 0.0);
-        out.rate           = get_real(root, "rate", 1.0);
-        out.has_fairplay   = plist_dict_get_item(root, "fpsd") != nullptr
-                          || plist_dict_get_item(root, "fairplay-blob") != nullptr;
+        // Keys match UxPlay's http_handlers.h http_handler_play.
+        out.url                    = get_string(root, "Content-Location");
+        out.playback_uuid          = get_string(root, "uuid");
+        out.client_proc            = get_string(root, "clientProcName");
+        out.start_position_seconds = get_real(root, "Start-Position-Seconds", 0.0);
         plist_free(root);
         return !out.url.empty();
     }
 #endif
-    // Legacy text/parameters (older iOS): "Content-Location: URL\r\n"
-    // followed by optional "Start-Position: 0.0\r\n".
+    // Legacy text/parameters fallback (only seen on older iOS).
     const std::string text(reinterpret_cast<const char*>(body.data()),
                            body.size());
     auto extract = [&](const std::string& key) -> std::string {
@@ -722,7 +734,7 @@ bool parse_play_body(const std::vector<uint8_t>& body, PlayRequest& out) {
     out.url = extract("Content-Location:");
     try {
         const auto sp = extract("Start-Position:");
-        if (!sp.empty()) out.start_position = std::stod(sp);
+        if (!sp.empty()) out.start_position_seconds = std::stod(sp);
     } catch (...) {}
     return !out.url.empty();
 }
@@ -731,28 +743,33 @@ Response handle_play(ClientSession& session, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
 
+    const std::string session_id = req.header("x-apple-session-id");
     PlayRequest pr;
-    if (!parse_play_body(req.body, pr)) {
+    if (!parse_play_body(req.body, session_id, pr)) {
         LOG_WARN << "POST /play: could not parse body ("
                  << req.body.size() << "B)  " << snapshot_body(req.body);
         return r;
     }
-    LOG_INFO << "POST /play url=" << pr.url;
-    LOG_INFO << "         start=" << pr.start_position
-             << " rate=" << pr.rate
-             << " uuid=" << pr.session_uuid
-             << (pr.has_fairplay ? " [FAIRPLAY]" : "");
+    LOG_INFO << "POST /play [" << pr.client_proc << "]"
+             << (pr.is_binary_plist ? " (bplist00)" : " (text)")
+             << "  url=" << pr.url;
+    LOG_INFO << "         uuid=" << pr.playback_uuid
+             << "  start=" << pr.start_position_seconds << 's'
+             << "  session=" << pr.session_id;
 
-    if (pr.has_fairplay) {
-        LOG_WARN << "POST /play: stream is FairPlay-protected "
-                    "(Netflix / Apple TV+). Cannot decrypt without an "
-                    "MFi key server certificate; playback skipped.";
+    // UxPlay gates on clientProcName == "YouTube" — other apps (Netflix,
+    // Apple TV+, Music in non-audio mode) ship FairPlay-protected HLS
+    // that we can't decrypt without an MFi key-server certificate.
+    if (pr.client_proc != "YouTube") {
+        LOG_WARN << "POST /play: clientProcName \"" << pr.client_proc
+                 << "\" not in supported list [YouTube]; skipping playback";
         return r;
     }
 
-    // TODO next commit: hand pr.url to an HLSPlayer that opens the
-    // URL with libavformat, decodes video with libavcodec (already
-    // linked) and pushes decoded frames into session.renderer.
+    // TODO next commit: look up the /reverse socket for this session_id
+    // and send a POST /event FCUP Request to ask iOS for the master
+    // playlist. Then on POST /action we receive the playlist data,
+    // parse it, and cascade FCUP requests for each media sub-playlist.
     (void)session;
     return r;
 }
@@ -849,7 +866,7 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     // AirPlay Streaming reconnaissance (step 3a): answer the routes iOS
     // hammers at session setup so we stop the retry storm and can observe
     // what else it sends for YouTube / Netflix / Apple TV+ playback.
-    if (req.method == "POST" && path == "/reverse")          return handle_reverse(req);
+    if (req.method == "POST" && path == "/reverse")          return handle_reverse(session, req);
     if (req.method == "GET"  && path == "/server-info")      return handle_server_info(ctx, req);
     if (req.method == "POST" && path == "/audioMode")        {
         // Observed as the resume-from-pause signal on some iOS flows

@@ -20,14 +20,28 @@ namespace ap::airplay {
 // that never reach the corresponding stage.
 struct ClientSession {
     ClientSession(const ap::crypto::Identity& id, std::string peer_ip,
+                  int socket_fd = -1,
                   ap::video::VideoRenderer* r = nullptr)
-        : identity(id), remote_ip(std::move(peer_ip)), renderer(r) {}
+        : identity(id), remote_ip(std::move(peer_ip)),
+          fd(socket_fd), renderer(r) {}
 
     const ap::crypto::Identity& identity;
 
     // iOS IP only (no port). Used as destination for the NTP client probes
     // we send once SETUP is done.
     std::string remote_ip;
+
+    // TCP socket fd of the underlying control connection. Used by
+    // handle_reverse to register itself in ReverseChannelRegistry so
+    // handle_play can push a POST /event (FCUP Request) back on the
+    // right socket. -1 when unknown (legacy callers).
+    int fd{-1};
+
+    // For the /reverse connection: session id iOS sent in the
+    // X-Apple-Session-ID header. We remember it so handle_client can
+    // unregister the fd from ReverseChannelRegistry when the TCP
+    // connection closes.
+    std::string reverse_session_id;
 
     // Non-owning; handed down to the StreamSession on first SETUP so the
     // mirror stream's decoded frames can be drawn.
