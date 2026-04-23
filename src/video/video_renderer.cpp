@@ -508,24 +508,26 @@ void VideoRenderer::run(const std::string& title) {
             SDL_Rect dst = fit_inside(cover_tex_w, cover_tex_h, win_w, top_h);
             SDL_RenderCopy(renderer, cover_tex, nullptr, &dst);
 
-            // Pause indicator: DIAG — bright red, fully opaque, over the
-            // full center rect of the cover. If this isn't visible the
-            // issue is with playing_ state, not with rendering.
+            // Pause indicator: two white bars on a semi-transparent black
+            // square, centered on the cover. Only while iOS reports
+            // rate: 0 via text/parameters (or POST /rate?value=0).
             if (!playing_.load(std::memory_order_relaxed)) {
-                const int badge = std::min(dst.w, dst.h) / 4;
+                const int badge = std::min(dst.w, dst.h) / 6;
                 const int cx    = dst.x + dst.w / 2;
                 const int cy    = dst.y + dst.h / 2;
-                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
-                SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255);
+                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 160);
                 SDL_Rect bg{cx - badge, cy - badge, badge * 2, badge * 2};
                 SDL_RenderFillRect(renderer, &bg);
-                SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
                 const int bw = badge / 3;
                 const int bh = badge;
-                SDL_Rect b1{cx - bw - 6, cy - bh / 2, bw, bh};
-                SDL_Rect b2{cx + 6,      cy - bh / 2, bw, bh};
+                const int gap = badge / 3;
+                SDL_SetRenderDrawColor(renderer, 255, 255, 255, 235);
+                SDL_Rect b1{cx - gap - bw, cy - bh / 2, bw, bh};
+                SDL_Rect b2{cx + gap,      cy - bh / 2, bw, bh};
                 SDL_RenderFillRect(renderer, &b1);
                 SDL_RenderFillRect(renderer, &b2);
+                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
             }
 
             // Text lines stacked left-aligned with a small margin.

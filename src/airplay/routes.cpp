@@ -689,13 +689,14 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "GET_PARAMETER")  return handle_get_parameter(req);
     if (req.method == "SET_PARAMETER")  return handle_set_parameter(session, req);
 
-    // RTSP media-control verbs. FLUSH is the AirPlay pause signal (the
-    // sender stops RTP and tells us to flush buffers); iOS resumes by
-    // either sending RECORD again or just resuming the audio stream,
-    // which is what puts playing_ back to true below in handle_*.
+    // RTSP FLUSH is NOT a pause signal in AirPlay 2 — iOS also sends it
+    // during active playback (seek / track-change prologue), and treating
+    // it as a pause incorrectly freezes the progress UI until the next
+    // explicit rate/progress message arrives. Acknowledge with 200 OK.
+    // The authoritative pause triggers are text/parameters "rate: 0" and
+    // POST /rate?value=0 (both handled elsewhere).
     if (req.method == "FLUSH" || req.method == "PAUSE") {
-        LOG_INFO << req.method << ": paused";
-        if (session.renderer) session.renderer->push_playback_rate(0.0f);
+        LOG_INFO << req.method << ": ack (no state change)";
         Response r = make(200, "OK");
         copy_cseq(req, r);
         return r;
