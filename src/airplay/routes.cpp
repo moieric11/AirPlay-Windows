@@ -697,14 +697,18 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "GET_PARAMETER")  return handle_get_parameter(req);
     if (req.method == "SET_PARAMETER")  return handle_set_parameter(session, req);
 
-    // RTSP FLUSH is NOT a pause signal in AirPlay 2 — iOS also sends it
-    // during active playback (seek / track-change prologue), and treating
-    // it as a pause incorrectly freezes the progress UI until the next
-    // explicit rate/progress message arrives. Acknowledge with 200 OK.
-    // The authoritative pause triggers are text/parameters "rate: 0" and
-    // POST /rate?value=0 (both handled elsewhere).
+    // RTSP FLUSH is iOS's ambiguous "buffer reset" verb. Observed flows:
+    //   - pre-playback / pre-track-change FLUSH followed by audio pkts
+    //     within ~1 ms (safe to ignore)
+    //   - user-pause FLUSH followed by 20+ seconds of silence, then a
+    //     SETUP or TEARDOWN on resume
+    // We can't distinguish the two up front, so anticipate pause here
+    // (push rate=0). The AudioReceiver silence watchdog flips rate back
+    // to 1 as soon as the next packet arrives, so a spurious mid-play
+    // FLUSH only shows pause for a fraction of a frame.
     if (req.method == "FLUSH" || req.method == "PAUSE") {
-        LOG_INFO << req.method << ": ack (no state change)";
+        LOG_INFO << req.method << ": tentative pause";
+        if (session.renderer) session.renderer->push_playback_rate(0.0f);
         Response r = make(200, "OK");
         copy_cseq(req, r);
         return r;
@@ -730,7 +734,14 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     // what else it sends for YouTube / Netflix / Apple TV+ playback.
     if (req.method == "POST" && path == "/reverse")          return handle_reverse(req);
     if (req.method == "GET"  && path == "/server-info")      return handle_server_info(ctx, req);
-    if (req.method == "POST" && path == "/audioMode")        return handle_stream_stub(req, "audioMode");
+    if (req.method == "POST" && path == "/audioMode")        {
+        // Observed as the resume-from-pause signal on some iOS flows
+        // (no RECORD, no new SETUP — just an audioMode announcement
+        // followed by the RTP stream kicking back in). Flip the renderer
+        // to playing; the silence watchdog will confirm via packets.
+        if (session.renderer) session.renderer->push_playback_rate(1.0f);
+        return handle_stream_stub(req, "audioMode");
+    }
     if (req.method == "POST" && path == "/play")             return handle_stream_stub(req, "play");
     if (req.method == "POST" && path == "/stop")             return handle_stream_stub(req, "stop");
     if (req.method == "POST" && path == "/scrub")            return handle_stream_stub(req, "scrub");
