@@ -368,6 +368,9 @@ Response handle_record(ClientSession& session, const Request& req) {
     // that the client did reach RECORD and is actively pushing media.
     LOG_INFO << "RECORD: session=" << session.streams->session_id()
              << " — stream worker not started (FairPlay blobs required)";
+    // Resume-from-FLUSH path: iOS pauses with FLUSH and restarts the
+    // stream with RECORD, so bring the "playing" flag back to true.
+    if (session.renderer) session.renderer->push_playback_rate(1.0f);
     return r;
 }
 
@@ -653,13 +656,20 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     LOG_INFO << req.method << ' ' << req.uri
              << "  body=" << req.body.size() << "B";
 
+    // Strip query string from URI for dispatch matching: iOS sends
+    // "/rate?value=0.000000" but our route table uses "/rate". The
+    // handler still has access to the full uri via req.uri.
+    const auto qpos = req.uri.find('?');
+    const std::string path = (qpos == std::string::npos)
+                                 ? req.uri : req.uri.substr(0, qpos);
+
     // Order matches the rough handshake sequence iOS initiates.
-    if (req.method == "GET"  && req.uri == "/info")          return handle_info(ctx, req);
-    if (req.method == "POST" && req.uri == "/pair-setup")    return handle_pair_setup(ctx, req);
-    if (req.method == "POST" && req.uri == "/pair-verify")   return handle_pair_verify(ctx, session, req);
-    if (req.method == "POST" && req.uri == "/fp-setup")      return handle_fp_setup(session, req);
-    if (req.method == "POST" && req.uri == "/auth-setup")    return handle_unimplemented(req, "auth-setup");
-    if (req.method == "POST" && req.uri == "/feedback")      {
+    if (req.method == "GET"  && path == "/info")          return handle_info(ctx, req);
+    if (req.method == "POST" && path == "/pair-setup")    return handle_pair_setup(ctx, req);
+    if (req.method == "POST" && path == "/pair-verify")   return handle_pair_verify(ctx, session, req);
+    if (req.method == "POST" && path == "/fp-setup")      return handle_fp_setup(session, req);
+    if (req.method == "POST" && path == "/auth-setup")    return handle_unimplemented(req, "auth-setup");
+    if (req.method == "POST" && path == "/feedback")      {
         Response r = make(200, "OK");
         copy_cseq(req, r);
         return r;
@@ -679,21 +689,47 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "GET_PARAMETER")  return handle_get_parameter(req);
     if (req.method == "SET_PARAMETER")  return handle_set_parameter(session, req);
 
+    // RTSP media-control verbs. FLUSH is the AirPlay pause signal (the
+    // sender stops RTP and tells us to flush buffers); iOS resumes by
+    // either sending RECORD again or just resuming the audio stream,
+    // which is what puts playing_ back to true below in handle_*.
+    if (req.method == "FLUSH" || req.method == "PAUSE") {
+        LOG_INFO << req.method << ": paused";
+        if (session.renderer) session.renderer->push_playback_rate(0.0f);
+        Response r = make(200, "OK");
+        copy_cseq(req, r);
+        return r;
+    }
+
+    // POST /rate?value=N: AirPlay Streaming pause/play (iOS also uses it
+    // for audio in some flows). value=0 → paused, value=1 → playing.
+    if (req.method == "POST" && path == "/rate") {
+        const auto eq = req.uri.find("value=");
+        if (eq != std::string::npos) {
+            try {
+                const float rate = std::stof(req.uri.substr(eq + 6));
+                LOG_INFO << "POST /rate value=" << rate
+                         << (rate > 0.5f ? " (playing)" : " (paused)");
+                if (session.renderer) session.renderer->push_playback_rate(rate);
+            } catch (...) {}
+        }
+        return handle_stream_stub(req, "rate");
+    }
+
     // AirPlay Streaming reconnaissance (step 3a): answer the routes iOS
     // hammers at session setup so we stop the retry storm and can observe
     // what else it sends for YouTube / Netflix / Apple TV+ playback.
-    if (req.method == "POST" && req.uri == "/reverse")          return handle_reverse(req);
-    if (req.method == "GET"  && req.uri == "/server-info")      return handle_server_info(ctx, req);
-    if (req.method == "POST" && req.uri == "/audioMode")        return handle_stream_stub(req, "audioMode");
-    if (req.method == "POST" && req.uri == "/play")             return handle_stream_stub(req, "play");
-    if (req.method == "POST" && req.uri == "/stop")             return handle_stream_stub(req, "stop");
-    if (req.method == "POST" && req.uri == "/rate")             return handle_stream_stub(req, "rate");
-    if (req.method == "POST" && req.uri == "/scrub")            return handle_stream_stub(req, "scrub");
-    if (req.method == "POST" && req.uri == "/setProperty")      return handle_stream_stub(req, "setProperty");
-    if (req.method == "POST" && req.uri == "/getProperty")      return handle_stream_stub(req, "getProperty");
-    if (req.method == "GET"  && req.uri == "/playback-info")    return handle_stream_stub(req, "playback-info");
-    if (req.method == "POST" && req.uri == "/action")           return handle_stream_stub(req, "action");
-    if (req.method == "POST" && req.uri == "/command")          return handle_stream_stub(req, "command");
+    if (req.method == "POST" && path == "/reverse")          return handle_reverse(req);
+    if (req.method == "GET"  && path == "/server-info")      return handle_server_info(ctx, req);
+    if (req.method == "POST" && path == "/audioMode")        return handle_stream_stub(req, "audioMode");
+    if (req.method == "POST" && path == "/play")             return handle_stream_stub(req, "play");
+    if (req.method == "POST" && path == "/stop")             return handle_stream_stub(req, "stop");
+    if (req.method == "POST" && path == "/scrub")            return handle_stream_stub(req, "scrub");
+    if (req.method == "POST" && path == "/setProperty")      return handle_stream_stub(req, "setProperty");
+    if (req.method == "POST" && path == "/getProperty")      return handle_stream_stub(req, "getProperty");
+    if (req.method == "GET"  && path == "/playback-info")    return handle_stream_stub(req, "playback-info");
+    if (req.method == "POST" && path == "/action")           return handle_stream_stub(req, "action");
+    if (req.method == "POST" && path == "/command")          return handle_stream_stub(req, "command");
 
     return handle_unimplemented(req, "unknown route");
 }
