@@ -409,7 +409,12 @@ Response handle_teardown(const DeviceContext& ctx, ClientSession& session, const
             session.streams->stop_stream(t);
         }
         // Keep session.streams alive — iOS may retry the stream without
-        // re-doing the session setup.
+        // re-doing the session setup. Do NOT touch the HLS player:
+        // when iOS starts an HLS video session (POST /play), it
+        // typically sends a partial teardown of the audio stream
+        // (type 96) to release the parallel RAOP channel it was
+        // using as a fallback. Stopping the HLS player here killed
+        // the just-started video pipeline ~17 ms after it began.
     } else if (session.streams) {
         LOG_INFO << "TEARDOWN full session=" << session.streams->session_id()
                  << " — AirPlay session ended";
@@ -418,10 +423,15 @@ Response handle_teardown(const DeviceContext& ctx, ClientSession& session, const
         // Wipe the idle-mode UI so a new connection doesn't inherit the
         // last track's cover, metadata and progress.
         if (session.renderer) session.renderer->clear_session();
+        // Full session end: stop the HLS player so the player thread
+        // doesn't keep fetching stale segments.
+        if (ctx.hls_player) ctx.hls_player->stop();
+    } else {
+        // No session state and no stream filter — treat as a full
+        // teardown too, since iOS may send an empty body to end a
+        // session we never had (paranoid fallback).
+        if (ctx.hls_player) ctx.hls_player->stop();
     }
-    // Also stop any HLS player started by AirPlay Streaming so the
-    // player thread doesn't keep fetching stale segments.
-    if (ctx.hls_player) ctx.hls_player->stop();
     return r;
 }
 
