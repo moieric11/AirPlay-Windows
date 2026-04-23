@@ -37,6 +37,18 @@ void HlsSessionRegistry::remove(const std::string& session_id) {
     sessions_.erase(session_id);
 }
 
+std::string HlsSessionRegistry::resolve_segment_path(
+        const std::string& local_path) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    for (const auto& [sid, s] : sessions_) {
+        if (!s) continue;
+        std::lock_guard<std::mutex> sl(s->seg_url_mtx);
+        const auto it = s->seg_url_map.find(local_path);
+        if (it != s->seg_url_map.end()) return it->second;
+    }
+    return {};
+}
+
 bool HlsSessionRegistry::lookup_playlist(const std::string& url,
                                          std::string& out_bytes,
                                          bool& out_is_master) const {
@@ -401,6 +413,55 @@ std::string expand_yt_condensed_playlist(const std::string& playlist) {
         pos = url_end + 1;
     }
     return out;
+}
+
+std::string rewrite_segments_to_local(HlsSession& session,
+                                      uint16_t local_port,
+                                      const std::string& expanded,
+                                      std::size_t& out_rewritten_count) {
+    out_rewritten_count = 0;
+    std::string out;
+    out.reserve(expanded.size());
+    std::size_t pos = 0;
+    while (pos < expanded.size()) {
+        const auto eol = expanded.find('\n', pos);
+        const auto line_end = (eol == std::string::npos) ? expanded.size() : eol;
+        const std::string line = expanded.substr(pos, line_end - pos);
+        pos = (eol == std::string::npos) ? expanded.size() : eol + 1;
+
+        // Blank / comment / header lines (HLS tags) — pass through
+        // verbatim. A URI line starts with a non-'#' non-whitespace.
+        const bool is_uri =
+            !line.empty() && line[0] != '#' &&
+            line[0] != ' ' && line[0] != '\t' && line[0] != '\r';
+        if (!is_uri) {
+            out.append(line);
+            if (eol != std::string::npos) out.push_back('\n');
+            continue;
+        }
+
+        // Strip \r on Windows line endings.
+        std::string url_line = line;
+        if (!url_line.empty() && url_line.back() == '\r') url_line.pop_back();
+
+        // Register a fresh local path and remember the real URL.
+        std::string local_path;
+        {
+            std::lock_guard<std::mutex> lock(session.seg_url_mtx);
+            local_path = "/seg/" + std::to_string(session.seg_url_counter++);
+            session.seg_url_map[local_path] = url_line;
+        }
+        out.append("http://localhost:");
+        out.append(std::to_string(local_port));
+        out.append(local_path);
+        if (eol != std::string::npos) out.push_back('\n');
+        ++out_rewritten_count;
+    }
+    return out;
+}
+
+std::string lookup_segment_url(const std::string& local_path) {
+    return HlsSessionRegistry::instance().resolve_segment_path(local_path);
 }
 
 std::vector<std::string> extract_media_uris(const std::string& master) {

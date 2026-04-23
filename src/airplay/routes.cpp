@@ -949,37 +949,57 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
         }
     } else if (url.size() >= 5 &&
                url.compare(url.size() - 5, 5, ".m3u8") == 0) {
-        // Media (child) playlist. Expand YouTube's "condensed" URL
-        // form so every segment URI in the stored body points
-        // directly at googlevideo.com over HTTPS — FFmpeg can then
-        // fetch segments itself without another FCUP round trip.
+        // Media (child) playlist. Two-pass:
+        //   1. Expand YouTube's "condensed" URL form (builds
+        //      googlevideo.com URLs from BASE-URI + PARAMS).
+        //   2. Rewrite every resulting segment URL to a local
+        //      "/seg/<n>" path on http://localhost:<port>/ so FFmpeg
+        //      fetches through us and we proxy via libavio. Required
+        //      because the CDN URLs bind the signature to the
+        //      iPhone's IP — the PC can't reach them directly.
         const std::string expanded = expand_yt_condensed_playlist(playlist);
+        std::size_t rewritten = 0;
+        const std::string localised = rewrite_segments_to_local(
+            *hls, ctx.hls_local_port, expanded, rewritten);
+
+        // Assert no googlevideo.com URL survived.
+        const auto gv_count = [](const std::string& s) {
+            std::size_t n = 0, p = 0;
+            while ((p = s.find("googlevideo.com", p)) != std::string::npos) {
+                ++n; p += 15;
+            }
+            return n;
+        };
+        const std::size_t after_gv = gv_count(localised);
+        if (after_gv != 0) {
+            LOG_WARN << "POST /action: " << after_gv
+                     << " googlevideo.com URL(s) still in media playlist "
+                     << "after rewrite — FFmpeg will bypass the proxy";
+        }
+
         if (hls->media_playlists.empty()) {
-            // Log the first media playlist's first segment (pre- and
-            // post-expansion) so we can verify the format. Slice a
-            // window around the first #EXTINF so both the header and
-            // the first chunk URI are visible.
             auto slice_around_first_chunk = [](const std::string& s) {
                 const auto p = s.find("#EXTINF");
                 if (p == std::string::npos) {
                     return s.substr(0, std::min<std::size_t>(600, s.size()));
                 }
-                const std::size_t start = p;
-                const std::size_t len   = std::min<std::size_t>(1200, s.size() - start);
-                return s.substr(start, len);
+                return s.substr(p, std::min<std::size_t>(1200, s.size() - p));
             };
-            LOG_INFO << "POST /action: first media playlist header:\n"
-                     << playlist.substr(0, std::min<std::size_t>(400, playlist.size()));
             LOG_INFO << "POST /action: first media playlist first chunk RAW:\n"
                      << slice_around_first_chunk(playlist);
             LOG_INFO << "POST /action: first media playlist first chunk EXPANDED:\n"
                      << slice_around_first_chunk(expanded);
+            LOG_INFO << "POST /action: first media playlist first chunk LOCALISED:\n"
+                     << slice_around_first_chunk(localised);
         }
-        hls->media_playlists[url] = expanded;
+        hls->media_playlists[url] = localised;
         LOG_INFO << "POST /action: media playlist stored "
                  << hls->media_playlists.size() << '/'
-                 << hls->media_uris.size() << " (" << playlist.size()
-                 << "B raw, " << expanded.size() << "B expanded)";
+                 << hls->media_uris.size() << " ("
+                 << playlist.size() << "B raw, "
+                 << localised.size() << "B localised, "
+                 << rewritten << " segs rewritten, "
+                 << after_gv << " googlevideo leaks)";
         HlsSessionRegistry::instance().notify_playlist_arrived(sid, url);
     } else if (!redirect_location.empty()) {
         // 302 to a signed CDN URL — forward to FFmpeg.

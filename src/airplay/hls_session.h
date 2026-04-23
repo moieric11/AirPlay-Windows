@@ -37,6 +37,15 @@ struct HlsSession {
     std::condition_variable                               seg_cv;
     std::unordered_map<std::string, std::string>          segment_data;       // raw bytes (empty string on 302)
     std::unordered_map<std::string, std::string>          segment_redirect;   // Location URL on 302
+
+    // Local /seg/<id> -> real CDN URL mapping. Populated when the
+    // expanded media playlist is rewritten so every segment URI
+    // points at http://localhost:7100/seg/<id>. HlsLocalServer
+    // reads this when the media player actually asks for a segment
+    // and proxies the HTTPS fetch from our side via libavio.
+    std::mutex                                            seg_url_mtx;
+    std::unordered_map<std::string, std::string>          seg_url_map;
+    uint64_t                                              seg_url_counter = 0;
 };
 
 class HlsSessionRegistry {
@@ -60,6 +69,11 @@ public:
     bool lookup_playlist(const std::string& url,
                          std::string& out_bytes,
                          bool& out_is_master) const;
+
+    // Resolve a local "/seg/<n>" path populated by
+    // rewrite_segments_to_local back to the CDN URL iOS gave us.
+    // Returns empty if the path isn't registered on any live session.
+    std::string resolve_segment_path(const std::string& local_path) const;
 
     // Fetch a segment (non-.m3u8) by sending a FCUP Request on the
     // reverse socket for the session that last saw a /play, then
@@ -110,6 +124,23 @@ private:
 // master playlist body. Returns the list of URIs in order, duplicates
 // removed.
 std::vector<std::string> extract_media_uris(const std::string& master);
+
+// Rewrite every segment URL in `expanded_playlist` to a local path
+// "/seg/<n>" where <n> is a fresh counter, and record the mapping
+// n -> original URL on `session`. Comments (#…) and blank lines are
+// preserved verbatim. HlsLocalServer uses the recorded URLs when
+// FFmpeg eventually fetches the local path.
+//
+// Counts how many URL lines were rewritten; the caller logs this
+// and can assert googlevideo URLs no longer appear in the output.
+std::string rewrite_segments_to_local(HlsSession& session,
+                                      uint16_t local_port,
+                                      const std::string& expanded,
+                                      std::size_t& out_rewritten_count);
+
+// Look up a local /seg/<id> path on any active HLS session; returns
+// the original CDN URL or empty string if not registered.
+std::string lookup_segment_url(const std::string& local_path);
 
 // Port of UxPlay's adjust_yt_condensed_playlist. YouTube-delivered
 // media playlists carry a "#YT-EXT-CONDENSED-URL" header with three

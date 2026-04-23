@@ -8,6 +8,11 @@
 #include <sstream>
 #include <string>
 
+extern "C" {
+#include <libavformat/avio.h>
+#include <libavutil/error.h>
+}
+
 namespace ap::airplay {
 
 bool HlsLocalServer::start(uint16_t port) {
@@ -131,6 +136,74 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
     // used so the registry lookup hits.
     const std::string mlhls_url = "mlhls://localhost/" +
         (path.empty() || path[0] != '/' ? path : path.substr(1));
+
+    // Route "/seg/<n>" to the CDN-URL proxy (see below). The rewritten
+    // media playlists we serve contain these local paths; FFmpeg
+    // fetches them and we resolve the id -> googlevideo.com URL, then
+    // stream the bytes back via libavio (HTTPS natively).
+    if (path.size() > 5 && path.compare(0, 5, "/seg/") == 0) {
+        const std::string cdn_url =
+            HlsSessionRegistry::instance().resolve_segment_path(path);
+        if (cdn_url.empty()) {
+            LOG_WARN << "HLS GET " << path << " -> 404 (seg id unknown)";
+            send_response(404, "Not Found", "", "text/plain");
+            ap::net::close_socket(client.fd);
+            return;
+        }
+        LOG_INFO << "HLS GET " << path << " -> proxy "
+                 << cdn_url.substr(0, std::min<std::size_t>(120, cdn_url.size()))
+                 << (cdn_url.size() > 120 ? "..." : "");
+
+        AVIOContext* avio = nullptr;
+        const int rc = avio_open(&avio, cdn_url.c_str(), AVIO_FLAG_READ);
+        if (rc < 0) {
+            char err[128]{};
+            av_strerror(rc, err, sizeof(err));
+            LOG_WARN << "seg proxy: avio_open failed: " << err;
+            send_response(502, "Bad Gateway", "", "text/plain");
+            ap::net::close_socket(client.fd);
+            return;
+        }
+        const int64_t size = avio_size(avio);
+        std::string hdr = "HTTP/1.1 200 OK\r\n"
+                          "Content-Type: application/octet-stream\r\n";
+        if (size > 0) {
+            hdr.append("Content-Length: ").append(std::to_string(size))
+               .append("\r\n");
+        } else {
+            hdr.append("Transfer-Encoding: chunked\r\n");
+        }
+        hdr.append("Connection: close\r\n\r\n");
+        ap::net::send_all(client.fd, hdr.data(), static_cast<int>(hdr.size()));
+
+        unsigned char buf[16 * 1024];
+        std::int64_t total = 0;
+        while (true) {
+            const int n = avio_read(avio, buf, sizeof(buf));
+            if (n <= 0) break;
+            total += n;
+            if (size > 0) {
+                if (ap::net::send_all(client.fd,
+                        reinterpret_cast<const char*>(buf), n) < 0) break;
+            } else {
+                char chunk_hdr[16];
+                const int hlen = std::snprintf(chunk_hdr, sizeof(chunk_hdr),
+                                               "%x\r\n", n);
+                ap::net::send_all(client.fd, chunk_hdr, hlen);
+                ap::net::send_all(client.fd,
+                    reinterpret_cast<const char*>(buf), n);
+                ap::net::send_all(client.fd, "\r\n", 2);
+            }
+        }
+        if (size <= 0) {
+            ap::net::send_all(client.fd, "0\r\n\r\n", 5);
+        }
+        avio_close(avio);
+        LOG_INFO << "HLS GET " << path << " proxy done ("
+                 << total << "B streamed)";
+        ap::net::close_socket(client.fd);
+        return;
+    }
 
     // Playlist vs segment: only .m3u8 paths come from the stored static
     // map. Everything else is a segment the player is pulling — those
