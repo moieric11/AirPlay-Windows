@@ -11,6 +11,9 @@
 #include "video/video_renderer.h"
 
 #include <openssl/evp.h>
+#if defined(HAVE_LIBPLIST)
+    #include <plist/plist.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -642,6 +645,118 @@ std::string snapshot_body(const std::vector<unsigned char>& body) {
     return os.str();
 }
 
+// POST /play: iOS asks the receiver to play a URL. This is the entry
+// point for AirPlay Streaming (YouTube, Photos slideshow, Netflix,
+// Apple TV+, ...). Body is either a binary plist (post-iOS 7) or the
+// legacy text/parameters format.
+//
+// Binary plist keys of interest (reference: Apple AirPlay Protocol
+// reverse-engineering notes + UxPlay's airplay_http_hls.c):
+//   Content-Location     string  — HLS manifest URL
+//   Start-Position       real    — fraction [0..1] of initial position
+//   X-Apple-Session-UUID string  — session identifier
+//   rate                 real    — 1.0 = play
+//   FairPlay / FPS blob  data    — only set for DRM-protected streams
+//                                   (Netflix, Apple TV+, iTunes rentals)
+//
+// If a FairPlay blob is present we bail: without a key-server MFi
+// certificate from Apple we can't decrypt the stream. YouTube and
+// Photos usually ship plain HLS that we can fetch directly.
+struct PlayRequest {
+    std::string url;
+    std::string session_uuid;
+    double      start_position = 0.0;
+    double      rate           = 1.0;
+    bool        has_fairplay   = false;
+};
+
+bool parse_play_body(const std::vector<uint8_t>& body, PlayRequest& out) {
+#if defined(HAVE_LIBPLIST)
+    if (body.size() >= 8 &&
+        std::memcmp(body.data(), "bplist00", 8) == 0) {
+        plist_t root = nullptr;
+        plist_from_bin(reinterpret_cast<const char*>(body.data()),
+                       static_cast<uint32_t>(body.size()), &root);
+        if (!root) return false;
+        auto get_string = [](plist_t p, const char* k) -> std::string {
+            plist_t n = plist_dict_get_item(p, k);
+            if (!n || plist_get_node_type(n) != PLIST_STRING) return {};
+            char* raw = nullptr; plist_get_string_val(n, &raw);
+            std::string s = raw ? raw : ""; std::free(raw); return s;
+        };
+        auto get_real = [](plist_t p, const char* k, double fallback) {
+            plist_t n = plist_dict_get_item(p, k);
+            if (!n) return fallback;
+            if (plist_get_node_type(n) == PLIST_REAL) {
+                double v = 0; plist_get_real_val(n, &v); return v;
+            }
+            if (plist_get_node_type(n) == PLIST_UINT) {
+                uint64_t v = 0; plist_get_uint_val(n, &v);
+                return static_cast<double>(v);
+            }
+            return fallback;
+        };
+        out.url            = get_string(root, "Content-Location");
+        out.session_uuid   = get_string(root, "X-Apple-Session-UUID");
+        out.start_position = get_real(root, "Start-Position", 0.0);
+        out.rate           = get_real(root, "rate", 1.0);
+        out.has_fairplay   = plist_dict_get_item(root, "fpsd") != nullptr
+                          || plist_dict_get_item(root, "fairplay-blob") != nullptr;
+        plist_free(root);
+        return !out.url.empty();
+    }
+#endif
+    // Legacy text/parameters (older iOS): "Content-Location: URL\r\n"
+    // followed by optional "Start-Position: 0.0\r\n".
+    const std::string text(reinterpret_cast<const char*>(body.data()),
+                           body.size());
+    auto extract = [&](const std::string& key) -> std::string {
+        const auto pos = text.find(key);
+        if (pos == std::string::npos) return {};
+        const auto start = pos + key.size();
+        const auto end   = text.find_first_of("\r\n", start);
+        std::string v = text.substr(start, end - start);
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(0, 1);
+        return v;
+    };
+    out.url = extract("Content-Location:");
+    try {
+        const auto sp = extract("Start-Position:");
+        if (!sp.empty()) out.start_position = std::stod(sp);
+    } catch (...) {}
+    return !out.url.empty();
+}
+
+Response handle_play(ClientSession& session, const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+
+    PlayRequest pr;
+    if (!parse_play_body(req.body, pr)) {
+        LOG_WARN << "POST /play: could not parse body ("
+                 << req.body.size() << "B)  " << snapshot_body(req.body);
+        return r;
+    }
+    LOG_INFO << "POST /play url=" << pr.url;
+    LOG_INFO << "         start=" << pr.start_position
+             << " rate=" << pr.rate
+             << " uuid=" << pr.session_uuid
+             << (pr.has_fairplay ? " [FAIRPLAY]" : "");
+
+    if (pr.has_fairplay) {
+        LOG_WARN << "POST /play: stream is FairPlay-protected "
+                    "(Netflix / Apple TV+). Cannot decrypt without an "
+                    "MFi key server certificate; playback skipped.";
+        return r;
+    }
+
+    // TODO next commit: hand pr.url to an HLSPlayer that opens the
+    // URL with libavformat, decodes video with libavcodec (already
+    // linked) and pushes decoded frames into session.renderer.
+    (void)session;
+    return r;
+}
+
 // Generic 200 OK stub that logs the body. Used for all the AirPlay
 // Streaming routes we haven't implemented yet (/play, /stop, /rate,
 // /scrub, /setProperty, /getProperty, /audioMode, /action, /command, …)
@@ -744,7 +859,7 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
         if (session.renderer) session.renderer->push_playback_rate(1.0f);
         return handle_stream_stub(req, "audioMode");
     }
-    if (req.method == "POST" && path == "/play")             return handle_stream_stub(req, "play");
+    if (req.method == "POST" && path == "/play")             return handle_play(session, req);
     if (req.method == "POST" && path == "/stop")             return handle_stream_stub(req, "stop");
     if (req.method == "POST" && path == "/scrub")            return handle_stream_stub(req, "scrub");
     if (req.method == "POST" && path == "/setProperty")      return handle_stream_stub(req, "setProperty");
