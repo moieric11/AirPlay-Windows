@@ -320,15 +320,19 @@ std::string expand_yt_condensed_playlist(const std::string& playlist) {
             }
         }
 
-        // Rebuild: BASE-URI + for each pair (token, field): "/" + token + "/" + field
-        // First field is empty (leading "/"); the loop produces:
-        //   BASE-URI /token0/ field1 /token1/ field2 ...
+        // Rebuild: BASE-URI + for each pair (param, field): "/" + param + "/" + field
+        // UxPlay's prefix typically ends with "/" so the condensed path
+        // starts with the first real field (not an empty segment from a
+        // leading "/"). Skip the leading empty field only when the
+        // condensed path actually begins with "/".
+        const std::size_t field_base = (!fields.empty() && fields[0].empty()) ? 1 : 0;
         out.append(base_uri);
         for (std::size_t i = 0; i < param_tokens.size(); ++i) {
             out.push_back('/');
             out.append(param_tokens[i]);
             out.push_back('/');
-            if (i + 1 < fields.size()) out.append(fields[i + 1]);
+            const std::size_t idx = field_base + i;
+            if (idx < fields.size()) out.append(fields[idx]);
         }
         out.push_back('\n');
         pos = url_end + 1;
