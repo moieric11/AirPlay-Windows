@@ -892,6 +892,20 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
         std::free(const_cast<char*>(data_ptr));
     }
 
+    // When FCUP_Response_Data is empty, iOS sometimes packs a 3xx
+    // redirect or an error code into the params dict. Log the whole
+    // structure as XML so we can see what fields iOS is using.
+    if (playlist.empty()) {
+        char*    xml = nullptr;
+        uint32_t xml_len = 0;
+        plist_to_xml(params, &xml, &xml_len);
+        if (xml) {
+            LOG_INFO << "POST /action empty data — params plist XML:\n"
+                     << std::string(xml, xml_len);
+            std::free(xml);
+        }
+    }
+
     LOG_INFO << "POST /action FCUP response url=" << url
              << "  playlist=" << playlist.size() << "B";
 
