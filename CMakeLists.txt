@@ -244,3 +244,18 @@ if(WIN32)
     # ws2_32: Winsock; iphlpapi: GetAdaptersAddresses; dnsapi: native mDNS.
     target_link_libraries(airplay-windows PRIVATE ws2_32 iphlpapi dnsapi)
 endif()
+
+# ---- Avahi (optional, Linux only — dev-mode mDNS) ----------------------------
+# Lets the receiver auto-appear on iOS when launched from a Linux host for
+# hacking / testing. Windows uses the native dnsapi above.
+if(NOT WIN32 AND PkgConfig_FOUND)
+    pkg_check_modules(AVAHI_CLIENT IMPORTED_TARGET avahi-client)
+    if(AVAHI_CLIENT_FOUND)
+        target_link_libraries(airplay-windows PRIVATE PkgConfig::AVAHI_CLIENT)
+        target_compile_definitions(airplay-windows PRIVATE HAVE_AVAHI=1)
+        message(STATUS "Avahi: linking via PkgConfig::AVAHI_CLIENT")
+    else()
+        message(STATUS "Avahi: not found — mDNS disabled on this Linux build "
+                       "(apt install libavahi-client-dev)")
+    endif()
+endif()

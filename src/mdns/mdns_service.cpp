@@ -1,8 +1,11 @@
 #include "mdns/mdns_service.h"
 #include "log.h"
 
+#include <atomic>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -178,12 +181,181 @@ struct MdnsService::Impl {
     }
 };
 
-#else // non-Windows: dev-only stub
+#elif defined(HAVE_AVAHI)
+
+#include <avahi-client/client.h>
+#include <avahi-client/publish.h>
+#include <avahi-common/error.h>
+#include <avahi-common/simple-watch.h>
+
+// Dev/hacking aid for running the receiver on Linux. Uses the native
+// avahi-client API + a dedicated poll thread so start() returns
+// immediately. Same _airplay._tcp and _raop._tcp TXT keys as the
+// Windows path, so iOS sees the device identically.
+struct MdnsService::Impl {
+    ~Impl() { stop(); }
+
+    AvahiSimplePoll*      poll   = nullptr;
+    AvahiClient*          client = nullptr;
+    AvahiEntryGroup*      group  = nullptr;
+    std::thread           thread;
+    std::atomic<bool>     running{false};
+
+    // Captured config for the client-state callback, which runs on the
+    // poll thread and only receives the Impl* via userdata.
+    ap::airplay::DeviceContext ctx;
+    uint16_t                   port = 0;
+
+    static AvahiStringList* txt_list(
+        const std::vector<std::pair<const char*, std::string>>& kv) {
+        AvahiStringList* list = nullptr;
+        for (auto& [k, v] : kv) {
+            list = avahi_string_list_add_pair(list, k, v.c_str());
+        }
+        return list;
+    }
+
+    static std::string pk_hex(const std::vector<unsigned char>& pk) {
+        static const char* hexd = "0123456789abcdef";
+        std::string out;
+        out.reserve(pk.size() * 2);
+        for (unsigned char b : pk) {
+            out.push_back(hexd[b >> 4]);
+            out.push_back(hexd[b & 0x0f]);
+        }
+        return out;
+    }
+
+    bool register_services() {
+        if (!client) return false;
+        if (group) avahi_entry_group_reset(group);
+        else       group = avahi_entry_group_new(client, nullptr, nullptr);
+        if (!group) {
+            LOG_ERROR << "avahi_entry_group_new failed: "
+                      << avahi_strerror(avahi_client_errno(client));
+            return false;
+        }
+
+        const std::string pk = pk_hex(ctx.public_key);
+
+        // _airplay._tcp — match the Windows TXT set byte-for-byte.
+        AvahiStringList* airplay_txt = txt_list({
+            {"deviceid", ctx.deviceid},
+            {"features", ctx.features},
+            {"flags",    std::string("0x4")},
+            {"model",    ctx.model},
+            {"pi",       ctx.pi},
+            {"pk",       pk},
+            {"pw",       std::string("false")},
+            {"srcvers",  ctx.srcvers},
+            {"vv",       std::string("2")},
+        });
+        int rc = avahi_entry_group_add_service_strlst(
+            group, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
+            AvahiPublishFlags(0),
+            ctx.name.c_str(), "_airplay._tcp",
+            nullptr, nullptr, port, airplay_txt);
+        avahi_string_list_free(airplay_txt);
+        if (rc < 0) {
+            LOG_ERROR << "Avahi add _airplay._tcp failed: "
+                      << avahi_strerror(rc);
+            return false;
+        }
+
+        // _raop._tcp instance name: "<12-hex-of-deviceid>@<DeviceName>".
+        std::string hex;
+        for (char c : ctx.deviceid) if (c != ':') hex.push_back(c);
+        const std::string raop_name = hex + "@" + ctx.name;
+        AvahiStringList* raop_txt = txt_list({
+            {"txtvers", std::string("1")},
+            {"ch",      std::string("2")},
+            {"cn",      std::string("0,1,2,3")},
+            {"da",      std::string("true")},
+            {"et",      std::string("0,3,5")},
+            {"ft",      ctx.features},
+            {"md",      std::string("0,1,2")},
+            {"am",      ctx.model},
+            {"rhd",     std::string("5.6.0.0")},
+            {"pk",      pk},
+            {"pw",      std::string("false")},
+            {"sf",      std::string("0x4")},
+            {"sr",      std::string("44100")},
+            {"ss",      std::string("16")},
+            {"sv",      std::string("false")},
+            {"tp",      std::string("UDP")},
+            {"vn",      std::string("65537")},
+            {"vs",      ctx.srcvers},
+            {"vv",      std::string("2")},
+        });
+        rc = avahi_entry_group_add_service_strlst(
+            group, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
+            AvahiPublishFlags(0),
+            raop_name.c_str(), "_raop._tcp",
+            nullptr, nullptr, port, raop_txt);
+        avahi_string_list_free(raop_txt);
+        if (rc < 0) {
+            LOG_WARN << "Avahi add _raop._tcp failed: " << avahi_strerror(rc);
+        }
+
+        rc = avahi_entry_group_commit(group);
+        if (rc < 0) {
+            LOG_ERROR << "avahi_entry_group_commit failed: "
+                      << avahi_strerror(rc);
+            return false;
+        }
+        LOG_INFO << "Avahi registered: " << ctx.name
+                 << "._airplay._tcp.local and _raop._tcp.local on port " << port;
+        return true;
+    }
+
+    static void client_cb(AvahiClient* c, AvahiClientState state, void* ud) {
+        auto* self = static_cast<Impl*>(ud);
+        self->client = c;
+        if (state == AVAHI_CLIENT_S_RUNNING) {
+            self->register_services();
+        } else if (state == AVAHI_CLIENT_FAILURE) {
+            LOG_ERROR << "Avahi client failure: "
+                      << avahi_strerror(avahi_client_errno(c));
+        }
+    }
+
+    bool start(const ap::airplay::DeviceContext& ctx_in, uint16_t port_in) {
+        ctx  = ctx_in;
+        port = port_in;
+        poll = avahi_simple_poll_new();
+        if (!poll) { LOG_ERROR << "avahi_simple_poll_new failed"; return false; }
+        int err = 0;
+        client = avahi_client_new(avahi_simple_poll_get(poll),
+                                  AvahiClientFlags(0),
+                                  &Impl::client_cb, this, &err);
+        if (!client) {
+            LOG_ERROR << "avahi_client_new failed: " << avahi_strerror(err);
+            avahi_simple_poll_free(poll); poll = nullptr;
+            return false;
+        }
+        running = true;
+        thread = std::thread([this]() {
+            avahi_simple_poll_loop(poll);
+        });
+        return true;
+    }
+
+    void stop() {
+        if (!running.exchange(false)) return;
+        if (poll)   avahi_simple_poll_quit(poll);
+        if (thread.joinable()) thread.join();
+        if (client) avahi_client_free(client);
+        if (poll)   avahi_simple_poll_free(poll);
+        client = nullptr; poll = nullptr; group = nullptr;
+    }
+};
+
+#else // non-Windows without Avahi: stub
 
 struct MdnsService::Impl {
     bool start(const ap::airplay::DeviceContext&, uint16_t) {
-        LOG_WARN << "mDNS advertising is Windows-only in this build "
-                    "(Linux targets are dev-only, no Avahi integration)";
+        LOG_WARN << "mDNS advertising unavailable in this build "
+                    "(install libavahi-client-dev + reconfigure to enable on Linux)";
         return false;
     }
     void stop() {}
