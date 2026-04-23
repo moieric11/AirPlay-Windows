@@ -2,11 +2,12 @@
 
 #include "airplay/rtsp_parser.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace ap::crypto { class Identity; }
-namespace ap::video  { class VideoRenderer; }
+namespace ap::video  { class VideoRenderer; class HlsPlayer; }
 
 namespace ap::airplay {
 
@@ -32,6 +33,16 @@ struct DeviceContext {
     // Non-owning pointer to the shared renderer. Handed down to each
     // StreamSession so mirror frames can be drawn. May be null (headless).
     ap::video::VideoRenderer*   renderer = nullptr;
+
+    // Non-owning pointer to the global HLS media player. Started by
+    // handle_action once every media playlist referenced by the master
+    // has been fetched, stopped by handle_teardown / clear_session.
+    ap::video::HlsPlayer*       hls_player = nullptr;
+
+    // Port of the local HLS HTTP server (started in main()). The HLS
+    // player opens http://localhost:<port>/master.m3u8 to fetch from
+    // our own server which is proxying iOS via FCUP.
+    uint16_t                    hls_local_port = 7100;
 };
 
 struct ClientSession;

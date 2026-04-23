@@ -9,6 +9,7 @@
 
 #include "airplay/hls_local_server.h"
 #include "airplay/server.h"
+#include "video/hls_player.h"
 #include "crypto/identity.h"
 #include "log.h"
 #include "mdns/mdns_service.h"
@@ -95,6 +96,9 @@ int main() {
     }
     ctx.renderer = &renderer;
 
+    ap::video::HlsPlayer hls_player;
+    ctx.hls_player = &hls_player;
+
     ap::airplay::Server server;
     if (!server.start(ctx, 7000)) {
         LOG_ERROR << "Failed to start AirPlay server";
@@ -112,6 +116,7 @@ int main() {
         LOG_WARN << "HLS local server could not bind 7100 — YouTube "
                     "AirPlay Streaming playback will not work";
     }
+    ctx.hls_local_port = hls_server.port();
 
     ap::mdns::MdnsService mdns;
     if (!mdns.start(ctx, server.port())) {
@@ -125,6 +130,7 @@ int main() {
 
     LOG_INFO << "Shutting down...";
     mdns.stop();
+    hls_player.stop();
     hls_server.stop();
     server.stop();
     renderer.stop();

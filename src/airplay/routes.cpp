@@ -11,6 +11,7 @@
 #include "crypto/fairplay.h"
 #include "crypto/pair_verify.h"
 #include "log.h"
+#include "video/hls_player.h"
 #include "video/video_renderer.h"
 
 #include <openssl/evp.h>
@@ -387,7 +388,7 @@ Response handle_record(ClientSession& session, const Request& req) {
 // stream (type 96 audio or 110 mirror) by sending a plist body
 // `{streams: [{type: N}]}`, or the whole session by sending an empty body.
 // In both cases UxPlay adds `Connection: close` to the response.
-Response handle_teardown(ClientSession& session, const Request& req) {
+Response handle_teardown(const DeviceContext& ctx, ClientSession& session, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
     r.set_header("Connection", "close");
@@ -418,6 +419,9 @@ Response handle_teardown(ClientSession& session, const Request& req) {
         // last track's cover, metadata and progress.
         if (session.renderer) session.renderer->clear_session();
     }
+    // Also stop any HLS player started by AirPlay Streaming so the
+    // player thread doesn't keep fetching stale segments.
+    if (ctx.hls_player) ctx.hls_player->stop();
     return r;
 }
 
@@ -828,7 +832,7 @@ Response handle_play(ClientSession& session, const Request& req) {
 // has type=="unhandledURLResponse" with a `params` dict containing
 // FCUP_Response_URL + FCUP_Response_Data (HLS playlist bytes).
 // Ported from UxPlay's http_handler_action (lib/http_handlers.h).
-Response handle_action(ClientSession& session, const Request& req) {
+Response handle_action(const DeviceContext& ctx, ClientSession& session, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
     const std::string sid = req.header("x-apple-session-id");
@@ -929,6 +933,22 @@ Response handle_action(ClientSession& session, const Request& req) {
         LOG_INFO << "POST /action: media playlist stored "
                  << hls->media_playlists.size() << '/'
                  << hls->media_uris.size() << " (" << playlist.size() << "B)";
+        // Once every media playlist referenced by the master has been
+        // delivered, kick the local media player at the rewritten
+        // master URL. Subsequent segment fetches go through the local
+        // HTTP server which FCUPs them on demand.
+        if (ctx.hls_player &&
+            hls->media_playlists.size() == hls->media_uris.size() &&
+            !hls->media_uris.empty()) {
+            const std::string local_master =
+                "http://localhost:" + std::to_string(ctx.hls_local_port) +
+                "/master.m3u8";
+            LOG_INFO << "POST /action: all " << hls->media_uris.size()
+                     << " media playlists in — starting HlsPlayer on "
+                     << local_master;
+            ctx.hls_player->stop();   // idempotent; clear any prior video
+            ctx.hls_player->start(local_master, ctx.renderer);
+        }
     } else {
         // A segment: hand the bytes to any HlsLocalServer thread
         // blocking in fetch_segment().
@@ -1038,7 +1058,7 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "ANNOUNCE")    return handle_announce(session, req);
     if (req.method == "SETUP")       return handle_setup   (session, req);
     if (req.method == "RECORD")      return handle_record  (session, req);
-    if (req.method == "TEARDOWN")    return handle_teardown(session, req);
+    if (req.method == "TEARDOWN")    return handle_teardown(ctx, session, req);
     if (req.method == "GET_PARAMETER")  return handle_get_parameter(req);
     if (req.method == "SET_PARAMETER")  return handle_set_parameter(session, req);
 
@@ -1091,7 +1111,7 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
         return handle_stream_stub(req, "audioMode");
     }
     if (req.method == "POST" && path == "/play")             return handle_play(session, req);
-    if (req.method == "POST" && path == "/action")           return handle_action(session, req);
+    if (req.method == "POST" && path == "/action")           return handle_action(ctx, session, req);
     if (req.method == "POST" && path == "/stop")             return handle_stream_stub(req, "stop");
     if (req.method == "POST" && path == "/scrub")            return handle_stream_stub(req, "scrub");
     if (req.method == "POST" && path == "/setProperty")      return handle_stream_stub(req, "setProperty");

@@ -64,10 +64,12 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 set(FFMPEG_TARGETS "")
 if(PkgConfig_FOUND)
     pkg_check_modules(AVCODEC  IMPORTED_TARGET libavcodec)
+    pkg_check_modules(AVFORMAT IMPORTED_TARGET libavformat)
     pkg_check_modules(AVUTIL   IMPORTED_TARGET libavutil)
     pkg_check_modules(SWSCALE  IMPORTED_TARGET libswscale)
-    if(AVCODEC_FOUND AND AVUTIL_FOUND AND SWSCALE_FOUND)
-        set(FFMPEG_TARGETS PkgConfig::AVCODEC PkgConfig::AVUTIL PkgConfig::SWSCALE)
+    if(AVCODEC_FOUND AND AVFORMAT_FOUND AND AVUTIL_FOUND AND SWSCALE_FOUND)
+        set(FFMPEG_TARGETS PkgConfig::AVCODEC PkgConfig::AVFORMAT
+                           PkgConfig::AVUTIL PkgConfig::SWSCALE)
     endif()
 endif()
 if(NOT FFMPEG_TARGETS)
@@ -163,6 +165,7 @@ add_executable(airplay-windows
     src/airplay/reverse_channel.cpp
     src/airplay/routes.cpp
     src/video/h264_decoder.cpp
+    src/video/hls_player.cpp
     src/video/video_renderer.cpp
     src/audio/audio_receiver.cpp
     src/audio/aac_decoder.cpp
