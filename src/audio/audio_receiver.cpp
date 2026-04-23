@@ -186,12 +186,23 @@ void AudioReceiver::thread_fn() {
         }
         if (n < 12) continue;   // RTP header minimum
 
-        last_packet = std::chrono::steady_clock::now();
-        // Suppress rate=1 during the post-FLUSH grace window: iOS keeps
-        // dribbling packets for ~200 ms after a real pause FLUSH to drain
-        // its buffer, and those packets used to un-pause us immediately.
-        if (cfg_.renderer && !cfg_.renderer->in_flush_grace()) {
-            cfg_.renderer->push_playback_rate(1.0f);
+        // Only count substantial packets (real audio) as proof of
+        // active playback. During pause iOS keeps dribbling small
+        // keepalive / silence-frame packets (observed around 32 B
+        // payload) at the normal packet rate — they used to keep
+        // resetting the silence watchdog and flipping rate back to 1.
+        // Real AAC-ELD / ALAC audio frames are 400+ bytes once any
+        // musical content is present, so a 100-byte threshold separates
+        // the two cleanly.
+        constexpr int kAudioPacketMinBytes = 100;
+        if (n >= kAudioPacketMinBytes) {
+            last_packet = std::chrono::steady_clock::now();
+            // Suppress rate=1 during the post-FLUSH grace window: iOS
+            // still drains its buffer with real audio for a few hundred
+            // ms after a real pause FLUSH.
+            if (cfg_.renderer && !cfg_.renderer->in_flush_grace()) {
+                cfg_.renderer->push_playback_rate(1.0f);
+            }
         }
 
         // Parse RTP header (RFC 3550, 12-byte fixed part).
