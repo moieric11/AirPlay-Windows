@@ -4,6 +4,8 @@
 #include "log.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 
@@ -305,9 +307,7 @@ std::string expand_yt_condensed_playlist(const std::string& playlist) {
 
         // Split condensed on '/' and drop empty tokens — robust to
         // prefixes that do or do not end with '/' (iOS builds vary).
-        // After filtering, `values` holds exactly one entry per
-        // PARAMS token, in order.
-        std::vector<std::string> values;
+        std::vector<std::string> parts;
         {
             std::size_t p = 0;
             while (p < condensed.size()) {
@@ -315,22 +315,87 @@ std::string expand_yt_condensed_playlist(const std::string& playlist) {
                 const auto end =
                     (slash == std::string::npos) ? condensed.size() : slash;
                 if (end > p) {
-                    values.push_back(condensed.substr(p, end - p));
+                    parts.push_back(condensed.substr(p, end - p));
                 }
                 if (slash == std::string::npos) break;
                 p = slash + 1;
             }
         }
 
-        // Rebuild: BASE-URI/param0/val0/param1/val1/.../paramN/valN.
-        // BASE-URI ends with ".m3u8" (no trailing slash), so a single
-        // "/" between it and the first param avoids a "//" artifact.
+        // Detect which shape iOS used:
+        //   Model A (UxPlay / older iOS): condensed = "val0/val1/…/valN"
+        //     — pure values. We interleave the PARAMS keys between them.
+        //   Model B (newer iOS, seen on iOS 18): condensed already is
+        //     "path0/path1/key0/val0/key1/val1/…" — path prefix plus
+        //     in-line key/value pairs, possibly ending with a bare key
+        //     (observed trailing "…/gosq/" with no value).
+        // Discriminator: look for PARAMS[0] (e.g. "begin") anywhere in
+        // the tokens. Any earlier tokens are path-prefix and stay.
+        const std::string& first_key = param_tokens.front();
+        const auto kv_it = std::find(parts.begin(), parts.end(), first_key);
+        const bool model_b = (kv_it != parts.end());
+
+        // BASE-URI ends with ".m3u8" (no trailing slash) so a single
+        // '/' before whatever follows avoids a "//" artifact.
         out.append(base_uri);
-        for (std::size_t i = 0; i < param_tokens.size(); ++i) {
-            out.push_back('/');
-            out.append(param_tokens[i]);
-            out.push_back('/');
-            if (i < values.size()) out.append(values[i]);
+        if (model_b) {
+            // Model B: path_prefix + kv pairs, possibly with a bare
+            // terminal key (iOS 18 ends chunks with ".../gosq/" — the
+            // segment number is encoded into the trailing slash).
+            //
+            // Emit every token verbatim; preserve a trailing "/" from
+            // the source so the CDN sees the exact URL iOS intended.
+            // Only warn when an odd kv tail ends in a token we don't
+            // recognise as a legitimate bare-terminal key — everything
+            // else (even-length kv lists, or odd lists ending in an
+            // allowed terminal) is emitted silently.
+            static const std::array<const char*, 1> kBareTerminalKeys{"gosq"};
+            const std::size_t kv_len = std::distance(kv_it, parts.end());
+            if ((kv_len & 1U) != 0U) {
+                const std::string& last = parts.back();
+                const bool allowed = std::any_of(
+                    kBareTerminalKeys.begin(), kBareTerminalKeys.end(),
+                    [&](const char* k) { return last == k; });
+                if (!allowed) {
+                    LOG_WARN << "expand_yt_condensed_playlist: unexpected "
+                                "odd kv tail in condensed \"" << condensed
+                             << "\" — emitting verbatim";
+                }
+            }
+            for (const auto& token : parts) {
+                out.push_back('/');
+                out.append(token);
+            }
+            // Preserve a trailing "/" from the condensed source (a bare
+            // terminal key like "/gosq/"), but don't double it up — in
+            // Model A the loop above already emits a "/" after every
+            // key regardless of whether the value exists, so the
+            // output may already end with "/".
+            if (!condensed.empty() && condensed.back() == '/' &&
+                (out.empty() || out.back() != '/')) {
+                out.push_back('/');
+            }
+        } else {
+            // Model A: emit "/param/val" for each param_tokens slot.
+            // If iOS under-delivered values (fewer than param_tokens),
+            // the tail emits empty values — combined with the trailing
+            // "/" preservation below this keeps a "…/gosq/" shape
+            // byte-identical to Model B.
+            for (std::size_t i = 0; i < param_tokens.size(); ++i) {
+                out.push_back('/');
+                out.append(param_tokens[i]);
+                out.push_back('/');
+                if (i < parts.size()) out.append(parts[i]);
+            }
+            // Preserve a trailing "/" from the condensed source (a bare
+            // terminal key like "/gosq/"), but don't double it up — in
+            // Model A the loop above already emits a "/" after every
+            // key regardless of whether the value exists, so the
+            // output may already end with "/".
+            if (!condensed.empty() && condensed.back() == '/' &&
+                (out.empty() || out.back() != '/')) {
+                out.push_back('/');
+            }
         }
         out.push_back('\n');
         pos = url_end + 1;
