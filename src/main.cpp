@@ -85,7 +85,8 @@ int main() {
     LOG_INFO << "=== AirPlay-Windows skeleton ===";
     LOG_INFO << "name="     << ctx.name;
     LOG_INFO << "deviceid=" << ctx.deviceid;
-    LOG_INFO << "ip="       << ap::net::primary_ipv4();
+    const std::string local_ip = ap::net::primary_ipv4();
+    LOG_INFO << "ip="       << local_ip;
     LOG_INFO << "pk(Ed25519)=" << ctx.public_key.size() << " bytes";
 
     // Start the SDL2 renderer window upfront. Streams will push decoded
@@ -94,6 +95,7 @@ int main() {
     if (!renderer.start("AirPlay-Windows")) {
         LOG_WARN << "VideoRenderer could not start — running headless";
     }
+    renderer.set_idle_info(ctx.name, local_ip);
     ctx.renderer = &renderer;
 
     ap::video::HlsPlayer hls_player;

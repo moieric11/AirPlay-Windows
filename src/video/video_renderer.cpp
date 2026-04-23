@@ -318,6 +318,15 @@ void VideoRenderer::clear_session() {
     cv_.notify_one();
 }
 
+void VideoRenderer::set_idle_info(const std::string& name,
+                                  const std::string& ip) {
+    std::lock_guard<std::mutex> lock(meta_mtx_);
+    idle_name_  = name;
+    idle_ip_    = ip;
+    idle_dirty_ = true;
+    cv_.notify_one();
+}
+
 void VideoRenderer::push_metadata(const std::string& title,
                                   const std::string& artist,
                                   const std::string& album) {
@@ -392,10 +401,13 @@ void VideoRenderer::run(const std::string& title) {
     } else {
         LOG_WARN << "TTF_Init failed: " << TTF_GetError();
     }
-    SDL_Texture* title_tex    = nullptr; int title_w    = 0, title_h    = 0;
-    SDL_Texture* artist_tex   = nullptr; int artist_w   = 0, artist_h   = 0;
-    SDL_Texture* album_tex    = nullptr; int album_w    = 0, album_h    = 0;
-    SDL_Texture* progress_tex = nullptr; int progress_w = 0, progress_h = 0;
+    SDL_Texture* title_tex     = nullptr; int title_w     = 0, title_h     = 0;
+    SDL_Texture* artist_tex    = nullptr; int artist_w    = 0, artist_h    = 0;
+    SDL_Texture* album_tex     = nullptr; int album_w     = 0, album_h     = 0;
+    SDL_Texture* progress_tex  = nullptr; int progress_w  = 0, progress_h  = 0;
+    SDL_Texture* idle_name_tex = nullptr; int idle_name_w = 0, idle_name_h = 0;
+    SDL_Texture* idle_ip_tex   = nullptr; int idle_ip_w   = 0, idle_ip_h   = 0;
+    SDL_Texture* idle_msg_tex  = nullptr; int idle_msg_w  = 0, idle_msg_h  = 0;
     std::string  last_progress_text;
 
     auto make_text = [&](const std::vector<TTF_Font*>& fonts,
@@ -419,6 +431,14 @@ void VideoRenderer::run(const std::string& title) {
     auto last_video_frame_time = std::chrono::steady_clock::now()
                                  - std::chrono::seconds(10);
 
+    bool fullscreen = false;
+    auto toggle_fullscreen = [&]() {
+        fullscreen = !fullscreen;
+        SDL_SetWindowFullscreen(window,
+            fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+        SDL_ShowCursor(fullscreen ? SDL_DISABLE : SDL_ENABLE);
+    };
+
     while (running_.load()) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -426,6 +446,24 @@ void VideoRenderer::run(const std::string& title) {
                 closed_  = true;
                 running_ = false;
                 break;
+            }
+            if (e.type == SDL_KEYDOWN) {
+                switch (e.key.keysym.sym) {
+                    case SDLK_ESCAPE:
+                        if (fullscreen) toggle_fullscreen();
+                        else { closed_ = true; running_ = false; }
+                        break;
+                    case SDLK_f:
+                    case SDLK_F11:
+                        toggle_fullscreen();
+                        break;
+                    default: break;
+                }
+            }
+            if (e.type == SDL_MOUSEBUTTONDOWN &&
+                e.button.button == SDL_BUTTON_LEFT &&
+                e.button.clicks == 2) {
+                toggle_fullscreen();
             }
         }
         if (!running_.load()) break;
@@ -486,9 +524,10 @@ void VideoRenderer::run(const std::string& title) {
                 cover_dirty_ = false;
             }
         }
-        // --- Consume pending metadata --------------------------------
-        std::string t_title, t_artist, t_album;
+        // --- Consume pending metadata + idle info --------------------
+        std::string t_title, t_artist, t_album, t_idle_name, t_idle_ip;
         bool meta_changed = false;
+        bool idle_changed = false;
         {
             std::lock_guard<std::mutex> lock(meta_mtx_);
             if (meta_dirty_) {
@@ -498,6 +537,23 @@ void VideoRenderer::run(const std::string& title) {
                 meta_dirty_  = false;
                 meta_changed = true;
             }
+            if (idle_dirty_) {
+                t_idle_name  = idle_name_;
+                t_idle_ip    = idle_ip_;
+                idle_dirty_  = false;
+                idle_changed = true;
+            }
+        }
+        if (idle_changed) {
+            make_text(fonts_big,   t_idle_name,
+                      SDL_Color{255, 255, 255, 255},
+                      idle_name_tex, idle_name_w, idle_name_h);
+            make_text(fonts_small, t_idle_ip,
+                      SDL_Color{180, 180, 180, 255},
+                      idle_ip_tex,   idle_ip_w,   idle_ip_h);
+            make_text(fonts_small, "En attente d'AirPlay",
+                      SDL_Color{150, 150, 150, 255},
+                      idle_msg_tex,  idle_msg_w,  idle_msg_h);
         }
         if (meta_changed) {
             make_text(fonts_big,   t_title,  SDL_Color{255, 255, 255, 255},
@@ -639,16 +695,33 @@ void VideoRenderer::run(const std::string& title) {
                 SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255);
                 SDL_RenderFillRect(renderer, &fg);
             }
+        } else {
+            // Idle: no mirror frame, no cover — show device info.
+            auto draw_centered = [&](SDL_Texture* tex, int tw, int th, int y) {
+                if (!tex) return;
+                SDL_Rect r{(win_w - tw) / 2, y, tw, th};
+                SDL_RenderCopy(renderer, tex, nullptr, &r);
+            };
+            const int total_h = idle_name_h + idle_ip_h + idle_msg_h + 24;
+            int y_cursor = (win_h - total_h) / 2;
+            draw_centered(idle_name_tex, idle_name_w, idle_name_h, y_cursor);
+            y_cursor += idle_name_h + 12;
+            draw_centered(idle_ip_tex,   idle_ip_w,   idle_ip_h,   y_cursor);
+            y_cursor += idle_ip_h + 12;
+            draw_centered(idle_msg_tex,  idle_msg_w,  idle_msg_h,  y_cursor);
         }
         SDL_RenderPresent(renderer);
     }
 
-    if (title_tex)    SDL_DestroyTexture(title_tex);
-    if (artist_tex)   SDL_DestroyTexture(artist_tex);
-    if (album_tex)    SDL_DestroyTexture(album_tex);
-    if (progress_tex) SDL_DestroyTexture(progress_tex);
-    if (video_tex)  SDL_DestroyTexture(video_tex);
-    if (cover_tex)  SDL_DestroyTexture(cover_tex);
+    if (title_tex)     SDL_DestroyTexture(title_tex);
+    if (artist_tex)    SDL_DestroyTexture(artist_tex);
+    if (album_tex)     SDL_DestroyTexture(album_tex);
+    if (progress_tex)  SDL_DestroyTexture(progress_tex);
+    if (idle_name_tex) SDL_DestroyTexture(idle_name_tex);
+    if (idle_ip_tex)   SDL_DestroyTexture(idle_ip_tex);
+    if (idle_msg_tex)  SDL_DestroyTexture(idle_msg_tex);
+    if (video_tex)     SDL_DestroyTexture(video_tex);
+    if (cover_tex)     SDL_DestroyTexture(cover_tex);
     for (TTF_Font* f : fonts_big)   if (f) TTF_CloseFont(f);
     for (TTF_Font* f : fonts_small) if (f) TTF_CloseFont(f);
     TTF_Quit();

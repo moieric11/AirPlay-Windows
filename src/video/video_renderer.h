@@ -81,6 +81,11 @@ public:
     void note_flush();
     bool in_flush_grace() const;
 
+    // Set the idle-screen text (receiver name + IP). Displayed when
+    // no mirror frame is live and no cover art is shown, i.e. when no
+    // iPhone is currently streaming. Thread-safe. Call once at startup.
+    void set_idle_info(const std::string& name, const std::string& ip);
+
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
     bool user_closed() const { return closed_.load(); }
@@ -113,6 +118,14 @@ private:
     std::string                meta_artist_;
     std::string                meta_album_;
     bool                       meta_dirty_{false};
+
+    // Idle screen: "<name>\n<ip>\nEn attente d'AirPlay" rendered when
+    // there's nothing else to show. Set once at startup so we can
+    // read without a mutex hop in the render loop; protected by
+    // meta_mtx_ for the rare reconfigure.
+    std::string                idle_name_;
+    std::string                idle_ip_;
+    bool                       idle_dirty_{true};
 
     // Progress is polled by the render thread every frame; atomics are
     // sufficient (the two are read independently but both change together
