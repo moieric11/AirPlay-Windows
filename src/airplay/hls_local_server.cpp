@@ -168,11 +168,29 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
         return;
     }
 
-    // Segment: FCUP to iOS and wait for POST /action to fill in data.
+    // Segment: FCUP to iOS and wait for POST /action to return either
+    // the bytes inline (rare) or a 302 Location URL to the CDN (the
+    // common YouTube path). If redirect, forward the 302 to FFmpeg
+    // which follows it over HTTPS straight to googlevideo.com.
     std::string seg;
-    if (!HlsSessionRegistry::instance().fetch_segment(mlhls_url, seg)) {
+    std::string redirect;
+    if (!HlsSessionRegistry::instance().fetch_segment(mlhls_url, seg, redirect)) {
         LOG_WARN << "HLS GET " << path << " -> 504 (segment fetch failed)";
         send_response(504, "Gateway Timeout", "", "text/plain");
+        ap::net::close_socket(client.fd);
+        return;
+    }
+    if (!redirect.empty()) {
+        LOG_INFO << "HLS GET " << path << " (segment) -> 302 ("
+                 << redirect.size() << "B Location)";
+        // Inline 302 + Location + empty body.
+        std::string wire;
+        wire.append("HTTP/1.1 302 Found\r\n");
+        wire.append("Location: ").append(redirect).append("\r\n");
+        wire.append("Content-Length: 0\r\n");
+        wire.append("Connection: close\r\n\r\n");
+        ap::net::send_all(client.fd, wire.data(),
+                          static_cast<int>(wire.size()));
         ap::net::close_socket(client.fd);
         return;
     }

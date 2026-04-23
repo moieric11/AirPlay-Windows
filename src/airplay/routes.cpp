@@ -892,17 +892,23 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
         std::free(const_cast<char*>(data_ptr));
     }
 
-    // When FCUP_Response_Data is empty, iOS sometimes packs a 3xx
-    // redirect or an error code into the params dict. Log the whole
-    // structure as XML so we can see what fields iOS is using.
-    if (playlist.empty()) {
-        char*    xml = nullptr;
-        uint32_t xml_len = 0;
-        plist_to_xml(params, &xml, &xml_len);
-        if (xml) {
-            LOG_INFO << "POST /action empty data — params plist XML:\n"
-                     << std::string(xml, xml_len);
-            std::free(xml);
+    // Inspect FCUP_Response_StatusCode: segments on YouTube come back
+    // as 302 redirects to a signed googlevideo.com URL. When data is
+    // empty and we see a 302, extract the Location header and route
+    // through segment_redirect so the local HLS server can 302 the
+    // player down to the CDN directly.
+    std::string redirect_location;
+    {
+        plist_t sc_node = plist_dict_get_item(params, "FCUP_Response_StatusCode");
+        uint64_t status = 0;
+        if (sc_node && plist_get_node_type(sc_node) == PLIST_UINT) {
+            plist_get_uint_val(sc_node, &status);
+        }
+        if (status == 302) {
+            plist_t hdrs = plist_dict_get_item(params, "FCUP_Response_Headers");
+            if (hdrs && plist_get_node_type(hdrs) == PLIST_DICT) {
+                get_string_of(hdrs, "Location", redirect_location);
+            }
         }
     }
 
@@ -951,9 +957,15 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
                  << hls->media_playlists.size() << '/'
                  << hls->media_uris.size() << " (" << playlist.size() << "B)";
         HlsSessionRegistry::instance().notify_playlist_arrived(sid, url);
+    } else if (!redirect_location.empty()) {
+        // 302 to a signed CDN URL — forward to FFmpeg.
+        LOG_INFO << "POST /action: segment " << url
+                 << " — 302 redirect (Location=" << redirect_location.size()
+                 << "B)";
+        HlsSessionRegistry::instance().deliver_segment_redirect(
+            sid, url, std::move(redirect_location));
     } else {
-        // A segment: hand the bytes to any HlsLocalServer thread
-        // blocking in fetch_segment().
+        // Fallback: iOS actually shipped bytes inline.
         LOG_INFO << "POST /action: segment " << url
                  << " (" << playlist.size() << "B) — deliver";
         HlsSessionRegistry::instance().deliver_segment(sid, url, playlist);

@@ -58,6 +58,7 @@ bool HlsSessionRegistry::lookup_playlist(const std::string& url,
 
 bool HlsSessionRegistry::fetch_segment(const std::string& url,
                                        std::string& out_bytes,
+                                       std::string& out_redirect,
                                        int timeout_ms) {
     // Pick the most recently created session with a reverse socket and
     // send FCUP on it. The caller is the local HTTP server which has no
@@ -89,8 +90,14 @@ bool HlsSessionRegistry::fetch_segment(const std::string& url,
     // Was it already delivered (iOS sometimes races a prior FCUP)?
     {
         std::lock_guard<std::mutex> lock(s->seg_mtx);
-        const auto it = s->segment_data.find(url);
-        if (it != s->segment_data.end()) {
+        if (auto it = s->segment_redirect.find(url);
+            it != s->segment_redirect.end()) {
+            out_redirect = std::move(it->second);
+            s->segment_redirect.erase(it);
+            return true;
+        }
+        if (auto it = s->segment_data.find(url);
+            it != s->segment_data.end()) {
             out_bytes = std::move(it->second);
             s->segment_data.erase(it);
             return true;
@@ -105,15 +112,34 @@ bool HlsSessionRegistry::fetch_segment(const std::string& url,
     std::unique_lock<std::mutex> lock(s->seg_mtx);
     const bool arrived = s->seg_cv.wait_for(lock,
         std::chrono::milliseconds(timeout_ms),
-        [&] { return s->segment_data.count(url) != 0; });
+        [&] { return s->segment_data.count(url)     != 0 ||
+                     s->segment_redirect.count(url) != 0; });
     if (!arrived) {
         LOG_WARN << "fetch_segment: timeout after " << timeout_ms
                  << "ms for " << url;
         return false;
     }
-    out_bytes = std::move(s->segment_data[url]);
-    s->segment_data.erase(url);
+    if (auto it = s->segment_redirect.find(url);
+        it != s->segment_redirect.end()) {
+        out_redirect = std::move(it->second);
+        s->segment_redirect.erase(it);
+    } else {
+        out_bytes = std::move(s->segment_data[url]);
+        s->segment_data.erase(url);
+    }
     return true;
+}
+
+void HlsSessionRegistry::deliver_segment_redirect(const std::string& session_id,
+                                                  const std::string& url,
+                                                  std::string redirect) {
+    HlsSession* s = find(session_id);
+    if (!s) return;
+    {
+        std::lock_guard<std::mutex> lock(s->seg_mtx);
+        s->segment_redirect[url] = std::move(redirect);
+    }
+    s->seg_cv.notify_all();
 }
 
 void HlsSessionRegistry::deliver_segment(const std::string& session_id,

@@ -28,10 +28,15 @@ struct HlsSession {
     // Segment data coordination: the local HTTP server, on a
     // non-.m3u8 GET, sends a FCUP Request for the segment's mlhls://
     // URL then waits here for handle_action to arrive on another
-    // thread and fill in the bytes.
+    // thread and fill in either the bytes (rare) or a 302 redirect
+    // Location URL (the common YouTube case — iOS mints a signed
+    // googlevideo.com URL and expects us to follow). The local
+    // server forwards the 302 to FFmpeg which fetches the segment
+    // directly from the CDN over HTTPS.
     std::mutex                                            seg_mtx;
     std::condition_variable                               seg_cv;
-    std::unordered_map<std::string, std::string>          segment_data;
+    std::unordered_map<std::string, std::string>          segment_data;       // raw bytes (empty string on 302)
+    std::unordered_map<std::string, std::string>          segment_redirect;   // Location URL on 302
 };
 
 class HlsSessionRegistry {
@@ -60,8 +65,12 @@ public:
     // reverse socket for the session that last saw a /play, then
     // blocking up to `timeout_ms` ms for iOS to ship bytes back via
     // POST /action. Returns false on timeout or no-active-session.
+    // On success, either `out_bytes` holds the segment bytes OR
+    // `out_redirect` holds the signed CDN URL iOS wants us to fetch
+    // from — the local HLS server forwards the redirect to FFmpeg.
     bool fetch_segment(const std::string& url,
                        std::string& out_bytes,
+                       std::string& out_redirect,
                        int timeout_ms = 5000);
 
     // Store segment bytes iOS delivered and wake any fetch_segment()
@@ -69,6 +78,11 @@ public:
     void deliver_segment(const std::string& session_id,
                          const std::string& url,
                          std::string bytes);
+
+    // Store a 302 redirect Location URL iOS handed us for a segment.
+    void deliver_segment_redirect(const std::string& session_id,
+                                  const std::string& url,
+                                  std::string redirect);
 
     // Child-playlist variant: the local HLS server calls this when
     // the player requests a .m3u8 that isn't in media_playlists yet
