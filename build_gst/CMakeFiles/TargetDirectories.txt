@@ -1,3 +1,0 @@
-/home/user/AirPlay-Windows/build_gst/CMakeFiles/airplay-windows.dir
-/home/user/AirPlay-Windows/build_gst/CMakeFiles/edit_cache.dir
-/home/user/AirPlay-Windows/build_gst/CMakeFiles/rebuild_cache.dir
