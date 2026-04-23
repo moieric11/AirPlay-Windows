@@ -113,17 +113,25 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
     if (is_playlist) {
         std::string body;
         bool is_master = false;
-        if (!HlsSessionRegistry::instance().lookup_playlist(
-                mlhls_url, body, is_master)) {
-            LOG_WARN << "HLS GET " << path << " -> 404 (no session owns "
-                     << mlhls_url << ")";
-            send_response(404, "Not Found", "", "text/plain");
-            ap::net::close_socket(client.fd);
-            return;
+        bool cached = HlsSessionRegistry::instance().lookup_playlist(
+            mlhls_url, body, is_master);
+        if (!cached) {
+            // iOS pre-delivers only a subset of the child playlists
+            // listed in the master (the itags it would actually
+            // select). For the rest we FCUP on demand, same pattern
+            // as segments.
+            if (!HlsSessionRegistry::instance().fetch_playlist(
+                    mlhls_url, body)) {
+                LOG_WARN << "HLS GET " << path << " -> 504 (playlist fetch failed)";
+                send_response(504, "Gateway Timeout", "", "text/plain");
+                ap::net::close_socket(client.fd);
+                return;
+            }
         }
         body = rewrite_urls(body);
         LOG_INFO << "HLS GET " << path
                  << (is_master ? " (master" : " (media")
+                 << (cached ? "" : ", fetched")
                  << ") -> " << body.size() << 'B';
         send_response(200, "OK", body,
                       "application/vnd.apple.mpegurl");

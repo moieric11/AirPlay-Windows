@@ -912,43 +912,31 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
             LOG_INFO << "         [" << i << "] " << hls->media_uris[i];
         }
 
-        // Cascade: ask iOS for every child media playlist.
-        const int reverse_fd =
-            ReverseChannelRegistry::instance().socket_for(sid);
-        if (reverse_fd < 0) {
-            LOG_WARN << "POST /action: no /reverse socket to cascade FCUP";
-        } else {
-            for (const auto& child : hls->media_uris) {
-                const int rid = hls->next_request_id++;
-                if (!send_fcup_request(reverse_fd, child, sid, rid)) {
-                    LOG_WARN << "POST /action: FCUP send failed for " << child;
-                }
-            }
-        }
-    } else if (url.size() >= 5 &&
-               url.compare(url.size() - 5, 5, ".m3u8") == 0) {
-        // Media (child) playlist — store by its URL so the local HLS
-        // server can serve it when the player asks.
-        hls->media_playlists[url] = playlist;
-        LOG_INFO << "POST /action: media playlist stored "
-                 << hls->media_playlists.size() << '/'
-                 << hls->media_uris.size() << " (" << playlist.size() << "B)";
-        // Once every media playlist referenced by the master has been
-        // delivered, kick the local media player at the rewritten
-        // master URL. Subsequent segment fetches go through the local
-        // HTTP server which FCUPs them on demand.
-        if (ctx.hls_player &&
-            hls->media_playlists.size() == hls->media_uris.size() &&
-            !hls->media_uris.empty()) {
+        // iOS only pre-delivers a subset of the child playlists (the
+        // itags actually selected for playback). The others are
+        // fetched on demand by the player itself, which our local
+        // HTTP server forwards as FCUP misses. So don't wait for
+        // all 16 to arrive — start the player as soon as we have
+        // the master in hand.
+        if (ctx.hls_player && ctx.renderer) {
             const std::string local_master =
                 "http://localhost:" + std::to_string(ctx.hls_local_port) +
                 "/master.m3u8";
-            LOG_INFO << "POST /action: all " << hls->media_uris.size()
-                     << " media playlists in — starting HlsPlayer on "
+            LOG_INFO << "POST /action: master stored — starting HlsPlayer on "
                      << local_master;
             ctx.hls_player->stop();   // idempotent; clear any prior video
             ctx.hls_player->start(local_master, ctx.renderer);
         }
+    } else if (url.size() >= 5 &&
+               url.compare(url.size() - 5, 5, ".m3u8") == 0) {
+        // Media (child) playlist — store by its URL so the local HLS
+        // server can serve it when the player asks. Any waiters on
+        // HlsSessionRegistry::fetch_playlist() get woken up.
+        hls->media_playlists[url] = playlist;
+        LOG_INFO << "POST /action: media playlist stored "
+                 << hls->media_playlists.size() << '/'
+                 << hls->media_uris.size() << " (" << playlist.size() << "B)";
+        HlsSessionRegistry::instance().notify_playlist_arrived(sid, url);
     } else {
         // A segment: hand the bytes to any HlsLocalServer thread
         // blocking in fetch_segment().

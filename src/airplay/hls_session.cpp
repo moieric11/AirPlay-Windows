@@ -131,6 +131,72 @@ void HlsSessionRegistry::deliver_segment(const std::string& session_id,
     s->seg_cv.notify_all();
 }
 
+bool HlsSessionRegistry::fetch_playlist(const std::string& url,
+                                        std::string& out_bytes,
+                                        int timeout_ms) {
+    // Pick the most recent session with a reverse channel (single
+    // iPhone = single session) and FCUP the requested .m3u8 URL,
+    // then block on seg_cv until handle_action populates it in
+    // media_playlists.
+    HlsSession* s = nullptr;
+    std::string session_id;
+    int         reverse_fd = -1;
+    int         request_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (auto& [sid, sess] : sessions_) {
+            if (!sess) continue;
+            const int fd =
+                ReverseChannelRegistry::instance().socket_for(sid);
+            if (fd < 0) continue;
+            s          = sess.get();
+            session_id = sid;
+            reverse_fd = fd;
+            request_id = s->next_request_id++;
+            break;
+        }
+    }
+    if (!s) return false;
+
+    // Maybe it was already delivered while we were initialising.
+    {
+        std::lock_guard<std::mutex> lock(s->seg_mtx);
+        const auto it = s->media_playlists.find(url);
+        if (it != s->media_playlists.end()) {
+            out_bytes = it->second;
+            return true;
+        }
+    }
+
+    if (!send_fcup_request(reverse_fd, url, session_id, request_id)) {
+        LOG_WARN << "fetch_playlist: FCUP send failed for " << url;
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lock(s->seg_mtx);
+    const bool arrived = s->seg_cv.wait_for(lock,
+        std::chrono::milliseconds(timeout_ms),
+        [&] { return s->media_playlists.count(url) != 0; });
+    if (!arrived) {
+        LOG_WARN << "fetch_playlist: timeout after " << timeout_ms
+                 << "ms for " << url;
+        return false;
+    }
+    out_bytes = s->media_playlists[url];
+    return true;
+}
+
+void HlsSessionRegistry::notify_playlist_arrived(const std::string& session_id,
+                                                 const std::string& /*url*/) {
+    HlsSession* s = find(session_id);
+    if (!s) return;
+    // The playlist was already stored in media_playlists by the
+    // caller; we just need to wake waiters so their predicate check
+    // succeeds. notify_all because multiple waiters might be blocked
+    // on different URLs on the same seg_cv.
+    s->seg_cv.notify_all();
+}
+
 std::vector<std::string> extract_media_uris(const std::string& master) {
     constexpr const char* kPrefix = "mlhls://localhost/";
     constexpr const char* kSuffix = ".m3u8";

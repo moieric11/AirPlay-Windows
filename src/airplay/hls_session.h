@@ -70,6 +70,21 @@ public:
                          const std::string& url,
                          std::string bytes);
 
+    // Child-playlist variant: the local HLS server calls this when
+    // the player requests a .m3u8 that isn't in media_playlists yet
+    // (iOS only pre-delivers the itags it selected, not all the ones
+    // listed in the master). Sends a FCUP for `url` on the session's
+    // reverse socket, then blocks on the shared seg_cv until
+    // handle_action stores the result in media_playlists.
+    bool fetch_playlist(const std::string& url,
+                        std::string& out_bytes,
+                        int timeout_ms = 5000);
+
+    // Wake fetch_playlist() waiters when handle_action adds a new
+    // entry to media_playlists.
+    void notify_playlist_arrived(const std::string& session_id,
+                                 const std::string& url);
+
 private:
     HlsSessionRegistry() = default;
 
