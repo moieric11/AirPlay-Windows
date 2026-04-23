@@ -617,13 +617,44 @@ Response handle_reverse(ClientSession& session, const Request& req) {
 
 // GET /server-info — capabilities plist the AirPlay Streaming path queries
 // before trying to stream. Reuses the same info_plist builder as GET /info;
-// iOS happily accepts a superset of fields here.
+// GET /server-info — capabilities plist the AirPlay Streaming path queries
+// before trying to stream. We build a dedicated 12-bit features bitmap
+// here (NOT the 64-bit mDNS features). Bit 4 "HLS supported" is the
+// switch that makes YouTube / iOS dispatch AirPlay Streaming rather
+// than fall back to Screen Mirroring.
+//
+// UxPlay's http_handler_info returns 0x27F = bits 0,1,2,3,4,5,6,9:
+//   0 video, 1 photo, 2 videoFairPlay, 3 volumeCtl, 4 HLS, 5 slideshow,
+//   6 (unknown), 9 audio.
+// Body is an XML plist (text/x-apple-plist+xml), not the binary /info.
 Response handle_server_info(const DeviceContext& ctx, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
+#if defined(HAVE_LIBPLIST)
+    plist_t root = plist_new_dict();
+    plist_dict_set_item(root, "features",       plist_new_uint(0x27F));
+    plist_dict_set_item(root, "macAddress",     plist_new_string(ctx.deviceid.c_str()));
+    plist_dict_set_item(root, "deviceid",       plist_new_string(ctx.deviceid.c_str()));
+    plist_dict_set_item(root, "model",          plist_new_string(ctx.model.c_str()));
+    plist_dict_set_item(root, "osBuildVersion", plist_new_string("12B435"));
+    plist_dict_set_item(root, "protovers",      plist_new_string("1.0"));
+    plist_dict_set_item(root, "srcvers",        plist_new_string(ctx.srcvers.c_str()));
+    plist_dict_set_item(root, "vv",             plist_new_uint(2));
+    char*    xml = nullptr;
+    uint32_t xml_len = 0;
+    plist_to_xml(root, &xml, &xml_len);
+    plist_free(root);
+    if (xml) {
+        r.body.assign(xml, xml + xml_len);
+        std::free(xml);
+    }
+    r.set_header("Content-Type", "text/x-apple-plist+xml");
+#else
     r.set_header("Content-Type", "application/x-apple-binary-plist");
     r.body = build_info_plist(ctx);
-    LOG_INFO << "/server-info served (" << r.body.size() << "B)";
+#endif
+    LOG_INFO << "/server-info served (" << r.body.size()
+             << "B, features=0x27F incl. HLS bit 4)";
     return r;
 }
 
