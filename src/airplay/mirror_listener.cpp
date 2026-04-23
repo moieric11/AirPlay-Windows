@@ -177,21 +177,63 @@ bool MirrorListener::enable_decrypt(
 }
 
 bool MirrorListener::start(uint16_t& port) {
-    listen_sock_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    // Dual-stack IPv6 listener so iOS reaches the mirror port whether
+    // it chose to connect over v4 or v6. This matches what the main
+    // TCP server and UDP audio sockets do; the previous IPv4-only
+    // bind silently dropped every v6 connect attempt, giving audio
+    // only (which uses a separate UDP socket) when the iPhone reached
+    // us via IPv6.
+    listen_sock_ = ::socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock_ == INVALID_SOCK) {
-        LOG_ERROR << "mirror: TCP socket() failed";
-        return false;
+        // Kernel without IPv6: fall back to v4.
+        listen_sock_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listen_sock_ == INVALID_SOCK) {
+            LOG_ERROR << "mirror: TCP socket() failed";
+            return false;
+        }
+        int on = 1;
+        ::setsockopt(listen_sock_, SOL_SOCKET, SO_REUSEADDR,
+                     reinterpret_cast<const char*>(&on), sizeof(on));
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port        = 0;
+        if (::bind(listen_sock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            LOG_ERROR << "mirror: bind(v4) failed";
+            ap::net::close_socket(listen_sock_); listen_sock_ = INVALID_SOCK;
+            return false;
+        }
+#if defined(_WIN32)
+        int len = sizeof(addr);
+#else
+        socklen_t len = sizeof(addr);
+#endif
+        ::getsockname(listen_sock_, reinterpret_cast<sockaddr*>(&addr), &len);
+        if (::listen(listen_sock_, 1) != 0) {
+            LOG_ERROR << "mirror: listen() failed";
+            ap::net::close_socket(listen_sock_); listen_sock_ = INVALID_SOCK;
+            return false;
+        }
+        port     = ntohs(addr.sin_port);
+        running_ = true;
+        thread_  = std::thread(&MirrorListener::accept_loop, this);
+        LOG_INFO << "mirror TCP listener on port " << port << " (v4 only)";
+        return true;
     }
+
     int on = 1;
     ::setsockopt(listen_sock_, SOL_SOCKET, SO_REUSEADDR,
                  reinterpret_cast<const char*>(&on), sizeof(on));
+    int v6only = 0;
+    ::setsockopt(listen_sock_, IPPROTO_IPV6, IPV6_V6ONLY,
+                 reinterpret_cast<const char*>(&v6only), sizeof(v6only));
 
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port        = 0;
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr   = in6addr_any;
+    addr.sin6_port   = 0;
     if (::bind(listen_sock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        LOG_ERROR << "mirror: bind() failed";
+        LOG_ERROR << "mirror: bind(v6 dual-stack) failed";
         ap::net::close_socket(listen_sock_); listen_sock_ = INVALID_SOCK;
         return false;
     }
@@ -210,10 +252,10 @@ bool MirrorListener::start(uint16_t& port) {
         return false;
     }
 
-    port     = ntohs(addr.sin_port);
+    port     = ntohs(addr.sin6_port);
     running_ = true;
     thread_  = std::thread(&MirrorListener::accept_loop, this);
-    LOG_INFO << "mirror TCP listener on port " << port;
+    LOG_INFO << "mirror TCP listener on port " << port << " (IPv4+IPv6)";
     return true;
 }
 
@@ -234,7 +276,9 @@ void MirrorListener::accept_loop() {
         if (ret <= 0) continue;
         if (listen_sock_ == INVALID_SOCK) break;
 
-        sockaddr_in peer{};
+        // sockaddr_storage covers both AF_INET and AF_INET6 without a
+        // preliminary branch. Format the peer address after accept.
+        sockaddr_storage peer{};
 #if defined(_WIN32)
         int plen = sizeof(peer);
 #else
@@ -244,9 +288,24 @@ void MirrorListener::accept_loop() {
                                    reinterpret_cast<sockaddr*>(&peer), &plen);
         if (client == INVALID_SOCK) continue;
 
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
-        LOG_INFO << "mirror: iOS connected from " << ip << ':' << ntohs(peer.sin_port);
+        char ip[INET6_ADDRSTRLEN] = {0};
+        uint16_t peer_port = 0;
+        if (peer.ss_family == AF_INET6) {
+            auto* in6 = reinterpret_cast<sockaddr_in6*>(&peer);
+            if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr)) {
+                const uint32_t v4 = reinterpret_cast<uint32_t*>(&in6->sin6_addr)[3];
+                in_addr a{}; a.s_addr = v4;
+                inet_ntop(AF_INET, &a, ip, sizeof(ip));
+            } else {
+                inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof(ip));
+            }
+            peer_port = ntohs(in6->sin6_port);
+        } else if (peer.ss_family == AF_INET) {
+            auto* in4 = reinterpret_cast<sockaddr_in*>(&peer);
+            inet_ntop(AF_INET, &in4->sin_addr, ip, sizeof(ip));
+            peer_port = ntohs(in4->sin_port);
+        }
+        LOG_INFO << "mirror: iOS connected from " << ip << ':' << peer_port;
 
         set_recv_timeout(client, kRecvTimeoutMs);
 
