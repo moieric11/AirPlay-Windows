@@ -187,7 +187,12 @@ void AudioReceiver::thread_fn() {
         if (n < 12) continue;   // RTP header minimum
 
         last_packet = std::chrono::steady_clock::now();
-        if (cfg_.renderer) cfg_.renderer->push_playback_rate(1.0f);
+        // Suppress rate=1 during the post-FLUSH grace window: iOS keeps
+        // dribbling packets for ~200 ms after a real pause FLUSH to drain
+        // its buffer, and those packets used to un-pause us immediately.
+        if (cfg_.renderer && !cfg_.renderer->in_flush_grace()) {
+            cfg_.renderer->push_playback_rate(1.0f);
+        }
 
         // Parse RTP header (RFC 3550, 12-byte fixed part).
         const uint8_t  pt  =  buf[1] & 0x7f;

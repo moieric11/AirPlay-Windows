@@ -73,6 +73,14 @@ public:
     // Thread-safe.
     void clear_session();
 
+    // Call on RTSP FLUSH. Starts a ~500 ms grace window during which
+    // the audio silence watchdog is NOT allowed to flip rate back to
+    // playing: iOS keeps dribbling packets to flush its buffer for a
+    // few hundred ms after a real pause, and those drained packets
+    // used to un-pause us immediately. Rate=0 pushes still go through.
+    void note_flush();
+    bool in_flush_grace() const;
+
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
     bool user_closed() const { return closed_.load(); }
@@ -123,6 +131,10 @@ private:
     // tick. Used by clear_session() so TEARDOWN wipes the "last track"
     // cover without needing a cover_mtx_ hop.
     std::atomic<bool>          clear_cover_requested_{false};
+
+    // steady_clock nanoseconds until which the silence watchdog is
+    // forbidden from pushing rate=1. Set by note_flush().
+    std::atomic<int64_t>       flush_grace_until_ns_{0};
 };
 
 } // namespace ap::video

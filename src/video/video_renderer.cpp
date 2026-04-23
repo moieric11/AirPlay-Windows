@@ -282,6 +282,22 @@ void VideoRenderer::push_playback_rate(float rate) {
     cv_.notify_one();
 }
 
+void VideoRenderer::note_flush() {
+    constexpr int64_t grace_ms = 500;
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    flush_grace_until_ns_.store(now_ns + grace_ms * 1'000'000,
+                                 std::memory_order_relaxed);
+}
+
+bool VideoRenderer::in_flush_grace() const {
+    const int64_t until = flush_grace_until_ns_.load(std::memory_order_relaxed);
+    if (until == 0) return false;
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return now_ns < until;
+}
+
 void VideoRenderer::clear_session() {
     LOG_INFO << "VideoRenderer clear_session: reset cover / metadata / progress";
     // Clear metadata on the next render tick by pushing empties (the

@@ -707,7 +707,10 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     // FLUSH only shows pause for a fraction of a frame.
     if (req.method == "FLUSH" || req.method == "PAUSE") {
         LOG_INFO << req.method << ": tentative pause";
-        if (session.renderer) session.renderer->push_playback_rate(0.0f);
+        if (session.renderer) {
+            session.renderer->note_flush();
+            session.renderer->push_playback_rate(0.0f);
+        }
         Response r = make(200, "OK");
         copy_cseq(req, r);
         return r;
