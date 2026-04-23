@@ -34,21 +34,51 @@ uint16_t pick_port(const std::string& header, const char* key) {
     return v;
 }
 
-// Bind a UDP socket on 0.0.0.0:0 (ephemeral) and return both the socket
-// and the port the OS picked. Returns (INVALID_SOCK, 0) on failure.
+// Bind a UDP socket on [::]:0 (dual-stack ephemeral) and return both
+// the socket and the port the OS picked. Returns (INVALID_SOCK, 0) on
+// failure. The socket accepts both IPv4 and IPv6 senders — when iOS
+// reaches us over IPv6 it also sends its RTP audio/control packets
+// to the v6 address returned here, and an IPv4-only UDP socket would
+// silently drop those.
 std::pair<socket_t, uint16_t> bind_udp() {
-    socket_t s = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (s == INVALID_SOCK) return {INVALID_SOCK, 0};
+    socket_t s = ::socket(AF_INET6, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCK) {
+        // Kernel without IPv6: fall back to v4-only.
+        s = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (s == INVALID_SOCK) return {INVALID_SOCK, 0};
 
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port        = 0;
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port        = 0;
+        if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            ap::net::close_socket(s);
+            return {INVALID_SOCK, 0};
+        }
+#if defined(_WIN32)
+        int len = sizeof(addr);
+#else
+        socklen_t len = sizeof(addr);
+#endif
+        if (::getsockname(s, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+            ap::net::close_socket(s);
+            return {INVALID_SOCK, 0};
+        }
+        return {s, ntohs(addr.sin_port)};
+    }
+
+    int v6only = 0;
+    ::setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY,
+                 reinterpret_cast<const char*>(&v6only), sizeof(v6only));
+
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr   = in6addr_any;
+    addr.sin6_port   = 0;
     if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         ap::net::close_socket(s);
         return {INVALID_SOCK, 0};
     }
-
 #if defined(_WIN32)
     int len = sizeof(addr);
 #else
@@ -58,7 +88,7 @@ std::pair<socket_t, uint16_t> bind_udp() {
         ap::net::close_socket(s);
         return {INVALID_SOCK, 0};
     }
-    return {s, ntohs(addr.sin_port)};
+    return {s, ntohs(addr.sin6_port)};
 }
 
 std::string random_session_id() {
