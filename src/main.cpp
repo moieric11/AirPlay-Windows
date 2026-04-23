@@ -45,15 +45,16 @@ ap::airplay::DeviceContext build_device_context() {
     ctx.deviceid = ap::net::primary_mac();
     ctx.model    = "AppleTV3,2";
     ctx.pi       = "b08f5a79-db29-4384-b456-a4784d9e6055";
-    // Feature bitmap advertised in mDNS TXT + /info. Starts from UxPlay's
-    // default 0x5A7FFEE6 and explicitly flips on bit 0 (AirPlay video)
-    // and bit 4 (HLS) — iOS keys the AirPlay Streaming dispatch on
-    // these two bits; without them YouTube / Photos stay on the audio
-    // fallback path. UxPlay enables them via --hls; we hard-enable.
-    // Bit 42 (HEVC "Screen Multi Codec") stays OFF for now: H264Decoder
-    // is pinned to AV_CODEC_ID_H264 so advertising HEVC would break
-    // decoding on iOS devices that honour the bit.
-    ctx.features = "0x5A7FFEF7,0x0";
+    // Feature bitmap advertised in mDNS TXT + /info.
+    //   Low word 0x5A7FFEF7: UxPlay's default 0x5A7FFEE6 plus bit 0
+    //     (AirPlay video) and bit 4 (HLS) — iOS keys AirPlay Streaming
+    //     dispatch on these two, without them YouTube / Photos stay on
+    //     the audio fallback.
+    //   High word 0x400: bit 42 "Screen Multi Codec" = HEVC mirror.
+    //     H264Decoder auto-detects avcC vs hvcC in the SPS_PPS frame
+    //     and swaps libavcodec between H.264 and HEVC on the fly.
+    //     iPhone 7+ encodes HEVC; older devices fall back to H.264.
+    ctx.features = "0x5A7FFEF7,0x400";
     ctx.srcvers  = "220.68";
     return ctx;
 }

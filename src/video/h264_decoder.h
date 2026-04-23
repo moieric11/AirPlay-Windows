@@ -30,8 +30,17 @@ public:
     H264Decoder(const H264Decoder&)            = delete;
     H264Decoder& operator=(const H264Decoder&) = delete;
 
+    // Initialise with an H.264 decoder (the historical path for the
+    // AirPlay mirror stream). If iOS later sends an hvcC blob in a
+    // SPS_PPS frame — because we now advertise bit 42 / HEVC — the
+    // decoder transparently switches to H.265 via reinit_for_hevc().
     bool init();
 
+    // Parse SPS/PPS out of an avcC (H.264) or hvcC (HEVC) blob iOS
+    // sent as an SPS_PPS mirror frame, caching them as Annex-B bytes
+    // for later prepend to IDR packets. Switches the internal decoder
+    // to the matching codec if needed. Returns false on malformed
+    // input (both parsers tried).
     bool set_parameter_sets_from_avcc(const uint8_t* avcc, std::size_t size);
 
     // Returns true iff the packet was accepted by avcodec. `got_frame` is set

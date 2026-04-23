@@ -30,8 +30,14 @@ struct H264Decoder::Impl {
     AVFrame*             frame       = nullptr;
     SwsContext*          sws         = nullptr;
 
+    // Annex-B bytes (with leading 00 00 00 01 start code) cached from
+    // the last config blob so every IDR can be prepended with its
+    // parameter sets. HEVC has three (VPS+SPS+PPS), H.264 has two.
+    std::vector<uint8_t> vps_annexb;   // HEVC only; empty for H.264
     std::vector<uint8_t> sps_annexb;
     std::vector<uint8_t> pps_annexb;
+
+    AVCodecID            codec_id    = AV_CODEC_ID_H264;
 
     int                  last_w      = 0;
     int                  last_h      = 0;
@@ -45,69 +51,166 @@ struct H264Decoder::Impl {
         if (pkt)   av_packet_free(&pkt);
         if (ctx)   avcodec_free_context(&ctx);
     }
+
+    // Open (or re-open after a codec switch) libavcodec for `id`.
+    bool open(AVCodecID id) {
+        const AVCodec* c = avcodec_find_decoder(id);
+        if (!c) {
+            LOG_ERROR << "decoder: codec " << avcodec_get_name(id)
+                      << " not available in libavcodec";
+            return false;
+        }
+        if (ctx) avcodec_free_context(&ctx);
+        codec    = c;
+        codec_id = id;
+        ctx      = avcodec_alloc_context3(c);
+        if (!ctx) return false;
+        if (avcodec_open2(ctx, c, nullptr) != 0) {
+            LOG_ERROR << "decoder: avcodec_open2 failed for "
+                      << avcodec_get_name(id);
+            return false;
+        }
+        LOG_INFO << "decoder ready: " << avcodec_get_name(id)
+                 << " (libavcodec " << LIBAVCODEC_IDENT << ')';
+        return true;
+    }
 };
 
 H264Decoder::H264Decoder()  : impl_(std::make_unique<Impl>()) {}
 H264Decoder::~H264Decoder() = default;
 
 bool H264Decoder::init() {
-    impl_->codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-    if (!impl_->codec) {
-        LOG_ERROR << "H264Decoder: H.264 decoder not available in libavcodec";
-        return false;
-    }
-    impl_->ctx = avcodec_alloc_context3(impl_->codec);
     impl_->pkt = av_packet_alloc();
     impl_->frame = av_frame_alloc();
-    if (!impl_->ctx || !impl_->pkt || !impl_->frame) return false;
-
-    if (avcodec_open2(impl_->ctx, impl_->codec, nullptr) != 0) {
-        LOG_ERROR << "H264Decoder: avcodec_open2 failed";
-        return false;
-    }
-    LOG_INFO << "H264Decoder ready (libavcodec " << LIBAVCODEC_IDENT << ')';
-    return true;
+    if (!impl_->pkt || !impl_->frame) return false;
+    return impl_->open(AV_CODEC_ID_H264);
 }
 
-// Parse the avcC blob iOS sends in SPS_PPS frames (ISO 14496-15 §5.2.4.1.1)
-// and extract the SPS + PPS NAL units. See docs/PROTOCOL.md for layout.
-bool H264Decoder::set_parameter_sets_from_avcc(const uint8_t* avcc,
-                                               std::size_t size) {
-    if (!avcc || size < 8 || avcc[0] != 0x01) {
-        LOG_WARN << "H264Decoder: avcC missing or wrong version";
-        return false;
-    }
-    uint8_t num_sps = avcc[5] & 0x1f;
+namespace {
+
+// Parse avcC (ISO 14496-15 §5.2.4.1.1) and populate sps/pps Annex-B.
+// Returns true only when the blob is fully consumed — partial parses
+// get rejected so we can fall through to the hvcC attempt.
+bool parse_avcc(const uint8_t* blob, std::size_t size,
+                std::vector<uint8_t>& sps_out,
+                std::vector<uint8_t>& pps_out) {
+    if (!blob || size < 7 || blob[0] != 0x01) return false;
+    const uint8_t num_sps = blob[5] & 0x1f;
     if (num_sps < 1) return false;
 
     std::size_t p = 6;
-
-    impl_->sps_annexb.clear();
-    impl_->pps_annexb.clear();
-
-    // -- SPS list --
-    for (uint8_t i = 0; i < num_sps && p + 2 <= size; ++i) {
-        uint16_t len = (static_cast<uint16_t>(avcc[p]) << 8) | avcc[p + 1];
+    sps_out.clear();
+    for (uint8_t i = 0; i < num_sps; ++i) {
+        if (p + 2 > size) return false;
+        const uint16_t len =
+            (static_cast<uint16_t>(blob[p]) << 8) | blob[p + 1];
         p += 2;
         if (p + len > size) return false;
-        if (i == 0) append_annexb_nal(impl_->sps_annexb, avcc + p, len);
+        if (i == 0) append_annexb_nal(sps_out, blob + p, len);
         p += len;
     }
     if (p >= size) return false;
-
-    // -- PPS list --
-    uint8_t num_pps = avcc[p++];
-    for (uint8_t i = 0; i < num_pps && p + 2 <= size; ++i) {
-        uint16_t len = (static_cast<uint16_t>(avcc[p]) << 8) | avcc[p + 1];
+    const uint8_t num_pps = blob[p++];
+    pps_out.clear();
+    for (uint8_t i = 0; i < num_pps; ++i) {
+        if (p + 2 > size) return false;
+        const uint16_t len =
+            (static_cast<uint16_t>(blob[p]) << 8) | blob[p + 1];
         p += 2;
         if (p + len > size) return false;
-        if (i == 0) append_annexb_nal(impl_->pps_annexb, avcc + p, len);
+        if (i == 0) append_annexb_nal(pps_out, blob + p, len);
         p += len;
     }
+    // iOS avcC has no trailing bytes; a malformed blob with extras
+    // looks superficially like hvcC and should fall through.
+    return !sps_out.empty() && !pps_out.empty();
+}
 
-    LOG_INFO << "H264Decoder: SPS=" << (impl_->sps_annexb.size() - 4) << "B, "
-             << "PPS=" << (impl_->pps_annexb.size() - 4) << "B cached";
-    return !impl_->sps_annexb.empty() && !impl_->pps_annexb.empty();
+// Parse hvcC (ISO 14496-15 §8.3.3.1.2): header is 22 bytes, then
+// numOfArrays (u8), each array is
+//   u8  array_completeness(1) | reserved(1) | NAL_unit_type(6)
+//   u16 numNalus
+//   for each nalu: u16 length, byte[length] data
+// HEVC NAL types: VPS=32, SPS=33, PPS=34.
+bool parse_hvcc(const uint8_t* blob, std::size_t size,
+                std::vector<uint8_t>& vps_out,
+                std::vector<uint8_t>& sps_out,
+                std::vector<uint8_t>& pps_out) {
+    if (!blob || size < 23 || blob[0] != 0x01) return false;
+    std::size_t p = 22;
+    const uint8_t num_arrays = blob[p++];
+    vps_out.clear(); sps_out.clear(); pps_out.clear();
+    for (uint8_t i = 0; i < num_arrays; ++i) {
+        if (p + 3 > size) return false;
+        const uint8_t  nal_type = blob[p] & 0x3f;
+        const uint16_t num_nalus =
+            (static_cast<uint16_t>(blob[p + 1]) << 8) | blob[p + 2];
+        p += 3;
+        for (uint16_t j = 0; j < num_nalus; ++j) {
+            if (p + 2 > size) return false;
+            const uint16_t len =
+                (static_cast<uint16_t>(blob[p]) << 8) | blob[p + 1];
+            p += 2;
+            if (p + len > size) return false;
+            if (j == 0) {
+                if      (nal_type == 32) append_annexb_nal(vps_out, blob + p, len);
+                else if (nal_type == 33) append_annexb_nal(sps_out, blob + p, len);
+                else if (nal_type == 34) append_annexb_nal(pps_out, blob + p, len);
+            }
+            p += len;
+        }
+    }
+    return !vps_out.empty() && !sps_out.empty() && !pps_out.empty();
+}
+
+} // namespace
+
+// Accept either an H.264 avcC or an HEVC hvcC blob, reinit the
+// decoder on codec change. Historical name kept for callers.
+bool H264Decoder::set_parameter_sets_from_avcc(const uint8_t* blob,
+                                               std::size_t size) {
+    if (!blob || size < 7 || blob[0] != 0x01) {
+        LOG_WARN << "decoder: config blob missing or wrong version";
+        return false;
+    }
+
+    // Try H.264 avcC first (common path).
+    std::vector<uint8_t> new_sps, new_pps;
+    if (parse_avcc(blob, size, new_sps, new_pps)) {
+        if (impl_->codec_id != AV_CODEC_ID_H264 &&
+            !impl_->open(AV_CODEC_ID_H264)) {
+            return false;
+        }
+        impl_->vps_annexb.clear();
+        impl_->sps_annexb = std::move(new_sps);
+        impl_->pps_annexb = std::move(new_pps);
+        LOG_INFO << "decoder: H.264 SPS="
+                 << (impl_->sps_annexb.size() - 4) << "B PPS="
+                 << (impl_->pps_annexb.size() - 4) << "B cached";
+        return true;
+    }
+
+    // Fall through to HEVC hvcC.
+    std::vector<uint8_t> new_vps;
+    new_sps.clear(); new_pps.clear();
+    if (parse_hvcc(blob, size, new_vps, new_sps, new_pps)) {
+        if (impl_->codec_id != AV_CODEC_ID_HEVC &&
+            !impl_->open(AV_CODEC_ID_HEVC)) {
+            return false;
+        }
+        impl_->vps_annexb = std::move(new_vps);
+        impl_->sps_annexb = std::move(new_sps);
+        impl_->pps_annexb = std::move(new_pps);
+        LOG_INFO << "decoder: HEVC VPS="
+                 << (impl_->vps_annexb.size() - 4) << "B SPS="
+                 << (impl_->sps_annexb.size() - 4) << "B PPS="
+                 << (impl_->pps_annexb.size() - 4) << "B cached";
+        return true;
+    }
+
+    LOG_WARN << "decoder: config blob matched neither avcC nor hvcC ("
+             << size << "B)";
+    return false;
 }
 
 bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
@@ -118,11 +221,17 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
     if (!impl_->ctx) return false;
     if (!nal_data || nal_size == 0) return false;
 
-    // Build the Annex-B packet. Every IDR gets SPS + PPS prepended so the
-    // decoder can re-initialise references if needed.
+    // Build the Annex-B packet. Every IDR gets the parameter sets
+    // prepended. H.264 needs SPS+PPS; HEVC additionally needs VPS
+    // before them.
     std::vector<uint8_t> buf;
-    buf.reserve(nal_size + impl_->sps_annexb.size() + impl_->pps_annexb.size());
+    buf.reserve(nal_size + impl_->vps_annexb.size() +
+                impl_->sps_annexb.size() + impl_->pps_annexb.size());
     if (is_idr) {
+        if (!impl_->vps_annexb.empty()) {
+            buf.insert(buf.end(),
+                       impl_->vps_annexb.begin(), impl_->vps_annexb.end());
+        }
         buf.insert(buf.end(),
                    impl_->sps_annexb.begin(), impl_->sps_annexb.end());
         buf.insert(buf.end(),
