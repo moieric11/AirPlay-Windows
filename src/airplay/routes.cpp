@@ -2,6 +2,7 @@
 #include "airplay/airplay2_setup.h"
 #include "airplay/client_session.h"
 #include "airplay/daap.h"
+#include "airplay/fcup.h"
 #include "airplay/info_plist.h"
 #include "airplay/reverse_channel.h"
 #include "airplay/sdp.h"
@@ -797,11 +798,56 @@ Response handle_play(ClientSession& session, const Request& req) {
         return r;
     }
 
-    // TODO next commit: look up the /reverse socket for this session_id
-    // and send a POST /event FCUP Request to ask iOS for the master
-    // playlist. Then on POST /action we receive the playlist data,
-    // parse it, and cascade FCUP requests for each media sub-playlist.
+    // Look up the /reverse socket iOS opened for this X-Apple-Session-ID
+    // and send a POST /event FCUP Request on it, asking iOS to deliver
+    // the master playlist via POST /action.
+    const int reverse_fd =
+        ReverseChannelRegistry::instance().socket_for(pr.session_id);
+    if (reverse_fd < 0) {
+        LOG_WARN << "POST /play: no /reverse socket for session "
+                 << pr.session_id << "; cannot send FCUP Request";
+        return r;
+    }
+    if (!send_fcup_request(reverse_fd, pr.url, pr.session_id, /*request_id*/ 1)) {
+        LOG_WARN << "POST /play: FCUP Request send failed";
+    } else {
+        LOG_INFO << "POST /play: FCUP Request sent for url=" << pr.url;
+    }
     (void)session;
+    return r;
+}
+
+// GET /playback-info: iOS polls this every ~1 s after /play. If we
+// don't answer with a valid readyToPlay plist within about 600 ms, iOS
+// assumes we're broken and TEARDOWNs the session. While the playlist
+// fetch (FCUP round trip) is in flight we need at least a buffering
+// response so iOS keeps waiting. Once a real player is wired up this
+// will grow duration/position/rate. For now: readyToPlay=0 signals
+// "still loading", duration=0 (unknown), position=0.
+Response handle_playback_info(const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    r.set_header("Content-Type", "text/x-apple-plist+xml");
+#if defined(HAVE_LIBPLIST)
+    plist_t root = plist_new_dict();
+    plist_dict_set_item(root, "duration",                 plist_new_real(0.0));
+    plist_dict_set_item(root, "position",                 plist_new_real(0.0));
+    plist_dict_set_item(root, "rate",                     plist_new_real(0.0));
+    plist_dict_set_item(root, "readyToPlay",              plist_new_uint(0));
+    plist_dict_set_item(root, "playbackBufferEmpty",      plist_new_uint(1));
+    plist_dict_set_item(root, "playbackBufferFull",       plist_new_uint(0));
+    plist_dict_set_item(root, "playbackLikelyToKeepUp",   plist_new_uint(0));
+    plist_dict_set_item(root, "loadedTimeRanges",         plist_new_array());
+    plist_dict_set_item(root, "seekableTimeRanges",       plist_new_array());
+    char*    xml = nullptr;
+    uint32_t xml_len = 0;
+    plist_to_xml(root, &xml, &xml_len);
+    plist_free(root);
+    if (xml) {
+        r.body.assign(xml, xml + xml_len);
+        std::free(xml);
+    }
+#endif
     return r;
 }
 
@@ -912,7 +958,7 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "POST" && path == "/scrub")            return handle_stream_stub(req, "scrub");
     if (req.method == "POST" && path == "/setProperty")      return handle_stream_stub(req, "setProperty");
     if (req.method == "POST" && path == "/getProperty")      return handle_stream_stub(req, "getProperty");
-    if (req.method == "GET"  && path == "/playback-info")    return handle_stream_stub(req, "playback-info");
+    if (req.method == "GET"  && path == "/playback-info")    return handle_playback_info(req);
     if (req.method == "POST" && path == "/action")           return handle_stream_stub(req, "action");
     if (req.method == "POST" && path == "/command")          return handle_stream_stub(req, "command");
 
