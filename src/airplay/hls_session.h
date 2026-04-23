@@ -125,6 +125,14 @@ private:
 // removed.
 std::vector<std::string> extract_media_uris(const std::string& master);
 
+// Reduce a YouTube-style master playlist to a single video variant
+// and one audio rendition per TYPE so FFmpeg doesn't probe every
+// itag. Keeps all header tags, the first #EXT-X-MEDIA per TYPE, and
+// the first #EXT-X-STREAM-INF (plus its URI line). Drops every
+// later variant. Returns `master` unchanged if it doesn't match the
+// expected shape.
+std::string filter_master_to_single_variant(const std::string& master);
+
 // Rewrite every segment URL in `expanded_playlist` to a local path
 // "/seg/<n>" where <n> is a fresh counter, and record the mapping
 // n -> original URL on `session`. Comments (#…) and blank lines are

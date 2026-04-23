@@ -464,6 +464,139 @@ std::string lookup_segment_url(const std::string& local_path) {
     return HlsSessionRegistry::instance().resolve_segment_path(local_path);
 }
 
+std::string filter_master_to_single_variant(const std::string& master) {
+    // Two-pass. First pass picks the STREAM-INF we'll keep (first
+    // seen) and records its AUDIO="…" group id if any. Second pass
+    // rebuilds the playlist keeping only compatible renditions so
+    // FFmpeg doesn't probe every itag.
+    auto quoted = [](const std::string& line,
+                     const char* key) -> std::string {
+        const std::string k = key;
+        const auto p = line.find(k);
+        if (p == std::string::npos) return {};
+        const auto open = line.find('"', p);
+        if (open == std::string::npos) return {};
+        const auto close = line.find('"', open + 1);
+        if (close == std::string::npos) return {};
+        return line.substr(open + 1, close - open - 1);
+    };
+    auto bare_attr = [](const std::string& line,
+                        const char* key) -> std::string {
+        const std::string k = key;
+        const auto p = line.find(k);
+        if (p == std::string::npos) return {};
+        const auto start = p + k.size();
+        const auto end = line.find_first_of(",\r\n ", start);
+        return line.substr(start,
+            end == std::string::npos ? std::string::npos : end - start);
+    };
+    auto split_lines = [](const std::string& s) {
+        std::vector<std::string> lines;
+        std::size_t pos = 0;
+        while (pos < s.size()) {
+            const auto eol = s.find('\n', pos);
+            const auto end = (eol == std::string::npos) ? s.size() : eol;
+            std::string line = s.substr(pos, end - pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(std::move(line));
+            if (eol == std::string::npos) break;
+            pos = eol + 1;
+        }
+        return lines;
+    };
+
+    const auto lines = split_lines(master);
+
+    // --- Pass 1: pick the STREAM-INF and remember its AUDIO group.
+    std::string audio_group;
+    std::size_t stream_inf_idx = std::string::npos;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].compare(0, 18, "#EXT-X-STREAM-INF:") == 0) {
+            stream_inf_idx = i;
+            audio_group = quoted(lines[i], "AUDIO=");
+            break;
+        }
+    }
+
+    // --- Pass 2: rebuild.
+    //   - Keep all header tags not of interest as-is.
+    //   - For #EXT-X-MEDIA:TYPE=AUDIO: keep only entries whose
+    //     GROUP-ID matches audio_group. Within that group, prefer
+    //     the one with DEFAULT=YES, else AUTOSELECT=YES, else the
+    //     first one seen.
+    //   - For #EXT-X-MEDIA:TYPE!=AUDIO (e.g. SUBTITLES, CLOSED-
+    //     CAPTIONS): keep the first per TYPE so captions still work.
+    //   - For #EXT-X-STREAM-INF: keep only the first one + its URI.
+    std::string out;
+    out.reserve(master.size());
+
+    // Preselect the single audio rendition.
+    std::size_t chosen_audio = std::string::npos;
+    {
+        std::size_t default_idx = std::string::npos;
+        std::size_t autoselect_idx = std::string::npos;
+        std::size_t first_idx = std::string::npos;
+        for (std::size_t i = 0; i < lines.size(); ++i) {
+            const auto& l = lines[i];
+            if (l.compare(0, 13, "#EXT-X-MEDIA:") != 0) continue;
+            if (bare_attr(l, "TYPE=") != "AUDIO") continue;
+            if (!audio_group.empty() &&
+                quoted(l, "GROUP-ID=") != audio_group) continue;
+            if (first_idx == std::string::npos) first_idx = i;
+            if (quoted(l, "DEFAULT=") == "YES" &&
+                default_idx == std::string::npos) default_idx = i;
+            if (quoted(l, "AUTOSELECT=") == "YES" &&
+                autoselect_idx == std::string::npos) autoselect_idx = i;
+        }
+        if      (default_idx    != std::string::npos) chosen_audio = default_idx;
+        else if (autoselect_idx != std::string::npos) chosen_audio = autoselect_idx;
+        else                                          chosen_audio = first_idx;
+    }
+
+    // Preselect a single non-AUDIO MEDIA entry per TYPE (first seen).
+    std::vector<std::string> kept_nonaudio_types;
+
+    bool emitted_stream_inf = false;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const auto& l = lines[i];
+
+        if (l.compare(0, 13, "#EXT-X-MEDIA:") == 0) {
+            const std::string type = bare_attr(l, "TYPE=");
+            if (type == "AUDIO") {
+                if (i == chosen_audio) { out.append(l); out.push_back('\n'); }
+                continue;
+            }
+            if (std::find(kept_nonaudio_types.begin(),
+                          kept_nonaudio_types.end(), type)
+                == kept_nonaudio_types.end()) {
+                kept_nonaudio_types.push_back(type);
+                out.append(l); out.push_back('\n');
+            }
+            continue;
+        }
+        if (l.compare(0, 18, "#EXT-X-STREAM-INF:") == 0) {
+            if (emitted_stream_inf) {
+                // skip this stream-inf + its URI
+                if (i + 1 < lines.size()) ++i;
+                continue;
+            }
+            emitted_stream_inf = true;
+            out.append(l); out.push_back('\n');
+            if (i + 1 < lines.size()) {
+                out.append(lines[i + 1]);
+                out.push_back('\n');
+                ++i;
+            }
+            continue;
+        }
+        // All other tags / blank lines / URI lines: emit as-is.
+        out.append(l);
+        if (i + 1 < lines.size()) out.push_back('\n');
+    }
+    (void)stream_inf_idx;
+    return out;
+}
+
 std::vector<std::string> extract_media_uris(const std::string& master) {
     constexpr const char* kPrefix = "mlhls://localhost/";
     constexpr const char* kSuffix = ".m3u8";

@@ -13,6 +13,9 @@ extern "C" {
 #include <libavutil/error.h>
 }
 
+#include <atomic>
+#include <chrono>
+
 namespace ap::airplay {
 
 bool HlsLocalServer::start(uint16_t port) {
@@ -191,11 +194,16 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
                  << cdn_url.substr(0, std::min<std::size_t>(120, cdn_url.size()))
                  << (cdn_url.size() > 120 ? "..." : "");
 
+        // Concurrency gauge — high concurrency means FFmpeg is still
+        // probing too many itags or sending many range requests.
+        static std::atomic<int> kInFlight{0};
+        const int in_flight = kInFlight.fetch_add(1) + 1;
+        const auto t_start = std::chrono::steady_clock::now();
+
         AVDictionary* opts = nullptr;
         if (range_start >= 0) {
             av_dict_set_int(&opts, "offset", range_start, 0);
             if (range_end >= 0) {
-                // libavio's end_offset is exclusive.
                 av_dict_set_int(&opts, "end_offset", range_end + 1, 0);
             }
         }
@@ -204,6 +212,7 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
                                   AVIO_FLAG_READ, nullptr, &opts);
         av_dict_free(&opts);
         if (rc < 0) {
+            kInFlight.fetch_sub(1);
             char err[128]{};
             av_strerror(rc, err, sizeof(err));
             LOG_WARN << "seg proxy: avio_open2 failed: " << err;
@@ -212,6 +221,9 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
             return;
         }
         const int64_t size = avio_size(avio);
+        const auto t_opened = std::chrono::steady_clock::now();
+        const auto open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            t_opened - t_start).count();
 
         std::string hdr;
         if (range_start >= 0) {
@@ -248,9 +260,15 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
 
         unsigned char buf[16 * 1024];
         std::int64_t total = 0;
+        std::chrono::steady_clock::time_point t_first_byte{};
+        bool got_first_byte = false;
         while (true) {
             const int n = avio_read(avio, buf, sizeof(buf));
             if (n <= 0) break;
+            if (!got_first_byte) {
+                t_first_byte = std::chrono::steady_clock::now();
+                got_first_byte = true;
+            }
             total += n;
             if (size > 0) {
                 if (ap::net::send_all(client.fd,
@@ -269,9 +287,26 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
             ap::net::send_all(client.fd, "0\r\n\r\n", 5);
         }
         avio_close(avio);
+        const auto t_done = std::chrono::steady_clock::now();
+        const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            t_done - t_start).count();
+        const auto ttfb_ms = got_first_byte
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                t_first_byte - t_start).count()
+            : total_ms;
+        const double mbps = total_ms > 0
+            ? (static_cast<double>(total) * 8.0 / 1000.0 / total_ms)
+            : 0.0;
         LOG_INFO << "HLS GET " << path << " proxy done ("
-                 << total << "B streamed, "
-                 << (range_start >= 0 ? "206" : "200") << ')';
+                 << (range_start >= 0 ? "206" : "200") << " "
+                 << total << "B, open=" << open_ms << "ms"
+                 << " ttfb=" << ttfb_ms << "ms"
+                 << " total=" << total_ms << "ms"
+                 << " " << mbps << "Mbps"
+                 << " concurrent=" << in_flight
+                 << (range_start >= 0 ? " range=yes" : " range=no")
+                 << ')';
+        kInFlight.fetch_sub(1);
         ap::net::close_socket(client.fd);
         return;
     }
@@ -289,10 +324,6 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
         bool cached = HlsSessionRegistry::instance().lookup_playlist(
             mlhls_url, body, is_master);
         if (!cached) {
-            // iOS pre-delivers only a subset of the child playlists
-            // listed in the master (the itags it would actually
-            // select). For the rest we FCUP on demand, same pattern
-            // as segments.
             if (!HlsSessionRegistry::instance().fetch_playlist(
                     mlhls_url, body)) {
                 LOG_WARN << "HLS GET " << path << " -> 504 (playlist fetch failed)";
@@ -302,10 +333,20 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
             }
         }
         body = rewrite_urls(body);
+        // Master playlist: strip all-but-first variant so FFmpeg picks
+        // one rendition and stops probing 16 itags. Media playlists
+        // already hold the localised /seg/ URLs — serve as-is.
+        const std::size_t before = body.size();
+        if (is_master) {
+            body = filter_master_to_single_variant(body);
+        }
         LOG_INFO << "HLS GET " << path
                  << (is_master ? " (master" : " (media")
                  << (cached ? "" : ", fetched")
-                 << ") -> " << body.size() << 'B';
+                 << ") -> " << body.size() << 'B'
+                 << (is_master && body.size() != before
+                         ? " (filtered from " + std::to_string(before) + "B)"
+                         : std::string{});
         send_response(200, "OK", body,
                       "application/vnd.apple.mpegurl");
         ap::net::close_socket(client.fd);

@@ -29,21 +29,23 @@ void HlsPlayer::run(std::string url) {
 
     AVFormatContext* fmt = nullptr;
     AVDictionary*    opts = nullptr;
-    // Lower the probe size: the local HTTP server only has the master
-    // manifest ready at start, and iOS-mediated segment fetches take
-    // 200-500 ms each. A large probe would stall before the first
-    // packet. 256 KB / 3 s matches typical HLS fragment sizes.
-    av_dict_set(&opts, "probesize",   "262144", 0);
-    av_dict_set(&opts, "analyzeduration", "3000000", 0);
+    // Trim probe + analyze to the minimum FFmpeg tolerates for HLS.
+    // 128 KB / 500 ms is enough to see one segment, and gives us the
+    // first frame much sooner than the defaults.
+    av_dict_set(&opts, "probesize",        "131072", 0);
+    av_dict_set(&opts, "analyzeduration",  "500000", 0);
+    // Low-latency playback options. nobuffer + low_delay + max_delay=0
+    // tell the demuxer/decoder to prefer "emit now" over "smooth".
+    // discardcorrupt hides the few lost TS packets typical of an HLS
+    // segment boundary so they don't jam the timeline.
+    av_dict_set(&opts, "fflags",           "nobuffer+discardcorrupt", 0);
+    av_dict_set(&opts, "flags",            "low_delay", 0);
+    av_dict_set(&opts, "max_delay",        "0", 0);
+    av_dict_set(&opts, "reconnect",        "1", 0);
+    av_dict_set(&opts, "reconnect_streamed","1", 0);
     // YouTube HLS segment URLs end with "/<index>" or query params, no
-    // .ts/.m4s extension. FFmpeg's HLS demuxer maintains a whitelist
-    // of allowed extensions ("allowed_segment_extensions") and rejects
-    // these URLs with "parse_playlist error". Two bypasses (different
-    // FFmpeg versions expose different option names):
-    //   - extension_picky=0 (newer FFmpeg 6.0+)
-    //   - allowed_extensions=ALL (older but still supported)
-    // Setting both is safe — unknown options are silently ignored.
-    av_dict_set(&opts, "extension_picky",   "0",   0);
+    // .ts/.m4s extension. Bypass FFmpeg's whitelist check.
+    av_dict_set(&opts, "extension_picky",    "0",   0);
     av_dict_set(&opts, "allowed_extensions", "ALL", 0);
     const int open_rc = avformat_open_input(&fmt, url.c_str(), nullptr, &opts);
     av_dict_free(&opts);
