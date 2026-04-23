@@ -43,7 +43,11 @@ ap::airplay::DeviceContext build_device_context() {
     ctx.deviceid = ap::net::primary_mac();
     ctx.model    = "AppleTV3,2";
     ctx.pi       = "b08f5a79-db29-4384-b456-a4784d9e6055";
-    ctx.features = "0x5A7FFFF7,0x1E";
+    // Feature bitmap advertised in mDNS TXT + /info. UxPlay's exact value
+    // (bit 27 "legacy pairing" ON) — iOS gates the AirPlay Streaming path
+    // on this matching a known-good AppleTV fingerprint, so aligning
+    // with UxPlay's proven value unlocks YouTube's POST /play.
+    ctx.features = "0x5A7FFEE6,0x0";
     ctx.srcvers  = "220.68";
     return ctx;
 }

@@ -116,11 +116,11 @@ struct MdnsService::Impl {
         airplay.host_name     = local_host;
         airplay.instance_name = widen(ctx.name) + L"._airplay._tcp.local";
         airplay.keys          = { L"deviceid", L"features", L"flags", L"model",
-                                  L"pi", L"srcvers", L"vv" };
+                                  L"pi", L"pw", L"srcvers", L"vv" };
         airplay.values        = { widen(ctx.deviceid), widen(ctx.features),
                                   L"0x4",             widen(ctx.model),
-                                  widen(ctx.pi),      widen(ctx.srcvers),
-                                  L"2" };
+                                  widen(ctx.pi),      L"false",
+                                  widen(ctx.srcvers), L"2" };
         if (!register_service(airplay, port)) return false;
 
         // ---- _raop._tcp -----------------------------------------------------

@@ -95,7 +95,7 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
     set_str (root, "pi",            ctx.pi);
     set_str (root, "sourceVersion", ctx.srcvers);
     set_uint(root, "features",      parse_features(ctx.features));
-    set_uint(root, "statusFlags",   4);
+    set_uint(root, "statusFlags",   68);   // UxPlay default (bits 2+6 set)
     set_uint(root, "vv",            2);
     set_bool(root, "keepAliveLowPower",        true);
     set_bool(root, "keepAliveSendStatsAsBody", true);
