@@ -112,15 +112,29 @@ struct MdnsService::Impl {
         }
         std::wstring local_host = std::wstring(host) + L".local";
 
+        // Hex-encode the Ed25519 public key for the `pk` TXT value (64
+        // chars for 32 bytes). iOS uses it to match the receiver
+        // advertised over mDNS with the one it later pair-verifies.
+        std::wstring pk_hex;
+        {
+            static const wchar_t* hexd = L"0123456789abcdef";
+            pk_hex.reserve(ctx.public_key.size() * 2);
+            for (unsigned char b : ctx.public_key) {
+                pk_hex.push_back(hexd[b >> 4]);
+                pk_hex.push_back(hexd[b & 0x0f]);
+            }
+        }
+
         // ---- _airplay._tcp --------------------------------------------------
         airplay.host_name     = local_host;
         airplay.instance_name = widen(ctx.name) + L"._airplay._tcp.local";
         airplay.keys          = { L"deviceid", L"features", L"flags", L"model",
-                                  L"pi", L"pw", L"srcvers", L"vv" };
+                                  L"pi", L"pk", L"pw", L"srcvers", L"vv" };
         airplay.values        = { widen(ctx.deviceid), widen(ctx.features),
                                   L"0x4",             widen(ctx.model),
-                                  widen(ctx.pi),      L"false",
-                                  widen(ctx.srcvers), L"2" };
+                                  widen(ctx.pi),      pk_hex,
+                                  L"false",           widen(ctx.srcvers),
+                                  L"2" };
         if (!register_service(airplay, port)) return false;
 
         // ---- _raop._tcp -----------------------------------------------------
@@ -131,14 +145,20 @@ struct MdnsService::Impl {
 
         raop.host_name     = local_host;
         raop.instance_name = widen(raop_name) + L"._raop._tcp.local";
-        raop.keys          = { L"cn", L"da",  L"et", L"ft", L"md", L"am",
-                               L"sf", L"tp",  L"vn", L"vs", L"vv", L"pi" };
-        raop.values        = { L"0,1,2,3",           L"true",
-                               L"0,3,5",             widen(ctx.features),
-                               L"0,1,2",             widen(ctx.model),
-                               L"0x4",               L"UDP",
-                               L"65537",             widen(ctx.srcvers),
-                               L"2",                 widen(ctx.pi) };
+        raop.keys          = { L"txtvers", L"ch",  L"cn",  L"da", L"et",
+                               L"ft",      L"md",  L"am",  L"rhd", L"pk",
+                               L"pw",      L"sf",  L"sr",  L"ss",  L"sv",
+                               L"tp",      L"vn",  L"vs",  L"vv" };
+        raop.values        = { L"1",                L"2",
+                               L"0,1,2,3",          L"true",
+                               L"0,3,5",            widen(ctx.features),
+                               L"0,1,2",            widen(ctx.model),
+                               L"5.6.0.0",          pk_hex,
+                               L"false",            L"0x4",
+                               L"44100",            L"16",
+                               L"false",            L"UDP",
+                               L"65537",            widen(ctx.srcvers),
+                               L"2" };
         if (!register_service(raop, port)) {
             LOG_WARN << "_raop._tcp registration failed; mirroring may still be offered";
         }
