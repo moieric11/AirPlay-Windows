@@ -8,43 +8,52 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
+#include <atomic>
 #include <cstring>
+#include <string>
+#include <thread>
+
+// libavformat-backed HlsPlayer. Default backend; the GStreamer
+// variant lives in hls_player_gstreamer.cpp and is selected with
+// USE_GSTREAMER_HLS=ON at CMake time.
 
 namespace ap::video {
 
+struct HlsPlayer::Impl {
+    std::atomic<bool> running{false};
+    std::thread       thread;
+    VideoRenderer*    renderer = nullptr;
+
+    void run(std::string url);
+};
+
+HlsPlayer::HlsPlayer()  : impl_(new Impl) {}
+HlsPlayer::~HlsPlayer() { stop(); delete impl_; }
+
 bool HlsPlayer::start(const std::string& url, VideoRenderer* renderer) {
-    if (running_.exchange(true)) return false;
-    renderer_ = renderer;
-    thread_   = std::thread(&HlsPlayer::run, this, url);
+    if (impl_->running.exchange(true)) return false;
+    impl_->renderer = renderer;
+    impl_->thread   = std::thread([this, url] { impl_->run(url); });
     return true;
 }
 
 void HlsPlayer::stop() {
-    if (!running_.exchange(false)) return;
-    if (thread_.joinable()) thread_.join();
+    if (!impl_->running.exchange(false)) return;
+    if (impl_->thread.joinable()) impl_->thread.join();
 }
 
-void HlsPlayer::run(std::string url) {
+void HlsPlayer::Impl::run(std::string url) {
     LOG_INFO << "HlsPlayer open " << url;
 
     AVFormatContext* fmt = nullptr;
     AVDictionary*    opts = nullptr;
-    // Trim probe + analyze to the minimum FFmpeg tolerates for HLS.
-    // 128 KB / 500 ms is enough to see one segment, and gives us the
-    // first frame much sooner than the defaults.
     av_dict_set(&opts, "probesize",        "131072", 0);
     av_dict_set(&opts, "analyzeduration",  "500000", 0);
-    // Low-latency playback options. nobuffer + low_delay + max_delay=0
-    // tell the demuxer/decoder to prefer "emit now" over "smooth".
-    // discardcorrupt hides the few lost TS packets typical of an HLS
-    // segment boundary so they don't jam the timeline.
     av_dict_set(&opts, "fflags",           "nobuffer+discardcorrupt", 0);
     av_dict_set(&opts, "flags",            "low_delay", 0);
     av_dict_set(&opts, "max_delay",        "0", 0);
     av_dict_set(&opts, "reconnect",        "1", 0);
     av_dict_set(&opts, "reconnect_streamed","1", 0);
-    // YouTube HLS segment URLs end with "/<index>" or query params, no
-    // .ts/.m4s extension. Bypass FFmpeg's whitelist check.
     av_dict_set(&opts, "extension_picky",    "0",   0);
     av_dict_set(&opts, "allowed_extensions", "ALL", 0);
     const int open_rc = avformat_open_input(&fmt, url.c_str(), nullptr, &opts);
@@ -53,14 +62,14 @@ void HlsPlayer::run(std::string url) {
         char errbuf[128] = {0};
         av_strerror(open_rc, errbuf, sizeof(errbuf));
         LOG_ERROR << "HlsPlayer avformat_open_input failed: " << errbuf;
-        running_ = false;
+        running = false;
         return;
     }
 
     if (avformat_find_stream_info(fmt, nullptr) < 0) {
         LOG_ERROR << "HlsPlayer avformat_find_stream_info failed";
         avformat_close_input(&fmt);
-        running_ = false;
+        running = false;
         return;
     }
 
@@ -74,7 +83,7 @@ void HlsPlayer::run(std::string url) {
     if (video_idx < 0) {
         LOG_ERROR << "HlsPlayer: no video stream in " << url;
         avformat_close_input(&fmt);
-        running_ = false;
+        running = false;
         return;
     }
 
@@ -83,7 +92,7 @@ void HlsPlayer::run(std::string url) {
     if (!codec) {
         LOG_ERROR << "HlsPlayer: no decoder for codec_id " << par->codec_id;
         avformat_close_input(&fmt);
-        running_ = false;
+        running = false;
         return;
     }
     AVCodecContext* dec = avcodec_alloc_context3(codec);
@@ -92,7 +101,7 @@ void HlsPlayer::run(std::string url) {
         LOG_ERROR << "HlsPlayer: video decoder init failed";
         if (dec) avcodec_free_context(&dec);
         avformat_close_input(&fmt);
-        running_ = false;
+        running = false;
         return;
     }
     LOG_INFO << "HlsPlayer video: " << avcodec_get_name(par->codec_id)
@@ -101,7 +110,7 @@ void HlsPlayer::run(std::string url) {
     AVPacket* pkt = av_packet_alloc();
     AVFrame*  frm = av_frame_alloc();
 
-    while (running_.load()) {
+    while (running.load()) {
         const int read_rc = av_read_frame(fmt, pkt);
         if (read_rc == AVERROR_EOF) {
             LOG_INFO << "HlsPlayer: EOF";
@@ -122,15 +131,15 @@ void HlsPlayer::run(std::string url) {
             continue;
         }
         av_packet_unref(pkt);
-        while (running_.load()) {
+        while (running.load()) {
             const int recv_rc = avcodec_receive_frame(dec, frm);
             if (recv_rc == AVERROR(EAGAIN) || recv_rc == AVERROR_EOF) break;
             if (recv_rc < 0) break;
-            if (renderer_ && frm->width > 0 && frm->height > 0) {
-                renderer_->push_frame(frm->data[0], frm->linesize[0],
-                                      frm->data[1], frm->linesize[1],
-                                      frm->data[2], frm->linesize[2],
-                                      frm->width, frm->height);
+            if (renderer && frm->width > 0 && frm->height > 0) {
+                renderer->push_frame(frm->data[0], frm->linesize[0],
+                                     frm->data[1], frm->linesize[1],
+                                     frm->data[2], frm->linesize[2],
+                                     frm->width, frm->height);
             }
             av_frame_unref(frm);
         }

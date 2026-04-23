@@ -137,6 +137,33 @@ if(NOT SDL2_TTF_TARGET)
         "  Linux:   apt install libsdl2-ttf-dev")
 endif()
 
+# ---- GStreamer (optional, HLS playback backend) -------------------------------
+# Default HLS backend is libavformat (single-file, cross-platform). Enable
+# USE_GSTREAMER_HLS to swap for the GStreamer backend (hls_player_gstreamer.cpp),
+# which handles HLS live-edge buffering, variant switching and codec muxing
+# more gracefully than raw libavformat — at the cost of another runtime dep
+# (libgstreamer-1.0 + gst-plugins-{base,good,bad} + gst-libav).
+option(USE_GSTREAMER_HLS "Use GStreamer for HLS playback (instead of libavformat)" OFF)
+set(HLS_PLAYER_SRC src/video/hls_player.cpp)
+if(USE_GSTREAMER_HLS)
+    if(NOT PkgConfig_FOUND)
+        message(FATAL_ERROR "USE_GSTREAMER_HLS=ON requires pkg-config")
+    endif()
+    pkg_check_modules(GSTREAMER IMPORTED_TARGET
+        gstreamer-1.0 gstreamer-app-1.0)
+    if(NOT GSTREAMER_FOUND)
+        message(FATAL_ERROR
+            "USE_GSTREAMER_HLS=ON but gstreamer-1.0/gstreamer-app-1.0 not found.\n"
+            "  Linux:   apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev\n"
+            "                       libgstreamer-plugins-bad1.0-dev gstreamer1.0-libav\n"
+            "                       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad")
+    endif()
+    message(STATUS "HLS backend: GStreamer (${GSTREAMER_VERSION})")
+    set(HLS_PLAYER_SRC src/video/hls_player_gstreamer.cpp)
+else()
+    message(STATUS "HLS backend: libavformat (default; -DUSE_GSTREAMER_HLS=ON for GStreamer)")
+endif()
+
 # ---- Sources ------------------------------------------------------------------
 add_executable(airplay-windows
     src/main.cpp
@@ -165,7 +192,7 @@ add_executable(airplay-windows
     src/airplay/reverse_channel.cpp
     src/airplay/routes.cpp
     src/video/h264_decoder.cpp
-    src/video/hls_player.cpp
+    ${HLS_PLAYER_SRC}
     src/video/video_renderer.cpp
     src/audio/audio_receiver.cpp
     src/audio/aac_decoder.cpp
@@ -174,6 +201,10 @@ add_executable(airplay-windows
 
 target_include_directories(airplay-windows PRIVATE src)
 target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET} ${SDL2_TTF_TARGET})
+if(USE_GSTREAMER_HLS AND GSTREAMER_FOUND)
+    target_link_libraries(airplay-windows PRIVATE PkgConfig::GSTREAMER)
+    target_compile_definitions(airplay-windows PRIVATE HAVE_GSTREAMER_HLS=1)
+endif()
 if(DEFINED FFMPEG_INCLUDE_DIRS_OK)
     target_include_directories(airplay-windows PRIVATE ${FFMPEG_INCLUDE_DIRS_OK})
 endif()

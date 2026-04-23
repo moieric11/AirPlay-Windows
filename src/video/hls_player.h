@@ -1,41 +1,39 @@
 #pragma once
 
-#include <atomic>
+#include <memory>
 #include <string>
-#include <thread>
 
 namespace ap::video {
 
 class VideoRenderer;
 
 // Internal media player for the AirPlay Streaming HLS path. Opens
-// `http://localhost:7100/master.m3u8` (served by HlsLocalServer),
-// demuxes with libavformat, decodes H.264 video with libavcodec, and
-// pushes YUV420P frames into the VideoRenderer.
+// `http://localhost:7100/master.m3u8` served by HlsLocalServer and
+// pushes decoded YUV420P frames into the VideoRenderer.
 //
-// A separate thread runs the read/decode loop. start() returns as
-// soon as the thread is spawned; the URL is fetched asynchronously.
-// stop() signals the thread to exit and joins. The player is
-// single-shot — create a new instance per iPhone /play call.
+// Two interchangeable backends, selected at CMake time:
+//   - hls_player.cpp            (libavformat, default)
+//   - hls_player_gstreamer.cpp  (USE_GSTREAMER_HLS=ON)
+// Both expose the same class interface below.
+//
+// start() is non-blocking; the player runs its own thread(s) and
+// pushes frames as they become available. stop() tears everything
+// down and joins. The player is single-shot — create a new instance
+// per iPhone /play call.
 class HlsPlayer {
 public:
-    HlsPlayer() = default;
-    ~HlsPlayer() { stop(); }
+    HlsPlayer();
+    ~HlsPlayer();
 
     HlsPlayer(const HlsPlayer&)            = delete;
     HlsPlayer& operator=(const HlsPlayer&) = delete;
 
-    // Non-blocking. Returns false if the thread couldn't be spawned.
-    // `renderer` is non-owning and must outlive the player.
     bool start(const std::string& url, VideoRenderer* renderer);
     void stop();
 
 private:
-    void run(std::string url);
-
-    std::atomic<bool> running_{false};
-    std::thread       thread_;
-    VideoRenderer*    renderer_{nullptr};
+    struct Impl;
+    Impl* impl_{nullptr};
 };
 
 } // namespace ap::video
