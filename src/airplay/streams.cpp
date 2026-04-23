@@ -199,6 +199,7 @@ bool StreamSession::setup_stream(int type,
         ac.aes_iv      = opts.aes_iv;
         ac.ct          = opts.ct;
         ac.sample_rate = opts.sample_rate;
+        ac.renderer    = renderer_;
         if (!audio_->start(std::move(ac))) {
             LOG_WARN << "SETUP stream 96: AudioReceiver failed to start "
                         "(UDP socket left bound, no decrypt)";

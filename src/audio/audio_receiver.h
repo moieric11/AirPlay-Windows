@@ -15,6 +15,8 @@
 struct evp_cipher_ctx_st;
 typedef struct evp_cipher_ctx_st EVP_CIPHER_CTX;
 
+namespace ap::video { class VideoRenderer; }
+
 namespace ap::audio {
 
 // UDP audio receiver for the AirPlay RAOP stream (type 96).
@@ -43,6 +45,13 @@ public:
         std::vector<unsigned char>  aes_iv;                    // 16 B
         int                         ct          = 0;           // compression type
         int                         sample_rate = 44100;
+        // Non-owning. When set, the receiver acts as a play/pause
+        // watchdog: it pushes rate 1 on any RTP packet and rate 0 after
+        // ~500 ms of silence. Apple Music and many iOS apps signal
+        // pause solely by stopping the RTP flow — no RTSP verb or
+        // text/parameters rate: update is sent — so this is the only
+        // reliable way to drive the UI pause state.
+        ap::video::VideoRenderer*   renderer    = nullptr;
     };
 
     AudioReceiver();

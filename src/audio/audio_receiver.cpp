@@ -1,6 +1,8 @@
 #include "audio/audio_receiver.h"
 #include "log.h"
+#include "video/video_renderer.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -156,15 +158,42 @@ void AudioReceiver::thread_fn() {
     // bitset via a boolean vector (8 KB).
     std::vector<bool> seen_seq(65536, false);
 
+    // Silence watchdog: many iOS apps (Apple Music in particular) signal
+    // pause solely by stopping the RTP flow. Track when we last saw a
+    // valid packet; if we go idle for more than kSilencePauseMs, flip
+    // the renderer to "paused". Any incoming packet flips us back to
+    // "playing". We assume not-yet-started = playing so the first
+    // packet doesn't show a spurious PAUSED -> PLAYING transition.
+    constexpr int kSilencePauseMs = 500;
+    auto last_packet = std::chrono::steady_clock::now();
+    bool watchdog_paused = false;
+
     while (running_.load()) {
         int n = ::recvfrom(cfg_.data_sock,
                            reinterpret_cast<char*>(buf), sizeof(buf), 0,
                            nullptr, nullptr);
         if (n < 0) {
-            // Timeout or shutdown; loop back to check running_.
+            // recv timed out (or shutdown). If we've been idle long
+            // enough, flip the renderer to paused.
+            if (!watchdog_paused && cfg_.renderer) {
+                const auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - last_packet).count();
+                if (idle >= kSilencePauseMs) {
+                    cfg_.renderer->push_playback_rate(0.0f);
+                    watchdog_paused = true;
+                }
+            }
             continue;
         }
         if (n < 12) continue;   // RTP header minimum
+
+        // Packet arrived: reset the silence timer and, if we were paused,
+        // flip back to playing.
+        last_packet = std::chrono::steady_clock::now();
+        if (watchdog_paused && cfg_.renderer) {
+            cfg_.renderer->push_playback_rate(1.0f);
+            watchdog_paused = false;
+        }
 
         // Parse RTP header (RFC 3550, 12-byte fixed part).
         const uint8_t  pt  =  buf[1] & 0x7f;
