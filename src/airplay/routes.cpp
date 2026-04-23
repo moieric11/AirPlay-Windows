@@ -3,6 +3,7 @@
 #include "airplay/client_session.h"
 #include "airplay/daap.h"
 #include "airplay/fcup.h"
+#include "airplay/hls_session.h"
 #include "airplay/info_plist.h"
 #include "airplay/reverse_channel.h"
 #include "airplay/sdp.h"
@@ -808,6 +809,12 @@ Response handle_play(ClientSession& session, const Request& req) {
                  << pr.session_id << "; cannot send FCUP Request";
         return r;
     }
+    // Remember master URL on the HLS session so handle_action can tell
+    // "master" from "media" playlists by URL comparison.
+    auto* hls = HlsSessionRegistry::instance().get_or_create(pr.session_id);
+    hls->master_url      = pr.url;
+    hls->next_request_id = 2;   // 1 is reserved for the master we're about to request
+
     if (!send_fcup_request(reverse_fd, pr.url, pr.session_id, /*request_id*/ 1)) {
         LOG_WARN << "POST /play: FCUP Request send failed";
     } else {
@@ -883,19 +890,46 @@ Response handle_action(ClientSession& session, const Request& req) {
 
     LOG_INFO << "POST /action FCUP response url=" << url
              << "  playlist=" << playlist.size() << "B";
-    // Log the first line of the playlist for sanity.
-    const auto nl = playlist.find('\n');
-    const std::string first_line = playlist.substr(
-        0, std::min<std::size_t>(nl == std::string::npos ? playlist.size() : nl,
-                                 120));
-    LOG_INFO << "         first_line=\"" << first_line << '"';
 
-    // TODO next commit: if url ends with /master.m3u8, parse the M3U8,
-    // extract the child mlhls:// URIs, and send a cascade of FCUP
-    // requests (one per child) so we end up with every media playlist
-    // the master references. Then kick off the local HTTP server +
-    // FFmpeg player.
-    (void)sid;
+    auto* hls = HlsSessionRegistry::instance().find(sid);
+    if (!hls) {
+        LOG_WARN << "POST /action: no HLS session for " << sid;
+        plist_free(root);
+        return r;
+    }
+
+    const bool is_master = (!hls->master_url.empty() && url == hls->master_url);
+    if (is_master) {
+        hls->master_playlist = playlist;
+        hls->media_uris      = extract_media_uris(playlist);
+        LOG_INFO << "POST /action: master playlist stored ("
+                 << hls->media_uris.size() << " child URIs)";
+        for (std::size_t i = 0; i < hls->media_uris.size(); ++i) {
+            LOG_INFO << "         [" << i << "] " << hls->media_uris[i];
+        }
+
+        // Cascade: ask iOS for every child media playlist.
+        const int reverse_fd =
+            ReverseChannelRegistry::instance().socket_for(sid);
+        if (reverse_fd < 0) {
+            LOG_WARN << "POST /action: no /reverse socket to cascade FCUP";
+        } else {
+            for (const auto& child : hls->media_uris) {
+                const int rid = hls->next_request_id++;
+                if (!send_fcup_request(reverse_fd, child, sid, rid)) {
+                    LOG_WARN << "POST /action: FCUP send failed for " << child;
+                }
+            }
+        }
+    } else {
+        // Media (child) playlist — store by its URL so the local HLS
+        // server can serve it when the player asks.
+        hls->media_playlists[url] = playlist;
+        LOG_INFO << "POST /action: media playlist stored "
+                 << hls->media_playlists.size() << '/'
+                 << hls->media_uris.size() << " (" << playlist.size() << "B)";
+    }
+
     (void)session;
     plist_free(root);
 #endif
