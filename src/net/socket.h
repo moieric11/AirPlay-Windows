@@ -35,6 +35,12 @@ int send_all(socket_t s, const void* buf, int len);
 // Returns the first non-loopback IPv4 address as a string, or "0.0.0.0".
 std::string primary_ipv4();
 
+// Returns the first non-loopback, non-link-local IPv6 address of the
+// same interface as primary_ipv4(), or an empty string if none is
+// configured. iOS 14+ sometimes prefers v6 on the _airplay._tcp
+// discovery and we need to know we're reachable that way.
+std::string primary_ipv6();
+
 // Returns a MAC-like 6-byte device id as uppercase "AA:BB:CC:DD:EE:FF".
 // AirPlay uses this as the `deviceid` field in the mDNS TXT record and as
 // part of the service name. We derive it from the first usable NIC MAC.

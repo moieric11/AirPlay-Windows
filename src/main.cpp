@@ -85,8 +85,12 @@ int main() {
     LOG_INFO << "=== AirPlay-Windows skeleton ===";
     LOG_INFO << "name="     << ctx.name;
     LOG_INFO << "deviceid=" << ctx.deviceid;
-    const std::string local_ip = ap::net::primary_ipv4();
+    const std::string local_ip   = ap::net::primary_ipv4();
+    const std::string local_ipv6 = ap::net::primary_ipv6();
     LOG_INFO << "ip="       << local_ip;
+    if (!local_ipv6.empty()) {
+        LOG_INFO << "ipv6="  << local_ipv6;
+    }
     LOG_INFO << "pk(Ed25519)=" << ctx.public_key.size() << " bytes";
 
     // Start the SDL2 renderer window upfront. Streams will push decoded

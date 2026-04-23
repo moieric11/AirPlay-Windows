@@ -125,7 +125,45 @@ std::string primary_ipv4_via_route() {
     close_socket(s);
     return result;
 }
+
+// Same trick over IPv6: UDP-connect to Google Public DNS v6 and read
+// back the local address the OS route table chose. Skip link-local
+// (fe80::) — iOS needs a globally-routable address to connect back to.
+std::string primary_ipv6_via_route() {
+    socket_t s = ::socket(AF_INET6, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCK) return {};
+
+    sockaddr_in6 peer{};
+    peer.sin6_family = AF_INET6;
+    peer.sin6_port   = htons(53);
+    inet_pton(AF_INET6, "2001:4860:4860::8888", &peer.sin6_addr);
+
+    std::string result;
+    if (::connect(s, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) == 0) {
+        sockaddr_in6 local{};
+#if defined(_WIN32)
+        int len = sizeof(local);
+#else
+        socklen_t len = sizeof(local);
+#endif
+        if (::getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) {
+            char buf[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, &local.sin6_addr, buf, sizeof(buf));
+            // Skip link-local; unusable from outside our own subnet.
+            if (std::strncmp(buf, "fe80", 4) != 0 &&
+                std::strncmp(buf, "::",   2) != 0) {
+                result = buf;
+            }
+        }
+    }
+    close_socket(s);
+    return result;
+}
 } // namespace
+
+std::string primary_ipv6() {
+    return primary_ipv6_via_route();
+}
 
 #if defined(_WIN32)
 
