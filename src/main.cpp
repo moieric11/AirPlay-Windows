@@ -39,29 +39,34 @@ void signal_handler(int) { g_stop = true; }
 
 // Pick sensible defaults. The PI and feature bitmask are copied from RPiPlay's
 // defaults — known to pass the initial iOS detection phase.
-ap::airplay::DeviceContext build_device_context() {
+//
+// `hls_playback` gates the AirPlay Streaming HLS proxy path (bits 0+4 of
+// features low word). When it's off, iOS routes YouTube / Photos to the
+// audio fallback — the mirror + RAOP-audio pipeline that actually behaves
+// like AirPlay mirror (low-latency, native). When on, iOS hands us an
+// mlhls:// URL and we play back via libavformat — works but acts like a
+// VOD player (probing, buffering, occasional stutter), best treated as
+// an opt-in experimental path.
+ap::airplay::DeviceContext build_device_context(bool hls_playback) {
     ap::airplay::DeviceContext ctx;
     ctx.name     = "AirPlay-Windows";
     ctx.deviceid = ap::net::primary_mac();
     ctx.model    = "AppleTV3,2";
     ctx.pi       = "b08f5a79-db29-4384-b456-a4784d9e6055";
-    // Feature bitmap advertised in mDNS TXT + /info.
-    //   Low word 0x5A7FFEF7: UxPlay's default 0x5A7FFEE6 plus bit 0
-    //     (AirPlay video) and bit 4 (HLS) — iOS keys AirPlay Streaming
-    //     dispatch on these two, without them YouTube / Photos stay on
-    //     the audio fallback.
+    // Features:
+    //   0x5A7FFEE6 - UxPlay default (mirror + audio, no HLS/video push).
+    //   + bit 0    - AirPlay video supported  (enables AirPlay Streaming)
+    //   + bit 4    - HTTP live streaming (HLS) supported
     //   High word 0x400: bit 42 "Screen Multi Codec" = HEVC mirror.
-    //     H264Decoder auto-detects avcC vs hvcC in the SPS_PPS frame
-    //     and swaps libavcodec between H.264 and HEVC on the fly.
-    //     iPhone 7+ encodes HEVC; older devices fall back to H.264.
-    ctx.features = "0x5A7FFEF7,0x400";
+    ctx.features = hls_playback ? "0x5A7FFEF7,0x400"   // video+HLS+HEVC
+                                : "0x5A7FFEE6,0x400";  // HEVC mirror only
     ctx.srcvers  = "220.68";
     return ctx;
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (!ap::net::global_init()) {
         return 1;
     }
@@ -73,7 +78,30 @@ int main() {
     std::signal(SIGTERM, signal_handler);
 #endif
 
-    auto ctx = build_device_context();
+    // Default mode: native AirPlay (mirror for video, RAOP for audio).
+    // This matches UxPlay's "no --hls" behaviour — low-latency, reliable,
+    // but YouTube/Photos play audio-only with thumbnail. Opt-in HLS
+    // proxy for the rare cases where you want the video stream delivered
+    // via the signed-CDN path we built.
+    bool hls_playback = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--hls-proxy-playback" || arg == "--hls") {
+            hls_playback = true;
+        } else if (arg == "--help" || arg == "-h") {
+            std::puts("AirPlay-Windows [--hls-proxy-playback]\n"
+                      "  --hls-proxy-playback  advertise HLS capability so iOS\n"
+                      "                         hands video URLs to our proxy\n"
+                      "                         (experimental, VOD-style latency)");
+            ap::net::global_shutdown();
+            return 0;
+        }
+    }
+
+    auto ctx = build_device_context(hls_playback);
+    LOG_INFO << "AirPlay Streaming HLS path: "
+             << (hls_playback ? "ENABLED (--hls-proxy-playback)"
+                              : "disabled (mirror + RAOP audio only)");
 
     // Load (or create) the persistent Ed25519 identity. iOS caches receivers
     // by pk — keeping a stable keypair avoids re-pairing on every launch.
@@ -107,7 +135,7 @@ int main() {
     ctx.renderer = &renderer;
 
     ap::video::HlsPlayer hls_player;
-    ctx.hls_player = &hls_player;
+    if (hls_playback) ctx.hls_player = &hls_player;
 
     ap::airplay::Server server;
     if (!server.start(ctx, 7000)) {
@@ -117,16 +145,18 @@ int main() {
         return 1;
     }
 
-    // Local HTTP server that fronts the HLS session registry for an
-    // internal media player (see hls_local_server.h). Only used for
-    // YouTube-via-AirPlay-Streaming — harmless if that path never
-    // triggers, since nothing connects to it.
+    // Local HTTP proxy + libavformat player only when the HLS path is
+    // opted into. In the default (mirror + RAOP) mode nothing connects
+    // to them anyway, but skipping the bind avoids the port claim and
+    // keeps a clean log.
     ap::airplay::HlsLocalServer hls_server;
-    if (!hls_server.start(7100)) {
-        LOG_WARN << "HLS local server could not bind 7100 — YouTube "
-                    "AirPlay Streaming playback will not work";
+    if (hls_playback) {
+        if (!hls_server.start(7100)) {
+            LOG_WARN << "HLS local server could not bind 7100 — "
+                        "--hls-proxy-playback playback will not work";
+        }
+        ctx.hls_local_port = hls_server.port();
     }
-    ctx.hls_local_port = hls_server.port();
 
     ap::mdns::MdnsService mdns;
     if (!mdns.start(ctx, server.port())) {
