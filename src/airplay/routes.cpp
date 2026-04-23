@@ -405,14 +405,6 @@ Response handle_teardown(ClientSession& session, const Request& req) {
         session.streams.reset();
         session.sdp.reset();
     }
-
-    // On many iOS apps (including Apple Music) the user hitting pause
-    // triggers a full TEARDOWN of the RAOP session — audio packets flow
-    // right up to the TEARDOWN, so the silence watchdog can't see the
-    // pause. The resume path runs a fresh ANNOUNCE/SETUP/RECORD, and
-    // our RECORD handler already pushes rate=1. So flipping the
-    // renderer to paused here matches the real user intent.
-    if (session.renderer) session.renderer->push_playback_rate(0.0f);
     return r;
 }
 
