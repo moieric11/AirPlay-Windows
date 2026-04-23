@@ -35,6 +35,16 @@ void HlsPlayer::run(std::string url) {
     // packet. 256 KB / 3 s matches typical HLS fragment sizes.
     av_dict_set(&opts, "probesize",   "262144", 0);
     av_dict_set(&opts, "analyzeduration", "3000000", 0);
+    // YouTube HLS segment URLs end with "/<index>" or query params, no
+    // .ts/.m4s extension. FFmpeg's HLS demuxer maintains a whitelist
+    // of allowed extensions ("allowed_segment_extensions") and rejects
+    // these URLs with "parse_playlist error". Two bypasses (different
+    // FFmpeg versions expose different option names):
+    //   - extension_picky=0 (newer FFmpeg 6.0+)
+    //   - allowed_extensions=ALL (older but still supported)
+    // Setting both is safe — unknown options are silently ignored.
+    av_dict_set(&opts, "extension_picky",   "0",   0);
+    av_dict_set(&opts, "allowed_extensions", "ALL", 0);
     const int open_rc = avformat_open_input(&fmt, url.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     if (open_rc < 0 || !fmt) {
