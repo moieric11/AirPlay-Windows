@@ -921,13 +921,20 @@ Response handle_action(ClientSession& session, const Request& req) {
                 }
             }
         }
-    } else {
+    } else if (url.size() >= 5 &&
+               url.compare(url.size() - 5, 5, ".m3u8") == 0) {
         // Media (child) playlist — store by its URL so the local HLS
         // server can serve it when the player asks.
         hls->media_playlists[url] = playlist;
         LOG_INFO << "POST /action: media playlist stored "
                  << hls->media_playlists.size() << '/'
                  << hls->media_uris.size() << " (" << playlist.size() << "B)";
+    } else {
+        // A segment: hand the bytes to any HlsLocalServer thread
+        // blocking in fetch_segment().
+        LOG_INFO << "POST /action: segment " << url
+                 << " (" << playlist.size() << "B) — deliver";
+        HlsSessionRegistry::instance().deliver_segment(sid, url, playlist);
     }
 
     (void)session;

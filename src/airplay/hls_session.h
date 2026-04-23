@@ -1,5 +1,7 @@
 #pragma once
 
+#include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -16,11 +18,20 @@ namespace ap::airplay {
 // on /action, and the (future) local HLS HTTP server thread reads
 // them to serve the player. Mutex-protected.
 struct HlsSession {
+    std::string              session_id;        // X-Apple-Session-ID
     std::string              master_url;        // canonical master.m3u8 URL
     std::string              master_playlist;   // raw bytes (iOS-delivered)
     int                      next_request_id = 2;   // 1 was used for master
     std::vector<std::string> media_uris;        // mlhls://localhost/itag/..
     std::unordered_map<std::string, std::string> media_playlists; // url->content
+
+    // Segment data coordination: the local HTTP server, on a
+    // non-.m3u8 GET, sends a FCUP Request for the segment's mlhls://
+    // URL then waits here for handle_action to arrive on another
+    // thread and fill in the bytes.
+    std::mutex                                            seg_mtx;
+    std::condition_variable                               seg_cv;
+    std::unordered_map<std::string, std::string>          segment_data;
 };
 
 class HlsSessionRegistry {
@@ -45,11 +56,25 @@ public:
                          std::string& out_bytes,
                          bool& out_is_master) const;
 
+    // Fetch a segment (non-.m3u8) by sending a FCUP Request on the
+    // reverse socket for the session that last saw a /play, then
+    // blocking up to `timeout_ms` ms for iOS to ship bytes back via
+    // POST /action. Returns false on timeout or no-active-session.
+    bool fetch_segment(const std::string& url,
+                       std::string& out_bytes,
+                       int timeout_ms = 5000);
+
+    // Store segment bytes iOS delivered and wake any fetch_segment()
+    // waiter. Called from handle_action.
+    void deliver_segment(const std::string& session_id,
+                         const std::string& url,
+                         std::string bytes);
+
 private:
     HlsSessionRegistry() = default;
 
     mutable std::mutex                                   mtx_;
-    std::unordered_map<std::string, HlsSession>          sessions_;
+    std::unordered_map<std::string, std::unique_ptr<HlsSession>> sessions_;
 };
 
 // Extract every occurrence of `mlhls://localhost/.../*.m3u8` from a

@@ -1,6 +1,10 @@
 #include "airplay/hls_session.h"
+#include "airplay/fcup.h"
+#include "airplay/reverse_channel.h"
+#include "log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace ap::airplay {
@@ -12,13 +16,18 @@ HlsSessionRegistry& HlsSessionRegistry::instance() {
 
 HlsSession* HlsSessionRegistry::get_or_create(const std::string& session_id) {
     std::lock_guard<std::mutex> lock(mtx_);
-    return &sessions_[session_id];
+    auto& slot = sessions_[session_id];
+    if (!slot) {
+        slot = std::make_unique<HlsSession>();
+        slot->session_id = session_id;
+    }
+    return slot.get();
 }
 
 HlsSession* HlsSessionRegistry::find(const std::string& session_id) {
     std::lock_guard<std::mutex> lock(mtx_);
     auto it = sessions_.find(session_id);
-    return it == sessions_.end() ? nullptr : &it->second;
+    return it == sessions_.end() ? nullptr : it->second.get();
 }
 
 void HlsSessionRegistry::remove(const std::string& session_id) {
@@ -31,13 +40,14 @@ bool HlsSessionRegistry::lookup_playlist(const std::string& url,
                                          bool& out_is_master) const {
     std::lock_guard<std::mutex> lock(mtx_);
     for (const auto& [sid, s] : sessions_) {
-        if (s.master_url == url) {
-            out_bytes     = s.master_playlist;
+        if (!s) continue;
+        if (s->master_url == url) {
+            out_bytes     = s->master_playlist;
             out_is_master = true;
             return !out_bytes.empty();
         }
-        const auto it = s.media_playlists.find(url);
-        if (it != s.media_playlists.end()) {
+        const auto it = s->media_playlists.find(url);
+        if (it != s->media_playlists.end()) {
             out_bytes     = it->second;
             out_is_master = false;
             return !out_bytes.empty();
@@ -46,13 +56,82 @@ bool HlsSessionRegistry::lookup_playlist(const std::string& url,
     return false;
 }
 
+bool HlsSessionRegistry::fetch_segment(const std::string& url,
+                                       std::string& out_bytes,
+                                       int timeout_ms) {
+    // Pick the most recently created session with a reverse socket and
+    // send FCUP on it. The caller is the local HTTP server which has no
+    // direct session handle — for a single iPhone, there's only one
+    // HlsSession live at a time.
+    HlsSession* s = nullptr;
+    std::string session_id;
+    int         reverse_fd = -1;
+    int         request_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (auto& [sid, sess] : sessions_) {
+            if (!sess) continue;
+            const int fd =
+                ReverseChannelRegistry::instance().socket_for(sid);
+            if (fd < 0) continue;
+            s           = sess.get();
+            session_id  = sid;
+            reverse_fd  = fd;
+            request_id  = s->next_request_id++;
+            break;
+        }
+    }
+    if (!s) {
+        LOG_WARN << "fetch_segment: no active HLS session with a reverse channel";
+        return false;
+    }
+
+    // Was it already delivered (iOS sometimes races a prior FCUP)?
+    {
+        std::lock_guard<std::mutex> lock(s->seg_mtx);
+        const auto it = s->segment_data.find(url);
+        if (it != s->segment_data.end()) {
+            out_bytes = std::move(it->second);
+            s->segment_data.erase(it);
+            return true;
+        }
+    }
+
+    if (!send_fcup_request(reverse_fd, url, session_id, request_id)) {
+        LOG_WARN << "fetch_segment: FCUP send failed for " << url;
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lock(s->seg_mtx);
+    const bool arrived = s->seg_cv.wait_for(lock,
+        std::chrono::milliseconds(timeout_ms),
+        [&] { return s->segment_data.count(url) != 0; });
+    if (!arrived) {
+        LOG_WARN << "fetch_segment: timeout after " << timeout_ms
+                 << "ms for " << url;
+        return false;
+    }
+    out_bytes = std::move(s->segment_data[url]);
+    s->segment_data.erase(url);
+    return true;
+}
+
+void HlsSessionRegistry::deliver_segment(const std::string& session_id,
+                                         const std::string& url,
+                                         std::string bytes) {
+    HlsSession* s = find(session_id);
+    if (!s) {
+        LOG_WARN << "deliver_segment: no session " << session_id;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s->seg_mtx);
+        s->segment_data[url] = std::move(bytes);
+    }
+    s->seg_cv.notify_all();
+}
+
 std::vector<std::string> extract_media_uris(const std::string& master) {
-    // Scan for substrings of the form mlhls://localhost/<path>.m3u8
-    // (both #EXT-X-MEDIA:URI="..." and #EXT-X-STREAM-INF: children
-    // on their own line). UxPlay's create_media_uri_table does the
-    // same linear scan; keep it minimal — every iOS-delivered HLS
-    // master we've seen puts every child URI between the mlhls:// and
-    // the literal .m3u8 with no nested quotes.
     constexpr const char* kPrefix = "mlhls://localhost/";
     constexpr const char* kSuffix = ".m3u8";
     std::vector<std::string> out;

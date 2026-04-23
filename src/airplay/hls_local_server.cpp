@@ -103,24 +103,44 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
     const std::string mlhls_url = "mlhls://localhost/" +
         (path.empty() || path[0] != '/' ? path : path.substr(1));
 
-    std::string body;
-    bool is_master = false;
-    if (!HlsSessionRegistry::instance().lookup_playlist(
-            mlhls_url, body, is_master)) {
-        LOG_WARN << "HLS GET " << path << " -> 404 (no session owns "
-                 << mlhls_url << ")";
-        send_response(404, "Not Found", "", "text/plain");
+    // Playlist vs segment: only .m3u8 paths come from the stored static
+    // map. Everything else is a segment the player is pulling — those
+    // aren't in media_playlists, we fetch them on demand from iOS via
+    // FCUP and block until /action arrives.
+    const bool is_playlist = (path.size() >= 5 &&
+        path.compare(path.size() - 5, 5, ".m3u8") == 0);
+
+    if (is_playlist) {
+        std::string body;
+        bool is_master = false;
+        if (!HlsSessionRegistry::instance().lookup_playlist(
+                mlhls_url, body, is_master)) {
+            LOG_WARN << "HLS GET " << path << " -> 404 (no session owns "
+                     << mlhls_url << ")";
+            send_response(404, "Not Found", "", "text/plain");
+            ap::net::close_socket(client.fd);
+            return;
+        }
+        body = rewrite_urls(body);
+        LOG_INFO << "HLS GET " << path
+                 << (is_master ? " (master" : " (media")
+                 << ") -> " << body.size() << 'B';
+        send_response(200, "OK", body,
+                      "application/vnd.apple.mpegurl");
         ap::net::close_socket(client.fd);
         return;
     }
 
-    // Rewrite inner "mlhls://localhost/" so the player stays on us for
-    // every fetch (master -> media playlists -> segments).
-    body = rewrite_urls(body);
-    LOG_INFO << "HLS GET " << path
-             << (is_master ? " (master" : " (media")
-             << ") -> " << body.size() << 'B';
-    send_response(200, "OK", body, "application/vnd.apple.mpegurl");
+    // Segment: FCUP to iOS and wait for POST /action to fill in data.
+    std::string seg;
+    if (!HlsSessionRegistry::instance().fetch_segment(mlhls_url, seg)) {
+        LOG_WARN << "HLS GET " << path << " -> 504 (segment fetch failed)";
+        send_response(504, "Gateway Timeout", "", "text/plain");
+        ap::net::close_socket(client.fd);
+        return;
+    }
+    LOG_INFO << "HLS GET " << path << " (segment) -> " << seg.size() << 'B';
+    send_response(200, "OK", seg, "application/octet-stream");
     ap::net::close_socket(client.fd);
 }
 
