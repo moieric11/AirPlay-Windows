@@ -67,6 +67,12 @@ public:
     // "rate: 1.0" / "rate: 0.0" from text/parameters. Thread-safe.
     void push_playback_rate(float rate);
 
+    // Reset cover art, metadata and progress to the "waiting for iOS"
+    // initial state. Call from the full-TEARDOWN path so a disconnected
+    // session doesn't leave a stale cover + pause overlay on screen.
+    // Thread-safe.
+    void clear_session();
+
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
     bool user_closed() const { return closed_.load(); }
@@ -112,6 +118,11 @@ private:
     // Playing (true) advances the extrapolated elapsed; paused (false)
     // freezes it. Toggled by rate: 1.0 / rate: 0.0.
     std::atomic<bool>          playing_{true};
+
+    // When set, the render thread drops the cover texture on the next
+    // tick. Used by clear_session() so TEARDOWN wipes the "last track"
+    // cover without needing a cover_mtx_ hop.
+    std::atomic<bool>          clear_cover_requested_{false};
 };
 
 } // namespace ap::video

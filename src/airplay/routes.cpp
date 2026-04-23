@@ -273,7 +273,10 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
                 }
                 session.aes_key = std::move(aes_key);
                 session.aes_iv  = parsed.eiv;
-                LOG_INFO << "airplay2 SETUP: stream AES key recovered (16 B)";
+                LOG_INFO << "airplay2 SETUP: stream AES key recovered (16 B) "
+                            "=== AirPlay session START: "
+                         << parsed.name << " (" << parsed.model << ") "
+                         << session.remote_ip << " ===";
             } else {
                 LOG_WARN << "airplay2 SETUP: fairplay_decrypt failed — "
                             "stream will not be decryptable";
@@ -401,9 +404,13 @@ Response handle_teardown(ClientSession& session, const Request& req) {
         // Keep session.streams alive — iOS may retry the stream without
         // re-doing the session setup.
     } else if (session.streams) {
-        LOG_INFO << "TEARDOWN full session=" << session.streams->session_id();
+        LOG_INFO << "TEARDOWN full session=" << session.streams->session_id()
+                 << " — AirPlay session ended";
         session.streams.reset();
         session.sdp.reset();
+        // Wipe the idle-mode UI so a new connection doesn't inherit the
+        // last track's cover, metadata and progress.
+        if (session.renderer) session.renderer->clear_session();
     }
     return r;
 }

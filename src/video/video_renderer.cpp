@@ -282,6 +282,26 @@ void VideoRenderer::push_playback_rate(float rate) {
     cv_.notify_one();
 }
 
+void VideoRenderer::clear_session() {
+    LOG_INFO << "VideoRenderer clear_session: reset cover / metadata / progress";
+    // Clear metadata on the next render tick by pushing empties (the
+    // renderer re-generates textures from empty strings, which produces
+    // no visible text).
+    {
+        std::lock_guard<std::mutex> lock(meta_mtx_);
+        meta_title_.clear();
+        meta_artist_.clear();
+        meta_album_.clear();
+        meta_dirty_ = true;
+    }
+    progress_elapsed_ms_.store(0, std::memory_order_relaxed);
+    progress_total_ms_.store(0,   std::memory_order_relaxed);
+    progress_pushed_at_ns_.store(0, std::memory_order_relaxed);
+    playing_.store(true, std::memory_order_relaxed);
+    clear_cover_requested_.store(true, std::memory_order_relaxed);
+    cv_.notify_one();
+}
+
 void VideoRenderer::push_metadata(const std::string& title,
                                   const std::string& artist,
                                   const std::string& album) {
@@ -426,6 +446,18 @@ void VideoRenderer::run(const std::string& title) {
                     y.data(), w, u.data(), w / 2, v.data(), w / 2);
             }
             last_video_frame_time = std::chrono::steady_clock::now();
+        }
+
+        // --- Drop the cover if clear_session was called --------------
+        if (clear_cover_requested_.exchange(false, std::memory_order_relaxed)) {
+            if (cover_tex) {
+                SDL_DestroyTexture(cover_tex);
+                cover_tex   = nullptr;
+                cover_tex_w = cover_tex_h = 0;
+            }
+            std::lock_guard<std::mutex> lock(cover_mtx_);
+            cover_jpeg_.clear();
+            cover_dirty_ = false;
         }
 
         // --- Consume pending cover-art JPEG --------------------------
