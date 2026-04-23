@@ -149,18 +149,51 @@ if(USE_GSTREAMER_HLS)
     if(NOT PkgConfig_FOUND)
         message(FATAL_ERROR "USE_GSTREAMER_HLS=ON requires pkg-config")
     endif()
-    # Windows convenience: -DGSTREAMER_ROOT=C:/Program Files/gstreamer/1.0/msvc_x86_64
-    # propagates into PKG_CONFIG_PATH so pkg_check_modules finds the .pc
-    # files without the user having to export an env var beforehand.
-    # Fall back to the env var path when -D isn't set.
+    # Windows convenience: -DGSTREAMER_ROOT=... propagates into
+    # PKG_CONFIG_PATH. Accepts either:
+    #   - the install root:
+    #       C:/Program Files/gstreamer/1.0/msvc_x86_64
+    #   - the pkgconfig dir directly (which is already how pkg-config
+    #     wants it):
+    #       C:/Program Files/gstreamer/1.0/msvc_x86_64/lib/pkgconfig
+    # Normalises backslashes to '/' for CMake consumption.
     if(GSTREAMER_ROOT)
-        message(STATUS "GSTREAMER_ROOT=${GSTREAMER_ROOT} → injecting into PKG_CONFIG_PATH")
-        if(WIN32)
-            set(ENV{PKG_CONFIG_PATH}
-                "${GSTREAMER_ROOT}/lib/pkgconfig;$ENV{PKG_CONFIG_PATH}")
+        string(REPLACE "\\" "/" _gst_root "${GSTREAMER_ROOT}")
+        # Accept any of: install root, .../lib, .../lib/pkgconfig, .../pkgconfig.
+        # Probe each candidate in turn for gstreamer-1.0.pc.
+        set(_gst_pkg_dir "")
+        foreach(_cand
+                "${_gst_root}"
+                "${_gst_root}/pkgconfig"
+                "${_gst_root}/lib/pkgconfig"
+                "${_gst_root}/lib")
+            if(EXISTS "${_cand}/gstreamer-1.0.pc")
+                set(_gst_pkg_dir "${_cand}")
+                break()
+            endif()
+        endforeach()
+        if(_gst_pkg_dir)
+            message(STATUS "GSTREAMER_ROOT=${GSTREAMER_ROOT}")
+            message(STATUS "  → pkgconfig dir: ${_gst_pkg_dir}")
+            if(WIN32)
+                set(ENV{PKG_CONFIG_PATH}
+                    "${_gst_pkg_dir};$ENV{PKG_CONFIG_PATH}")
+            else()
+                set(ENV{PKG_CONFIG_PATH}
+                    "${_gst_pkg_dir}:$ENV{PKG_CONFIG_PATH}")
+            endif()
         else()
-            set(ENV{PKG_CONFIG_PATH}
-                "${GSTREAMER_ROOT}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+            message(WARNING
+                "GSTREAMER_ROOT=${GSTREAMER_ROOT}\n"
+                "  gstreamer-1.0.pc not found under that path. Checked:\n"
+                "    ${_gst_root}\n"
+                "    ${_gst_root}/pkgconfig\n"
+                "    ${_gst_root}/lib/pkgconfig\n"
+                "    ${_gst_root}/lib\n"
+                "  On Windows the development files live under:\n"
+                "    C:/Program Files/gstreamer/1.0/msvc_x86_64/lib/pkgconfig\n"
+                "  If gstreamer-1.0.pc is missing entirely, re-run the MSI\n"
+                "  installer in Custom mode and enable the whole feature tree.")
         endif()
     endif()
     pkg_check_modules(GSTREAMER IMPORTED_TARGET
