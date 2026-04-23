@@ -949,13 +949,24 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
         }
     } else if (url.size() >= 5 &&
                url.compare(url.size() - 5, 5, ".m3u8") == 0) {
-        // Media (child) playlist — store by its URL so the local HLS
-        // server can serve it when the player asks. Any waiters on
-        // HlsSessionRegistry::fetch_playlist() get woken up.
-        hls->media_playlists[url] = playlist;
+        // Media (child) playlist. Expand YouTube's "condensed" URL
+        // form so every segment URI in the stored body points
+        // directly at googlevideo.com over HTTPS — FFmpeg can then
+        // fetch segments itself without another FCUP round trip.
+        const std::string expanded = expand_yt_condensed_playlist(playlist);
+        if (hls->media_playlists.empty()) {
+            // Log the first media playlist (pre- and post-expansion)
+            // so we can verify the format on new iOS versions.
+            LOG_INFO << "POST /action: first media playlist RAW:\n"
+                     << playlist.substr(0, std::min<std::size_t>(800, playlist.size()));
+            LOG_INFO << "POST /action: first media playlist EXPANDED:\n"
+                     << expanded.substr(0, std::min<std::size_t>(800, expanded.size()));
+        }
+        hls->media_playlists[url] = expanded;
         LOG_INFO << "POST /action: media playlist stored "
                  << hls->media_playlists.size() << '/'
-                 << hls->media_uris.size() << " (" << playlist.size() << "B)";
+                 << hls->media_uris.size() << " (" << playlist.size()
+                 << "B raw, " << expanded.size() << "B expanded)";
         HlsSessionRegistry::instance().notify_playlist_arrived(sid, url);
     } else if (!redirect_location.empty()) {
         // 302 to a signed CDN URL — forward to FFmpeg.

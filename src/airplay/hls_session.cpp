@@ -223,6 +223,119 @@ void HlsSessionRegistry::notify_playlist_arrived(const std::string& session_id,
     s->seg_cv.notify_all();
 }
 
+// Helper: extract the quoted value following `key=`, e.g.
+//   input "...BASE-URI=\"https://x\",PARAMS=\"a,b\"..."
+//   key   "BASE-URI="
+//   -> "https://x"
+// Returns empty string if the key isn't present or isn't quoted.
+static std::string extract_quoted_attr(const std::string& src,
+                                       const std::string& key) {
+    const auto kp = src.find(key);
+    if (kp == std::string::npos) return {};
+    const auto open = src.find('"', kp + key.size());
+    if (open == std::string::npos) return {};
+    const auto close = src.find('"', open + 1);
+    if (close == std::string::npos) return {};
+    return src.substr(open + 1, close - open - 1);
+}
+
+// Port of UxPlay's adjust_yt_condensed_playlist (airplay_video.c).
+// Given a media playlist:
+//   #EXTM3U
+//   #YT-EXT-CONDENSED-URL:BASE-URI="https://cdn/.../",PARAMS="s,slices",PREFIX="mlhls://localhost/..."
+//   #EXTINF:5.0,
+//   /0/5600/0-62329/0
+//   ...
+// Expand each condensed chunk line by replacing PREFIX with BASE-URI
+// and interleaving the PARAMS tokens between the "/"-separated fields
+// of the condensed path. Result: full https://cdn/.../s/0/5600/slices=0-62329/0
+std::string expand_yt_condensed_playlist(const std::string& playlist) {
+    const char* kHdr = "#YT-EXT-CONDENSED-URL";
+    const auto hdr_pos = playlist.find(kHdr);
+    if (hdr_pos == std::string::npos) return playlist;
+
+    // Header runs until the next newline.
+    const auto hdr_eol = playlist.find('\n', hdr_pos);
+    if (hdr_eol == std::string::npos) return playlist;
+    const std::string hdr_line = playlist.substr(hdr_pos, hdr_eol - hdr_pos);
+
+    const std::string base_uri = extract_quoted_attr(hdr_line, "BASE-URI=");
+    const std::string params   = extract_quoted_attr(hdr_line, "PARAMS=");
+    const std::string prefix   = extract_quoted_attr(hdr_line, "PREFIX=");
+    if (base_uri.empty() || params.empty() || prefix.empty()) return playlist;
+
+    // Split params on ','
+    std::vector<std::string> param_tokens;
+    {
+        std::size_t p = 0;
+        while (p < params.size()) {
+            const auto comma = params.find(',', p);
+            if (comma == std::string::npos) {
+                param_tokens.push_back(params.substr(p));
+                break;
+            }
+            param_tokens.push_back(params.substr(p, comma - p));
+            p = comma + 1;
+        }
+    }
+
+    // Walk each chunk: find the line starting with `prefix` after an
+    // #EXTINF tag, rebuild it as base_uri + interleaved fields.
+    std::string out;
+    out.reserve(playlist.size() * 2);
+    std::size_t pos = 0;
+    while (pos < playlist.size()) {
+        const auto extinf = playlist.find("#EXTINF", pos);
+        if (extinf == std::string::npos) {
+            out.append(playlist, pos, std::string::npos);
+            break;
+        }
+        const auto chunk_line = playlist.find(prefix, extinf);
+        if (chunk_line == std::string::npos) {
+            out.append(playlist, pos, std::string::npos);
+            break;
+        }
+        // Copy everything up to the condensed URL.
+        out.append(playlist, pos, chunk_line - pos);
+        // Find end of the condensed URL line (next '\n' or end).
+        auto url_end = playlist.find('\n', chunk_line);
+        if (url_end == std::string::npos) url_end = playlist.size();
+        const std::string condensed = playlist.substr(
+            chunk_line + prefix.size(), url_end - chunk_line - prefix.size());
+
+        // condensed is "/a/b/c/.../n" — same count of '/' as param_tokens
+        // (UxPlay comment notes the invariant). Split on '/' and
+        // interleave.
+        std::vector<std::string> fields;
+        {
+            std::size_t p = 0;
+            while (p <= condensed.size()) {
+                const auto slash = condensed.find('/', p);
+                if (slash == std::string::npos) {
+                    fields.push_back(condensed.substr(p));
+                    break;
+                }
+                fields.push_back(condensed.substr(p, slash - p));
+                p = slash + 1;
+            }
+        }
+
+        // Rebuild: BASE-URI + for each pair (token, field): "/" + token + "/" + field
+        // First field is empty (leading "/"); the loop produces:
+        //   BASE-URI /token0/ field1 /token1/ field2 ...
+        out.append(base_uri);
+        for (std::size_t i = 0; i < param_tokens.size(); ++i) {
+            out.push_back('/');
+            out.append(param_tokens[i]);
+            out.push_back('/');
+            if (i + 1 < fields.size()) out.append(fields[i + 1]);
+        }
+        out.push_back('\n');
+        pos = url_end + 1;
+    }
+    return out;
+}
+
 std::vector<std::string> extract_media_uris(const std::string& master) {
     constexpr const char* kPrefix = "mlhls://localhost/";
     constexpr const char* kSuffix = ".m3u8";

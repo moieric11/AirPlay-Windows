@@ -111,4 +111,15 @@ private:
 // removed.
 std::vector<std::string> extract_media_uris(const std::string& master);
 
+// Port of UxPlay's adjust_yt_condensed_playlist. YouTube-delivered
+// media playlists carry a "#YT-EXT-CONDENSED-URL" header with three
+// attributes — BASE-URI (signed googlevideo.com URL), PARAMS (slash-
+// separated fields like "s,slices") and PREFIX (the mlhls:// stub the
+// condensed chunks start with). Each EXTINF chunk body is a condensed
+// path with "/" separators that must be un-condensed by inserting the
+// PARAMS values. After expansion the segment URIs point directly at
+// the CDN over HTTPS so FFmpeg fetches them without a FCUP round trip.
+// Returns `playlist` unchanged when the header isn't present.
+std::string expand_yt_condensed_playlist(const std::string& playlist);
+
 } // namespace ap::airplay
