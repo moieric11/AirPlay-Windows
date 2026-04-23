@@ -15,19 +15,18 @@
 // implementation in hls_player.cpp — exactly one of the two files is
 // compiled into the binary (USE_GSTREAMER_HLS CMake option).
 //
-// Pipeline:
-//   uridecodebin uri=<local master.m3u8>
-//   -> videoconvert
-//   -> caps=video/x-raw,format=I420
-//   -> appsink name=vsink emit-signals=true sync=false
-//      max-buffers=3 drop=true
+// Pipeline (via playbin3):
+//   - URI ->  demuxer (hlsdemux) -> decoders (avdec_h264/h265, audio)
+//   - video-sink = appsink (caps=video/x-raw,format=I420, sync=true,
+//                           drop=true, max-buffers=3) -> push_frame()
+//   - audio-sink = default system sink (autoaudiosink -> WASAPI on
+//                  Windows, pulseaudio on Linux) so YouTube audio
+//                  plays natively without any code from our side.
 //
-// uridecodebin auto-selects the HLS demuxer + H.264/HEVC decoders
-// through libav (avdec_h264 / avdec_h265 plugins from gst-libav).
-// sync=false + drop=true + max-buffers=3 = best-effort low-latency:
-// we push the newest frame we can pull and let GStreamer throw away
-// anything the renderer doesn't pick up fast enough, rather than
-// letting the appsink grow a big queue.
+// playbin handles HLS variant selection, demuxing, decoding and clock
+// synchronisation. max-buffers=3 + drop=true on the video appsink
+// keeps playback paced without letting frames pile up if the GUI
+// thread is briefly stalled.
 
 namespace ap::video {
 
@@ -123,24 +122,35 @@ bool HlsPlayer::start(const std::string& url, VideoRenderer* renderer) {
     if (impl_->running.exchange(true)) return false;
     impl_->renderer = renderer;
 
-    std::string desc =
-        "uridecodebin uri=" + url + " ! "
-        "videoconvert ! "
-        "video/x-raw,format=I420 ! "
-        "appsink name=vsink emit-signals=true sync=true "
-               "max-buffers=3 drop=true";
-
-    GError* err = nullptr;
-    impl_->pipeline = gst_parse_launch(desc.c_str(), &err);
+    // playbin = full auto demux + decode + sink selection. We supply
+    // our own video sink (appsink wired to push_frame); playbin picks
+    // a system audio sink by default, which on Windows means WASAPI
+    // and on Linux either PulseAudio or PipeWire via autoaudiosink.
+    impl_->pipeline = gst_element_factory_make("playbin", "player");
     if (!impl_->pipeline) {
-        LOG_ERROR << "HlsPlayer(gst) parse_launch failed: "
-                  << (err ? err->message : "?");
-        if (err) g_error_free(err);
+        // "playbin" was renamed to "playbin3" in 1.22+ on some
+        // builds; fall back if the default factory isn't there.
+        impl_->pipeline = gst_element_factory_make("playbin3", "player");
+    }
+    if (!impl_->pipeline) {
+        LOG_ERROR << "HlsPlayer(gst) neither playbin nor playbin3 available";
         impl_->running = false;
         return false;
     }
+    g_object_set(impl_->pipeline, "uri", url.c_str(), NULL);
 
-    impl_->appsink = gst_bin_get_by_name(GST_BIN(impl_->pipeline), "vsink");
+    // Video sink: appsink emitting YUV420 buffers for push_frame().
+    impl_->appsink = gst_element_factory_make("appsink", "vsink");
+    g_object_set(impl_->appsink,
+        "emit-signals", TRUE,
+        "sync",        TRUE,
+        "max-buffers", static_cast<guint>(3),
+        "drop",        TRUE,
+        NULL);
+    GstCaps* caps = gst_caps_from_string("video/x-raw,format=I420");
+    g_object_set(impl_->appsink, "caps", caps, NULL);
+    gst_caps_unref(caps);
+    g_object_set(impl_->pipeline, "video-sink", impl_->appsink, NULL);
     g_signal_connect(impl_->appsink, "new-sample",
                      G_CALLBACK(&Impl::on_new_sample), impl_);
 
