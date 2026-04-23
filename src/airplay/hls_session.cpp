@@ -303,36 +303,34 @@ std::string expand_yt_condensed_playlist(const std::string& playlist) {
         const std::string condensed = playlist.substr(
             chunk_line + prefix.size(), url_end - chunk_line - prefix.size());
 
-        // condensed is "/a/b/c/.../n" — same count of '/' as param_tokens
-        // (UxPlay comment notes the invariant). Split on '/' and
-        // interleave.
-        std::vector<std::string> fields;
+        // Split condensed on '/' and drop empty tokens — robust to
+        // prefixes that do or do not end with '/' (iOS builds vary).
+        // After filtering, `values` holds exactly one entry per
+        // PARAMS token, in order.
+        std::vector<std::string> values;
         {
             std::size_t p = 0;
-            while (p <= condensed.size()) {
+            while (p < condensed.size()) {
                 const auto slash = condensed.find('/', p);
-                if (slash == std::string::npos) {
-                    fields.push_back(condensed.substr(p));
-                    break;
+                const auto end =
+                    (slash == std::string::npos) ? condensed.size() : slash;
+                if (end > p) {
+                    values.push_back(condensed.substr(p, end - p));
                 }
-                fields.push_back(condensed.substr(p, slash - p));
+                if (slash == std::string::npos) break;
                 p = slash + 1;
             }
         }
 
-        // Rebuild: BASE-URI + for each pair (param, field): "/" + param + "/" + field
-        // UxPlay's prefix typically ends with "/" so the condensed path
-        // starts with the first real field (not an empty segment from a
-        // leading "/"). Skip the leading empty field only when the
-        // condensed path actually begins with "/".
-        const std::size_t field_base = (!fields.empty() && fields[0].empty()) ? 1 : 0;
+        // Rebuild: BASE-URI/param0/val0/param1/val1/.../paramN/valN.
+        // BASE-URI ends with ".m3u8" (no trailing slash), so a single
+        // "/" between it and the first param avoids a "//" artifact.
         out.append(base_uri);
         for (std::size_t i = 0; i < param_tokens.size(); ++i) {
             out.push_back('/');
             out.append(param_tokens[i]);
             out.push_back('/');
-            const std::size_t idx = field_base + i;
-            if (idx < fields.size()) out.append(fields[idx]);
+            if (i < values.size()) out.append(values[i]);
         }
         out.push_back('\n');
         pos = url_end + 1;
