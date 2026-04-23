@@ -127,7 +127,7 @@ bool HlsPlayer::start(const std::string& url, VideoRenderer* renderer) {
         "uridecodebin uri=" + url + " ! "
         "videoconvert ! "
         "video/x-raw,format=I420 ! "
-        "appsink name=vsink emit-signals=true sync=false "
+        "appsink name=vsink emit-signals=true sync=true "
                "max-buffers=3 drop=true";
 
     GError* err = nullptr;
