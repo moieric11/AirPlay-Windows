@@ -28,6 +28,12 @@ struct Response {
     std::unordered_map<std::string, std::string> headers;
     std::vector<unsigned char> body;
 
+    // When true, the server should not send this response on the wire.
+    // Used to swallow responses iOS sends back to our FCUP Requests on
+    // the reverse channel (which our request reader mis-parses as new
+    // requests because they come on the same socket).
+    bool silent = false;
+
     void set_header(std::string key, std::string value);
     std::string serialize() const;
 };

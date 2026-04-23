@@ -30,6 +30,7 @@ void Server::handle_client(ap::net::ClientSocket client) {
 
     while (reader.read(static_cast<int>(client.fd), req)) {
         Response res = dispatch(ctx_, session, req);
+        if (res.silent) continue;
         std::string wire = res.serialize();
         if (ap::net::send_all(client.fd, wire.data(),
                               static_cast<int>(wire.size())) < 0) {

@@ -817,6 +817,91 @@ Response handle_play(ClientSession& session, const Request& req) {
     return r;
 }
 
+// POST /action: iOS pushes back FCUP data. The request we care about
+// has type=="unhandledURLResponse" with a `params` dict containing
+// FCUP_Response_URL + FCUP_Response_Data (HLS playlist bytes).
+// Ported from UxPlay's http_handler_action (lib/http_handlers.h).
+Response handle_action(ClientSession& session, const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    const std::string sid = req.header("x-apple-session-id");
+
+#if defined(HAVE_LIBPLIST)
+    if (req.body.size() < 8 ||
+        std::memcmp(req.body.data(), "bplist00", 8) != 0) {
+        LOG_WARN << "POST /action: body is not a binary plist ("
+                 << req.body.size() << "B)";
+        return r;
+    }
+    plist_t root = nullptr;
+    plist_from_bin(reinterpret_cast<const char*>(req.body.data()),
+                   static_cast<uint32_t>(req.body.size()), &root);
+    if (!root) {
+        LOG_WARN << "POST /action: plist_from_bin failed";
+        return r;
+    }
+
+    auto get_string_of = [](plist_t p, const char* key, std::string& out) {
+        plist_t n = plist_dict_get_item(p, key);
+        if (!n || plist_get_node_type(n) != PLIST_STRING) return false;
+        char* raw = nullptr; plist_get_string_val(n, &raw);
+        if (!raw) return false;
+        out.assign(raw);
+        std::free(raw);
+        return true;
+    };
+
+    std::string type;
+    get_string_of(root, "type", type);
+
+    plist_t params = plist_dict_get_item(root, "params");
+    if (type != "unhandledURLResponse" || !params) {
+        LOG_INFO << "POST /action type=\"" << type << "\" (unhandled)";
+        plist_free(root);
+        return r;
+    }
+
+    std::string url;
+    get_string_of(params, "FCUP_Response_URL", url);
+
+    plist_t data_node = plist_dict_get_item(params, "FCUP_Response_Data");
+    const char* data_ptr = nullptr;
+    uint64_t    data_len = 0;
+    if (data_node && plist_get_node_type(data_node) == PLIST_DATA) {
+        char* buf = nullptr;
+        plist_get_data_val(data_node, &buf, &data_len);
+        data_ptr = buf;
+        // buf must be freed by the caller — we copy into a std::string
+        // below and free immediately.
+    }
+
+    std::string playlist;
+    if (data_ptr && data_len > 0) {
+        playlist.assign(data_ptr, data_ptr + data_len);
+        std::free(const_cast<char*>(data_ptr));
+    }
+
+    LOG_INFO << "POST /action FCUP response url=" << url
+             << "  playlist=" << playlist.size() << "B";
+    // Log the first line of the playlist for sanity.
+    const auto nl = playlist.find('\n');
+    const std::string first_line = playlist.substr(
+        0, std::min<std::size_t>(nl == std::string::npos ? playlist.size() : nl,
+                                 120));
+    LOG_INFO << "         first_line=\"" << first_line << '"';
+
+    // TODO next commit: if url ends with /master.m3u8, parse the M3U8,
+    // extract the child mlhls:// URIs, and send a cascade of FCUP
+    // requests (one per child) so we end up with every media playlist
+    // the master references. Then kick off the local HTTP server +
+    // FFmpeg player.
+    (void)sid;
+    (void)session;
+    plist_free(root);
+#endif
+    return r;
+}
+
 // GET /playback-info: iOS polls this every ~1 s after /play. If we
 // don't answer with a valid readyToPlay plist within about 600 ms, iOS
 // assumes we're broken and TEARDOWNs the session. While the playlist
@@ -869,6 +954,17 @@ Response handle_stream_stub(const Request& req, const char* tag) {
 
 Response dispatch(const DeviceContext& ctx, ClientSession& session,
                   const Request& req) {
+    // iOS replies to our POST /event FCUP Requests with plain HTTP
+    // responses ("HTTP/1.1 200 OK", "HTTP/1.1 404 Not Found") on the
+    // same socket. Our generic request reader happily parses those as
+    // new requests with method=="HTTP/1.1", uri=="404" — don't dispatch
+    // or reply to them, just drop silently. Response.silent skips send.
+    if (req.method.compare(0, 5, "HTTP/") == 0) {
+        Response r = make(200, "OK");
+        r.silent = true;
+        return r;
+    }
+
     LOG_INFO << req.method << ' ' << req.uri
              << "  body=" << req.body.size() << "B";
 
@@ -954,12 +1050,13 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
         return handle_stream_stub(req, "audioMode");
     }
     if (req.method == "POST" && path == "/play")             return handle_play(session, req);
+    if (req.method == "POST" && path == "/action")           return handle_action(session, req);
     if (req.method == "POST" && path == "/stop")             return handle_stream_stub(req, "stop");
     if (req.method == "POST" && path == "/scrub")            return handle_stream_stub(req, "scrub");
     if (req.method == "POST" && path == "/setProperty")      return handle_stream_stub(req, "setProperty");
     if (req.method == "POST" && path == "/getProperty")      return handle_stream_stub(req, "getProperty");
     if (req.method == "GET"  && path == "/playback-info")    return handle_playback_info(req);
-    if (req.method == "POST" && path == "/action")           return handle_stream_stub(req, "action");
+    // "/action" handled above (real parser).
     if (req.method == "POST" && path == "/command")          return handle_stream_stub(req, "command");
 
     return handle_unimplemented(req, "unknown route");
