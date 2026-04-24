@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -46,6 +47,15 @@ struct HlsSession {
     std::mutex                                            seg_url_mtx;
     std::unordered_map<std::string, std::string>          seg_url_map;
     uint64_t                                              seg_url_counter = 0;
+
+    // Lightweight playback state surfaced via GET /playback-info.
+    std::atomic<bool>                                     playback_started{false};
+    std::atomic<bool>                                     media_playlist_ready{false};
+
+    // Best-effort cache of POST /setProperty payloads so matching
+    // /getProperty calls can echo the latest known value.
+    std::mutex                                            props_mtx;
+    std::unordered_map<std::string, std::vector<unsigned char>> props;
 };
 
 class HlsSessionRegistry {

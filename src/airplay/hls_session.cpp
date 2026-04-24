@@ -419,6 +419,19 @@ std::string rewrite_segments_to_local(HlsSession& session,
                                       uint16_t local_port,
                                       const std::string& expanded,
                                       std::size_t& out_rewritten_count) {
+    auto register_local = [&](const std::string& url_line) {
+        std::string local_path;
+        {
+            std::lock_guard<std::mutex> lock(session.seg_url_mtx);
+            local_path = "/seg/" + std::to_string(session.seg_url_counter++);
+            session.seg_url_map[local_path] = url_line;
+        }
+        std::string local_url = "http://localhost:";
+        local_url += std::to_string(local_port);
+        local_url += local_path;
+        return local_url;
+    };
+
     out_rewritten_count = 0;
     std::string out;
     out.reserve(expanded.size());
@@ -435,7 +448,30 @@ std::string rewrite_segments_to_local(HlsSession& session,
             !line.empty() && line[0] != '#' &&
             line[0] != ' ' && line[0] != '\t' && line[0] != '\r';
         if (!is_uri) {
-            out.append(line);
+            // Rewrite tag attributes carrying URLs, e.g.
+            //   #EXT-X-MAP:URI="https://.../init.mp4"
+            // so the player never bypasses our local proxy.
+            std::string tagged = line;
+            std::size_t p = 0;
+            while ((p = tagged.find("URI=\"", p)) != std::string::npos) {
+                const std::size_t v0 = p + 5;
+                const std::size_t v1 = tagged.find('"', v0);
+                if (v1 == std::string::npos) break;
+                const std::string raw = tagged.substr(v0, v1 - v0);
+                if (!raw.empty() &&
+                    (raw.rfind("http://", 0) == 0 ||
+                     raw.rfind("https://", 0) == 0 ||
+                     raw.rfind("mlhls://", 0) == 0 ||
+                     raw.rfind("/", 0) == 0)) {
+                    const std::string local = register_local(raw);
+                    tagged.replace(v0, v1 - v0, local);
+                    ++out_rewritten_count;
+                    p = v0 + local.size();
+                    continue;
+                }
+                p = v1 + 1;
+            }
+            out.append(tagged);
             if (eol != std::string::npos) out.push_back('\n');
             continue;
         }
@@ -445,15 +481,7 @@ std::string rewrite_segments_to_local(HlsSession& session,
         if (!url_line.empty() && url_line.back() == '\r') url_line.pop_back();
 
         // Register a fresh local path and remember the real URL.
-        std::string local_path;
-        {
-            std::lock_guard<std::mutex> lock(session.seg_url_mtx);
-            local_path = "/seg/" + std::to_string(session.seg_url_counter++);
-            session.seg_url_map[local_path] = url_line;
-        }
-        out.append("http://localhost:");
-        out.append(std::to_string(local_port));
-        out.append(local_path);
+        out.append(register_local(url_line));
         if (eol != std::string::npos) out.push_back('\n');
         ++out_rewritten_count;
     }

@@ -828,6 +828,12 @@ Response handle_play(ClientSession& session, const Request& req) {
     auto* hls = HlsSessionRegistry::instance().get_or_create(pr.session_id);
     hls->master_url      = pr.url;
     hls->next_request_id = 2;   // 1 is reserved for the master we're about to request
+    hls->playback_started.store(true);
+    hls->media_playlist_ready.store(false);
+    {
+        std::lock_guard<std::mutex> lock(hls->props_mtx);
+        hls->props.clear();
+    }
 
     if (!send_fcup_request(reverse_fd, pr.url, pr.session_id, /*request_id*/ 1)) {
         LOG_WARN << "POST /play: FCUP Request send failed";
@@ -1003,6 +1009,7 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
                      << slice_around_first_chunk(localised);
         }
         hls->media_playlists[url] = localised;
+        hls->media_playlist_ready.store(true);
         LOG_INFO << "POST /action: media playlist stored "
                  << hls->media_playlists.size() << '/'
                  << hls->media_uris.size() << " ("
@@ -1043,14 +1050,26 @@ Response handle_playback_info(const Request& req) {
     copy_cseq(req, r);
     r.set_header("Content-Type", "text/x-apple-plist+xml");
 #if defined(HAVE_LIBPLIST)
+    const std::string sid = req.header("x-apple-session-id");
+    bool started = false;
+    bool ready = false;
+    if (!sid.empty()) {
+        if (auto* hls = HlsSessionRegistry::instance().find(sid)) {
+            started = hls->playback_started.load();
+            ready   = hls->media_playlist_ready.load();
+        }
+    }
+    const double rate = started ? 1.0 : 0.0;
     plist_t root = plist_new_dict();
     plist_dict_set_item(root, "duration",                 plist_new_real(0.0));
     plist_dict_set_item(root, "position",                 plist_new_real(0.0));
-    plist_dict_set_item(root, "rate",                     plist_new_real(0.0));
-    plist_dict_set_item(root, "readyToPlay",              plist_new_uint(0));
-    plist_dict_set_item(root, "playbackBufferEmpty",      plist_new_uint(1));
-    plist_dict_set_item(root, "playbackBufferFull",       plist_new_uint(0));
-    plist_dict_set_item(root, "playbackLikelyToKeepUp",   plist_new_uint(0));
+    plist_dict_set_item(root, "rate",                     plist_new_real(rate));
+    // Keep iOS in "playing" state as soon as /play has been accepted.
+    // media_playlist_ready flips once we have at least one child playlist.
+    plist_dict_set_item(root, "readyToPlay",              plist_new_uint(started ? 1 : 0));
+    plist_dict_set_item(root, "playbackBufferEmpty",      plist_new_uint(ready ? 0 : 1));
+    plist_dict_set_item(root, "playbackBufferFull",       plist_new_uint(ready ? 1 : 0));
+    plist_dict_set_item(root, "playbackLikelyToKeepUp",   plist_new_uint(ready ? 1 : 0));
     plist_dict_set_item(root, "loadedTimeRanges",         plist_new_array());
     plist_dict_set_item(root, "seekableTimeRanges",       plist_new_array());
     char*    xml = nullptr;
@@ -1061,6 +1080,10 @@ Response handle_playback_info(const Request& req) {
         r.body.assign(xml, xml + xml_len);
         std::free(xml);
     }
+    LOG_INFO << "GET /playback-info sid=" << (sid.empty() ? "<none>" : sid)
+             << " started=" << (started ? 1 : 0)
+             << " ready=" << (ready ? 1 : 0)
+             << " rate=" << rate;
 #endif
     return r;
 }
@@ -1077,6 +1100,63 @@ Response handle_stream_stub(const Request& req, const char* tag) {
     auto sid = req.header("x-apple-session-id");
     if (!sid.empty()) LOG_INFO << "  X-Apple-Session-ID=" << sid;
     return r;
+}
+
+Response handle_set_property(const Request& req) {
+    const std::string sid = req.header("x-apple-session-id");
+    std::string prop;
+    const auto q = req.uri.find('?');
+    if (q != std::string::npos && q + 1 < req.uri.size()) {
+        prop = req.uri.substr(q + 1);
+    }
+    // Some clients emit a trailing "&" on single-key query strings;
+    // normalize so cache lookups hit for both forms.
+    if (!prop.empty() && prop.back() == '&') {
+        prop.pop_back();
+    }
+    if (!sid.empty() && !prop.empty()) {
+        auto* hls = HlsSessionRegistry::instance().get_or_create(sid);
+        {
+            std::lock_guard<std::mutex> lock(hls->props_mtx);
+            hls->props[prop] = req.body;
+        }
+        LOG_INFO << "setProperty cache: sid=" << sid
+                 << " key=" << prop << " bytes=" << req.body.size();
+    }
+    return handle_stream_stub(req, "setProperty");
+}
+
+Response handle_get_property(const Request& req) {
+    Response r = make(200, "OK");
+    copy_cseq(req, r);
+    const std::string sid = req.header("x-apple-session-id");
+    std::string prop;
+    const auto q = req.uri.find('?');
+    if (q != std::string::npos && q + 1 < req.uri.size()) {
+        prop = req.uri.substr(q + 1);
+    }
+    if (!prop.empty() && prop.back() == '&') {
+        prop.pop_back();
+    }
+    if (!sid.empty() && !prop.empty()) {
+        if (auto* hls = HlsSessionRegistry::instance().find(sid)) {
+            std::lock_guard<std::mutex> lock(hls->props_mtx);
+            const auto it = hls->props.find(prop);
+            if (it != hls->props.end()) {
+                r.body = it->second;
+                if (!r.body.empty() && r.body.size() >= 8 &&
+                    std::memcmp(r.body.data(), "bplist00", 8) == 0) {
+                    r.set_header("Content-Type", "application/x-apple-binary-plist");
+                }
+                LOG_INFO << "getProperty cache hit: sid=" << sid
+                         << " key=" << prop << " bytes=" << r.body.size();
+                return r;
+            }
+        }
+    }
+    LOG_INFO << "getProperty cache miss: sid=" << (sid.empty() ? "<none>" : sid)
+             << " key=" << (prop.empty() ? "<none>" : prop);
+    return handle_stream_stub(req, "getProperty");
 }
 
 } // namespace
@@ -1182,8 +1262,10 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "POST" && path == "/action")           return handle_action(ctx, session, req);
     if (req.method == "POST" && path == "/stop")             return handle_stream_stub(req, "stop");
     if (req.method == "POST" && path == "/scrub")            return handle_stream_stub(req, "scrub");
-    if (req.method == "POST" && path == "/setProperty")      return handle_stream_stub(req, "setProperty");
-    if (req.method == "POST" && path == "/getProperty")      return handle_stream_stub(req, "getProperty");
+    if ((req.method == "POST" || req.method == "PUT") && path == "/setProperty")
+        return handle_set_property(req);
+    if ((req.method == "POST" || req.method == "PUT") && path == "/getProperty")
+        return handle_get_property(req);
     if (req.method == "GET"  && path == "/playback-info")    return handle_playback_info(req);
     // "/action" handled above (real parser).
     if (req.method == "POST" && path == "/command")          return handle_stream_stub(req, "command");
