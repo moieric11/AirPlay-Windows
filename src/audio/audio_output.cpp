@@ -49,7 +49,13 @@ void SdlAudioOutput::stop() {
         SDL_ClearQueuedAudio(device_);
         SDL_CloseAudioDevice(device_);
         device_ = 0;
-        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        // Deliberately NOT calling SDL_QuitSubSystem(SDL_INIT_AUDIO):
+        // stop() runs on the RTSP server thread during session
+        // teardown, and on Windows shutting down the SDL audio
+        // subsystem cross-thread can knock out the video event pump
+        // (spontaneous SDL_QUIT / window close). SDL_Quit() in the
+        // renderer's shutdown path will clean up the subsystem when
+        // the app actually exits.
     }
 }
 
