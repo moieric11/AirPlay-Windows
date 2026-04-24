@@ -169,13 +169,19 @@ void AudioReceiver::thread_fn() {
     // user manually pauses+resumes.
     constexpr int kSilencePauseMs = 500;
     auto last_packet = std::chrono::steady_clock::now();
+    // Arm the silence watchdog only after we've seen at least one real
+    // audio packet. Otherwise, a fresh mirror session that starts with
+    // iOS's keepalive-only dribble (sub-100B packets) would flip the
+    // renderer to rate=0 within 500ms and paint a pause badge over the
+    // first video frame, even though the iPhone is actively playing.
+    bool audio_ever_seen = false;
 
     while (running_.load()) {
         int n = ::recvfrom(cfg_.data_sock,
                            reinterpret_cast<char*>(buf), sizeof(buf), 0,
                            nullptr, nullptr);
         if (n < 0) {
-            if (cfg_.renderer) {
+            if (cfg_.renderer && audio_ever_seen) {
                 const auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - last_packet).count();
                 if (idle >= kSilencePauseMs) {
@@ -197,6 +203,7 @@ void AudioReceiver::thread_fn() {
         constexpr int kAudioPacketMinBytes = 100;
         if (n >= kAudioPacketMinBytes) {
             last_packet = std::chrono::steady_clock::now();
+            audio_ever_seen = true;
             // Suppress rate=1 during the post-FLUSH grace window: iOS
             // still drains its buffer with real audio for a few hundred
             // ms after a real pause FLUSH.
