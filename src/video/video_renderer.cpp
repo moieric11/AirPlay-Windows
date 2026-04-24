@@ -594,12 +594,15 @@ void VideoRenderer::run(const std::string& title) {
         }
 
         // --- Decide which texture to show ----------------------------
-        // Video takes priority if we got a frame within the last 500 ms.
-        // Otherwise fall back to the cover texture; if neither, black.
+        // Video takes priority if we got a recent frame. While paused,
+        // keep the last video frame on screen instead of falling back to
+        // stale cover art.
         const auto now = std::chrono::steady_clock::now();
         const bool video_fresh =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - last_video_frame_time).count() < 500;
+        const bool playing_now = playing_.load(std::memory_order_relaxed);
+        const bool show_video = video_tex && (video_fresh || !playing_now);
 
         int win_w = 0, win_h = 0;
         SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
@@ -607,9 +610,31 @@ void VideoRenderer::run(const std::string& title) {
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
 
-        if (video_fresh && video_tex) {
+        auto draw_pause_badge = [&](const SDL_Rect& dst) {
+            const int badge = std::min(dst.w, dst.h) / 6;
+            const int cx    = dst.x + dst.w / 2;
+            const int cy    = dst.y + dst.h / 2;
+            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 160);
+            SDL_Rect bg{cx - badge, cy - badge, badge * 2, badge * 2};
+            SDL_RenderFillRect(renderer, &bg);
+            const int bw = badge / 3;
+            const int bh = badge;
+            const int gap = badge / 3;
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 235);
+            SDL_Rect b1{cx - gap - bw, cy - bh / 2, bw, bh};
+            SDL_Rect b2{cx + gap,      cy - bh / 2, bw, bh};
+            SDL_RenderFillRect(renderer, &b1);
+            SDL_RenderFillRect(renderer, &b2);
+            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+        };
+
+        if (show_video) {
             SDL_Rect dst = fit_inside(video_tex_w, video_tex_h, win_w, win_h);
             SDL_RenderCopy(renderer, video_tex, nullptr, &dst);
+            if (!playing_now) {
+                draw_pause_badge(dst);
+            }
         } else if (cover_tex) {
             // Cover art centered in the top 70% of the window; the bottom
             // strip holds the metadata text (title / artist / album).
@@ -621,23 +646,8 @@ void VideoRenderer::run(const std::string& title) {
             // Pause indicator: two white bars on a semi-transparent black
             // square, centered on the cover. Only while iOS reports
             // rate: 0 via text/parameters (or POST /rate?value=0).
-            if (!playing_.load(std::memory_order_relaxed)) {
-                const int badge = std::min(dst.w, dst.h) / 6;
-                const int cx    = dst.x + dst.w / 2;
-                const int cy    = dst.y + dst.h / 2;
-                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 160);
-                SDL_Rect bg{cx - badge, cy - badge, badge * 2, badge * 2};
-                SDL_RenderFillRect(renderer, &bg);
-                const int bw = badge / 3;
-                const int bh = badge;
-                const int gap = badge / 3;
-                SDL_SetRenderDrawColor(renderer, 255, 255, 255, 235);
-                SDL_Rect b1{cx - gap - bw, cy - bh / 2, bw, bh};
-                SDL_Rect b2{cx + gap,      cy - bh / 2, bw, bh};
-                SDL_RenderFillRect(renderer, &b1);
-                SDL_RenderFillRect(renderer, &b2);
-                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+            if (!playing_now) {
+                draw_pause_badge(dst);
             }
 
             // Text lines stacked left-aligned with a small margin.
@@ -663,7 +673,7 @@ void VideoRenderer::run(const std::string& title) {
             const uint32_t total_ms        = progress_total_ms_.load(std::memory_order_relaxed);
             const uint32_t elapsed_pushed  = progress_elapsed_ms_.load(std::memory_order_relaxed);
             const int64_t  pushed_at_ns    = progress_pushed_at_ns_.load(std::memory_order_relaxed);
-            const bool     playing         = playing_.load(std::memory_order_relaxed);
+            const bool     playing         = playing_now;
             uint32_t elapsed_ms = elapsed_pushed;
             if (total_ms > 0 && playing && pushed_at_ns > 0) {
                 const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
