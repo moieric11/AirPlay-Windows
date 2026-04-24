@@ -132,7 +132,13 @@ int main(int argc, char** argv) {
     if (!renderer.start("AirPlay-Windows")) {
         LOG_WARN << "VideoRenderer could not start — running headless";
     }
-    renderer.set_idle_info(ctx.name, local_ip);
+    // Prefer the v4 address on the idle screen (shorter, more familiar),
+    // but fall back to v6 if we're on a v6-only network. Without this,
+    // an v6-only host would display "0.0.0.0" to the user.
+    const std::string display_ip =
+        (local_ip.empty() || local_ip == "0.0.0.0") && !local_ipv6.empty()
+            ? local_ipv6 : local_ip;
+    renderer.set_idle_info(ctx.name, display_ip);
     ctx.renderer = &renderer;
 
     ap::video::HlsPlayer hls_player;
