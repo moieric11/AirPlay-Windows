@@ -7,6 +7,7 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <utility>
 
 extern "C" {
 #include <libavformat/avio.h>
@@ -330,6 +331,19 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
                 send_response(504, "Gateway Timeout", "", "text/plain");
                 ap::net::close_socket(client.fd);
                 return;
+            }
+        } else if (!is_master &&
+                   body.find("#EXT-X-ENDLIST") == std::string::npos) {
+            std::string refreshed;
+            if (HlsSessionRegistry::instance().fetch_playlist(
+                    mlhls_url, refreshed, true)) {
+                body = std::move(refreshed);
+                cached = false;
+                LOG_INFO << "HLS GET " << path
+                         << " (media) refreshed non-final playlist";
+            } else {
+                LOG_WARN << "HLS GET " << path
+                         << " refresh failed; serving cached non-final playlist";
             }
         }
         body = rewrite_urls(body);

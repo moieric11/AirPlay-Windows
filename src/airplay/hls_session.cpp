@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstring>
+#include <utility>
 
 namespace ap::airplay {
 
@@ -32,15 +34,30 @@ HlsSession* HlsSessionRegistry::find(const std::string& session_id) {
     return it == sessions_.end() ? nullptr : it->second.get();
 }
 
+void HlsSessionRegistry::set_active_session(const std::string& session_id) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    active_session_id_ = session_id;
+}
+
 void HlsSessionRegistry::remove(const std::string& session_id) {
     std::lock_guard<std::mutex> lock(mtx_);
     sessions_.erase(session_id);
+    if (active_session_id_ == session_id) active_session_id_.clear();
 }
 
 std::string HlsSessionRegistry::resolve_segment_path(
         const std::string& local_path) const {
     std::lock_guard<std::mutex> lock(mtx_);
+    if (!active_session_id_.empty()) {
+        const auto active = sessions_.find(active_session_id_);
+        if (active != sessions_.end() && active->second) {
+            std::lock_guard<std::mutex> sl(active->second->seg_url_mtx);
+            const auto it = active->second->seg_url_map.find(local_path);
+            if (it != active->second->seg_url_map.end()) return it->second;
+        }
+    }
     for (const auto& [sid, s] : sessions_) {
+        if (sid == active_session_id_) continue;
         if (!s) continue;
         std::lock_guard<std::mutex> sl(s->seg_url_mtx);
         const auto it = s->seg_url_map.find(local_path);
@@ -53,19 +70,31 @@ bool HlsSessionRegistry::lookup_playlist(const std::string& url,
                                          std::string& out_bytes,
                                          bool& out_is_master) const {
     std::lock_guard<std::mutex> lock(mtx_);
-    for (const auto& [sid, s] : sessions_) {
-        if (!s) continue;
-        if (s->master_url == url) {
-            out_bytes     = s->master_playlist;
+    auto lookup_in_session = [&](const HlsSession& s) {
+        if (s.master_url == url) {
+            out_bytes     = s.master_playlist;
             out_is_master = true;
             return !out_bytes.empty();
         }
-        const auto it = s->media_playlists.find(url);
-        if (it != s->media_playlists.end()) {
+        const auto it = s.media_playlists.find(url);
+        if (it != s.media_playlists.end()) {
             out_bytes     = it->second;
             out_is_master = false;
             return !out_bytes.empty();
         }
+        return false;
+    };
+    if (!active_session_id_.empty()) {
+        const auto active = sessions_.find(active_session_id_);
+        if (active != sessions_.end() && active->second &&
+            lookup_in_session(*active->second)) {
+            return true;
+        }
+    }
+    for (const auto& [sid, s] : sessions_) {
+        if (sid == active_session_id_) continue;
+        if (!s) continue;
+        if (lookup_in_session(*s)) return true;
     }
     return false;
 }
@@ -84,7 +113,21 @@ bool HlsSessionRegistry::fetch_segment(const std::string& url,
     int         request_id = 0;
     {
         std::lock_guard<std::mutex> lock(mtx_);
+        if (!active_session_id_.empty()) {
+            const auto active = sessions_.find(active_session_id_);
+            if (active != sessions_.end() && active->second) {
+                const int fd =
+                    ReverseChannelRegistry::instance().socket_for(active_session_id_);
+                if (fd >= 0) {
+                    s           = active->second.get();
+                    session_id  = active_session_id_;
+                    reverse_fd  = fd;
+                    request_id  = s->next_request_id.fetch_add(1);
+                }
+            }
+        }
         for (auto& [sid, sess] : sessions_) {
+            if (s) break;
             if (!sess) continue;
             const int fd =
                 ReverseChannelRegistry::instance().socket_for(sid);
@@ -92,7 +135,7 @@ bool HlsSessionRegistry::fetch_segment(const std::string& url,
             s           = sess.get();
             session_id  = sid;
             reverse_fd  = fd;
-            request_id  = s->next_request_id++;
+            request_id  = s->next_request_id.fetch_add(1);
             break;
         }
     }
@@ -118,6 +161,10 @@ bool HlsSessionRegistry::fetch_segment(const std::string& url,
         }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(s->seg_mtx);
+        s->request_generations[request_id] = s->playback_generation.load();
+    }
     if (!send_fcup_request(reverse_fd, url, session_id, request_id)) {
         LOG_WARN << "fetch_segment: FCUP send failed for " << url;
         return false;
@@ -173,6 +220,7 @@ void HlsSessionRegistry::deliver_segment(const std::string& session_id,
 
 bool HlsSessionRegistry::fetch_playlist(const std::string& url,
                                         std::string& out_bytes,
+                                        bool force_refresh,
                                         int timeout_ms) {
     // Pick the most recent session with a reverse channel (single
     // iPhone = single session) and FCUP the requested .m3u8 URL,
@@ -184,7 +232,21 @@ bool HlsSessionRegistry::fetch_playlist(const std::string& url,
     int         request_id = 0;
     {
         std::lock_guard<std::mutex> lock(mtx_);
+        if (!active_session_id_.empty()) {
+            const auto active = sessions_.find(active_session_id_);
+            if (active != sessions_.end() && active->second) {
+                const int fd =
+                    ReverseChannelRegistry::instance().socket_for(active_session_id_);
+                if (fd >= 0) {
+                    s          = active->second.get();
+                    session_id = active_session_id_;
+                    reverse_fd = fd;
+                    request_id = s->next_request_id.fetch_add(1);
+                }
+            }
+        }
         for (auto& [sid, sess] : sessions_) {
+            if (s) break;
             if (!sess) continue;
             const int fd =
                 ReverseChannelRegistry::instance().socket_for(sid);
@@ -192,24 +254,41 @@ bool HlsSessionRegistry::fetch_playlist(const std::string& url,
             s          = sess.get();
             session_id = sid;
             reverse_fd = fd;
-            request_id = s->next_request_id++;
+            request_id = s->next_request_id.fetch_add(1);
             break;
         }
     }
     if (!s) return false;
 
-    // Maybe it was already delivered while we were initialising.
+    // Maybe it was already delivered while we were initialising. Media
+    // playlists without EXT-X-ENDLIST are refreshed on demand because
+    // YouTube may extend the window as playback advances.
+    std::string previous_playlist;
+    bool had_previous_playlist = false;
     {
         std::lock_guard<std::mutex> lock(s->seg_mtx);
         const auto it = s->media_playlists.find(url);
-        if (it != s->media_playlists.end()) {
+        if (!force_refresh && it != s->media_playlists.end()) {
             out_bytes = it->second;
             return true;
         }
+        if (force_refresh && it != s->media_playlists.end()) {
+            previous_playlist = it->second;
+            had_previous_playlist = true;
+            s->media_playlists.erase(it);
+        }
     }
 
+    {
+        std::lock_guard<std::mutex> lock(s->seg_mtx);
+        s->request_generations[request_id] = s->playback_generation.load();
+    }
     if (!send_fcup_request(reverse_fd, url, session_id, request_id)) {
         LOG_WARN << "fetch_playlist: FCUP send failed for " << url;
+        if (had_previous_playlist) {
+            std::lock_guard<std::mutex> lock(s->seg_mtx);
+            s->media_playlists[url] = std::move(previous_playlist);
+        }
         return false;
     }
 
@@ -220,6 +299,9 @@ bool HlsSessionRegistry::fetch_playlist(const std::string& url,
     if (!arrived) {
         LOG_WARN << "fetch_playlist: timeout after " << timeout_ms
                  << "ms for " << url;
+        if (had_previous_playlist) {
+            s->media_playlists[url] = std::move(previous_playlist);
+        }
         return false;
     }
     out_bytes = s->media_playlists[url];
@@ -548,41 +630,61 @@ std::string filter_master_to_single_variant(const std::string& master) {
 
     // --- Pass 2: rebuild.
     //   - Keep all header tags not of interest as-is.
-    //   - For #EXT-X-MEDIA:TYPE=AUDIO: keep only entries whose
-    //     GROUP-ID matches audio_group. Within that group, prefer
-    //     the one with DEFAULT=YES, else AUTOSELECT=YES, else the
-    //     first one seen.
-    //   - For #EXT-X-MEDIA:TYPE!=AUDIO (e.g. SUBTITLES, CLOSED-
-    //     CAPTIONS): keep the first per TYPE so captions still work.
+    //   - For #EXT-X-MEDIA:TYPE=AUDIO: keep only one entry whose
+    //     GROUP-ID matches audio_group. Prefer French if available,
+    //     then DEFAULT=YES, AUTOSELECT=YES, then the first one seen.
+    //   - Drop non-audio MEDIA entries so GStreamer doesn't download
+    //     subtitle/caption side playlists while we only render video.
     //   - For #EXT-X-STREAM-INF: keep only the first one + its URI.
     std::string out;
     out.reserve(master.size());
 
+    auto lower_ascii = [](std::string s) {
+        for (char& c : s) {
+            c = static_cast<char>(std::tolower(
+                static_cast<unsigned char>(c)));
+        }
+        return s;
+    };
+    auto is_yes = [](const std::string& s) {
+        return s == "YES" || s == "yes" || s == "1";
+    };
+    auto looks_french = [&](const std::string& line) {
+        const std::string lang = lower_ascii(quoted(line, "LANGUAGE="));
+        const std::string name = lower_ascii(quoted(line, "NAME="));
+        return lang == "fr" || lang == "fra" || lang == "fre" ||
+               lang.rfind("fr-", 0) == 0 ||
+               name.find("franc") != std::string::npos ||
+               name.find("french") != std::string::npos;
+    };
+
     // Preselect the single audio rendition.
     std::size_t chosen_audio = std::string::npos;
     {
-        std::size_t default_idx = std::string::npos;
-        std::size_t autoselect_idx = std::string::npos;
-        std::size_t first_idx = std::string::npos;
+        int best_score = -1;
         for (std::size_t i = 0; i < lines.size(); ++i) {
             const auto& l = lines[i];
             if (l.compare(0, 13, "#EXT-X-MEDIA:") != 0) continue;
             if (bare_attr(l, "TYPE=") != "AUDIO") continue;
             if (!audio_group.empty() &&
                 quoted(l, "GROUP-ID=") != audio_group) continue;
-            if (first_idx == std::string::npos) first_idx = i;
-            if (quoted(l, "DEFAULT=") == "YES" &&
-                default_idx == std::string::npos) default_idx = i;
-            if (quoted(l, "AUTOSELECT=") == "YES" &&
-                autoselect_idx == std::string::npos) autoselect_idx = i;
+            int score = 1;
+            if (is_yes(quoted(l, "AUTOSELECT="))) score += 10;
+            if (is_yes(quoted(l, "DEFAULT="))) score += 20;
+            if (looks_french(l)) score += 100;
+            if (score > best_score) {
+                best_score = score;
+                chosen_audio = i;
+            }
         }
-        if      (default_idx    != std::string::npos) chosen_audio = default_idx;
-        else if (autoselect_idx != std::string::npos) chosen_audio = autoselect_idx;
-        else                                          chosen_audio = first_idx;
     }
-
-    // Preselect a single non-AUDIO MEDIA entry per TYPE (first seen).
-    std::vector<std::string> kept_nonaudio_types;
+    if (chosen_audio != std::string::npos) {
+        LOG_INFO << "HLS master filter: audio="
+                 << quoted(lines[chosen_audio], "LANGUAGE=")
+                 << " name=\"" << quoted(lines[chosen_audio], "NAME=")
+                 << "\" group=\"" << quoted(lines[chosen_audio], "GROUP-ID=")
+                 << '"';
+    }
 
     bool emitted_stream_inf = false;
     for (std::size_t i = 0; i < lines.size(); ++i) {
@@ -593,12 +695,6 @@ std::string filter_master_to_single_variant(const std::string& master) {
             if (type == "AUDIO") {
                 if (i == chosen_audio) { out.append(l); out.push_back('\n'); }
                 continue;
-            }
-            if (std::find(kept_nonaudio_types.begin(),
-                          kept_nonaudio_types.end(), type)
-                == kept_nonaudio_types.end()) {
-                kept_nonaudio_types.push_back(type);
-                out.append(l); out.push_back('\n');
             }
             continue;
         }

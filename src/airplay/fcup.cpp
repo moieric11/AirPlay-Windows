@@ -57,6 +57,8 @@ bool send_fcup_request(int fd,
         plist_new_string(
             "AppleCoreMedia/1.0.0.11B554a (Apple TV; U; CPU OS 7_0_4 "
             "like Mac OS X; en_us"));
+    plist_dict_set_item(hdrs, "Accept-Language",
+        plist_new_string("fr-FR,fr;q=0.9,en;q=0.8"));
     plist_dict_set_item(fcup, "FCUP_Response_Headers", hdrs);
 
     plist_dict_set_item(root, "request", fcup);

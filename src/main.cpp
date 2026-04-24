@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <string>
 #include <thread>
 
 namespace {

@@ -2,6 +2,7 @@
 
 #include <condition_variable>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -22,7 +23,9 @@ struct HlsSession {
     std::string              session_id;        // X-Apple-Session-ID
     std::string              master_url;        // canonical master.m3u8 URL
     std::string              master_playlist;   // raw bytes (iOS-delivered)
-    int                      next_request_id = 2;   // 1 was used for master
+    std::atomic<int>         next_request_id{1};
+    std::atomic<int>         master_request_id{0};
+    std::atomic<int>         playback_generation{0};
     std::vector<std::string> media_uris;        // mlhls://localhost/itag/..
     std::unordered_map<std::string, std::string> media_playlists; // url->content
 
@@ -38,6 +41,7 @@ struct HlsSession {
     std::condition_variable                               seg_cv;
     std::unordered_map<std::string, std::string>          segment_data;       // raw bytes (empty string on 302)
     std::unordered_map<std::string, std::string>          segment_redirect;   // Location URL on 302
+    std::unordered_map<int, int>                          request_generations; // FCUP request id -> playback_generation
 
     // Local /seg/<id> -> real CDN URL mapping. Populated when the
     // expanded media playlist is rewritten so every segment URI
@@ -51,6 +55,9 @@ struct HlsSession {
     // Lightweight playback state surfaced via GET /playback-info.
     std::atomic<bool>                                     playback_started{false};
     std::atomic<bool>                                     media_playlist_ready{false};
+    std::atomic<double>                                   playback_position_base{0.0};
+    std::atomic<double>                                   playback_rate{0.0};
+    std::atomic<int64_t>                                  playback_anchor_ms{0};
 
     // Best-effort cache of POST /setProperty payloads so matching
     // /getProperty calls can echo the latest known value.
@@ -68,6 +75,12 @@ public:
 
     // Best-effort lookup (no allocation).
     HlsSession* find(const std::string& session_id);
+
+    // Mark the HLS session that should back the session-less local
+    // /master.m3u8 and /seg/<n> URLs. YouTube commonly reuses those
+    // local paths across video changes, so stale sessions must not win
+    // registry scans.
+    void set_active_session(const std::string& session_id);
 
     // Remove + free. Called on TEARDOWN / session end.
     void remove(const std::string& session_id);
@@ -116,6 +129,7 @@ public:
     // handle_action stores the result in media_playlists.
     bool fetch_playlist(const std::string& url,
                         std::string& out_bytes,
+                        bool force_refresh = false,
                         int timeout_ms = 5000);
 
     // Wake fetch_playlist() waiters when handle_action adds a new
@@ -128,6 +142,7 @@ private:
 
     mutable std::mutex                                   mtx_;
     std::unordered_map<std::string, std::unique_ptr<HlsSession>> sessions_;
+    std::string                                          active_session_id_;
 };
 
 // Extract every occurrence of `mlhls://localhost/.../*.m3u8` from a
