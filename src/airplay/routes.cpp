@@ -482,15 +482,21 @@ Response handle_teardown(const DeviceContext& ctx, ClientSession& session, const
         LOG_INFO << "TEARDOWN full session=" << session.streams->session_id()
                  << " — AirPlay session ended";
         const std::string sid = req.header("x-apple-session-id");
+        LOG_INFO << "TEARDOWN: streams.reset() begin";
         session.streams.reset();
+        LOG_INFO << "TEARDOWN: streams.reset() done";
         session.sdp.reset();
+        LOG_INFO << "TEARDOWN: sdp.reset() done";
         // Wipe the idle-mode UI so a new connection doesn't inherit the
         // last track's cover, metadata and progress.
         if (session.renderer) session.renderer->clear_session();
+        LOG_INFO << "TEARDOWN: renderer.clear_session() done";
         // Full session end: stop the HLS player so the player thread
         // doesn't keep fetching stale segments.
         if (ctx.hls_player) ctx.hls_player->stop();
+        LOG_INFO << "TEARDOWN: hls_player.stop() done";
         if (!sid.empty()) HlsSessionRegistry::instance().set_active_session("");
+        LOG_INFO << "TEARDOWN: full cleanup complete";
     } else {
         // No session state and no stream filter — treat as a full
         // teardown too, since iOS may send an empty body to end a

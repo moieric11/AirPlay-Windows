@@ -297,10 +297,16 @@ void StreamSession::set_audio_volume_db(float db) {
 }
 
 void StreamSession::teardown() {
-    if (ntp_)    { ntp_->stop();    ntp_.reset(); }
-    if (mirror_) { mirror_->stop(); mirror_.reset(); }
-    if (audio_)  { audio_->stop();  audio_.reset(); }
+    LOG_INFO << "StreamSession::teardown begin session=" << session_id_
+             << " ntp=" << (ntp_ ? "yes" : "no")
+             << " mirror=" << (mirror_ ? "yes" : "no")
+             << " audio=" << (audio_ ? "yes" : "no")
+             << " channels=" << channels_.size();
+    if (ntp_)    { LOG_INFO << "teardown: ntp stop"; ntp_->stop(); ntp_.reset(); }
+    if (mirror_) { LOG_INFO << "teardown: mirror stop"; mirror_->stop(); mirror_.reset(); }
+    if (audio_)  { LOG_INFO << "teardown: audio stop"; audio_->stop();  audio_.reset(); }
 
+    LOG_INFO << "teardown: closing session sockets";
     for (auto* sp : { &data_sock_, &ctrl_sock_, &timing_sock_,
                        &event_sock_, &ap2_timing_sock }) {
         if (*sp != INVALID_SOCK) {
@@ -308,11 +314,13 @@ void StreamSession::teardown() {
             *sp = INVALID_SOCK;
         }
     }
+    LOG_INFO << "teardown: closing channel sockets";
     for (auto& ch : channels_) {
         if (ch.data_sock    != INVALID_SOCK) ap::net::close_socket(ch.data_sock);
         if (ch.control_sock != INVALID_SOCK) ap::net::close_socket(ch.control_sock);
     }
     channels_.clear();
+    LOG_INFO << "teardown: done";
 }
 
 } // namespace ap::airplay

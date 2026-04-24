@@ -449,6 +449,7 @@ void VideoRenderer::run(const std::string& title) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) {
+                LOG_INFO << "VideoRenderer received SDL_QUIT";
                 closed_  = true;
                 running_ = false;
                 break;

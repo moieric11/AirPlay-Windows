@@ -169,7 +169,8 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    LOG_INFO << "Shutting down...";
+    LOG_INFO << "Shutting down... (g_stop=" << g_stop.load()
+             << " user_closed=" << renderer.user_closed() << ")";
     mdns.stop();
     hls_player.stop();
     hls_server.stop();
