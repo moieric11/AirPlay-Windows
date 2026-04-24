@@ -197,10 +197,10 @@ if(USE_GSTREAMER_HLS)
         endif()
     endif()
     pkg_check_modules(GSTREAMER IMPORTED_TARGET
-        gstreamer-1.0 gstreamer-app-1.0)
+        gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
     if(NOT GSTREAMER_FOUND)
         message(FATAL_ERROR
-            "USE_GSTREAMER_HLS=ON but gstreamer-1.0/gstreamer-app-1.0 not found.\n"
+            "USE_GSTREAMER_HLS=ON but gstreamer-1.0/gstreamer-app-1.0/gstreamer-video-1.0 not found.\n"
             "  Windows: install GStreamer MSVC x86_64 from\n"
             "           https://gstreamer.freedesktop.org/download/ and either\n"
             "             set PKG_CONFIG_PATH before cmake, or pass\n"

@@ -9,9 +9,13 @@ extern "C" {
 }
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 
 // libavformat-backed HlsPlayer. Default backend; the GStreamer
 // variant lives in hls_player_gstreamer.cpp and is selected with
@@ -21,31 +25,76 @@ namespace ap::video {
 
 struct HlsPlayer::Impl {
     std::atomic<bool> running{false};
+    std::atomic<double> rate{1.0};
+    std::atomic<double> pending_seek{-1.0};
     std::thread       thread;
     VideoRenderer*    renderer = nullptr;
+    std::mutex        callback_mtx;
+    std::function<void()> end_callback;
 
     void run(std::string url);
+    static int interrupt_cb(void* opaque);
+    void notify_end();
 };
 
 HlsPlayer::HlsPlayer()  : impl_(new Impl) {}
 HlsPlayer::~HlsPlayer() { stop(); delete impl_; }
 
 bool HlsPlayer::start(const std::string& url, VideoRenderer* renderer) {
-    if (impl_->running.exchange(true)) return false;
+    stop();
+    impl_->running.store(true);
+    impl_->rate.store(1.0);
     impl_->renderer = renderer;
     impl_->thread   = std::thread([this, url] { impl_->run(url); });
     return true;
 }
 
+void HlsPlayer::set_rate(double rate) {
+    impl_->rate.store(rate);
+}
+
+void HlsPlayer::seek(double position_seconds) {
+    if (position_seconds >= 0.0) {
+        impl_->pending_seek.store(position_seconds);
+    }
+}
+
+void HlsPlayer::set_end_callback(std::function<void()> callback) {
+    std::lock_guard<std::mutex> lock(impl_->callback_mtx);
+    impl_->end_callback = std::move(callback);
+}
+
 void HlsPlayer::stop() {
-    if (!impl_->running.exchange(false)) return;
+    impl_->running.store(false);
     if (impl_->thread.joinable()) impl_->thread.join();
+}
+
+int HlsPlayer::Impl::interrupt_cb(void* opaque) {
+    auto* self = static_cast<Impl*>(opaque);
+    return (self && !self->running.load()) ? 1 : 0;
+}
+
+void HlsPlayer::Impl::notify_end() {
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(callback_mtx);
+        cb = end_callback;
+    }
+    if (cb) cb();
 }
 
 void HlsPlayer::Impl::run(std::string url) {
     LOG_INFO << "HlsPlayer open " << url;
 
-    AVFormatContext* fmt = nullptr;
+    AVFormatContext* fmt = avformat_alloc_context();
+    if (!fmt) {
+        LOG_ERROR << "HlsPlayer avformat_alloc_context failed";
+        running = false;
+        return;
+    }
+    fmt->interrupt_callback.callback = &HlsPlayer::Impl::interrupt_cb;
+    fmt->interrupt_callback.opaque   = this;
+
     AVDictionary*    opts = nullptr;
     av_dict_set(&opts, "probesize",        "131072", 0);
     av_dict_set(&opts, "analyzeduration",  "500000", 0);
@@ -62,6 +111,7 @@ void HlsPlayer::Impl::run(std::string url) {
         char errbuf[128] = {0};
         av_strerror(open_rc, errbuf, sizeof(errbuf));
         LOG_ERROR << "HlsPlayer avformat_open_input failed: " << errbuf;
+        if (fmt) avformat_close_input(&fmt);
         running = false;
         return;
     }
@@ -111,9 +161,31 @@ void HlsPlayer::Impl::run(std::string url) {
     AVFrame*  frm = av_frame_alloc();
 
     while (running.load()) {
+        const double seek_to = pending_seek.exchange(-1.0);
+        if (seek_to >= 0.0) {
+            const int64_t ts =
+                static_cast<int64_t>(seek_to * static_cast<double>(AV_TIME_BASE));
+            const int rc = av_seek_frame(fmt, -1, ts, AVSEEK_FLAG_BACKWARD);
+            if (rc >= 0) {
+                avcodec_flush_buffers(dec);
+                LOG_INFO << "HlsPlayer seek position=" << seek_to << 's';
+            } else {
+                char errbuf[128] = {0};
+                av_strerror(rc, errbuf, sizeof(errbuf));
+                LOG_WARN << "HlsPlayer seek failed position=" << seek_to
+                         << "s: " << errbuf;
+            }
+        }
+        while (running.load() && rate.load() <= 0.0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (!running.load()) break;
+
         const int read_rc = av_read_frame(fmt, pkt);
         if (read_rc == AVERROR_EOF) {
             LOG_INFO << "HlsPlayer: EOF";
+            running.store(false);
+            notify_end();
             break;
         }
         if (read_rc < 0) {

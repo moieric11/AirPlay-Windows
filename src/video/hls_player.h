@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -29,6 +30,9 @@ public:
     HlsPlayer& operator=(const HlsPlayer&) = delete;
 
     bool start(const std::string& url, VideoRenderer* renderer);
+    void set_rate(double rate);
+    void seek(double position_seconds);
+    void set_end_callback(std::function<void()> callback);
     void stop();
 
 private:
