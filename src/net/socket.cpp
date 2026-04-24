@@ -100,13 +100,15 @@ int send_all(socket_t s, const void* buf, int len) {
 // "first non-loopback" enumeration.
 namespace {
 std::string primary_ipv4_via_route() {
+    // Intentional: this helper is v4-specific by design. The IPv6
+    // equivalent lives in primary_ipv6_via_route() below.
     socket_t s = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (s == INVALID_SOCK) return "0.0.0.0";
 
     sockaddr_in peer{};
     peer.sin_family = AF_INET;
     peer.sin_port   = htons(53);
-    inet_pton(AF_INET, "8.8.8.8", &peer.sin_addr);
+    inet_pton(AF_INET, "8.8.8.8", &peer.sin_addr);   // v4-only probe
 
     std::string result = "0.0.0.0";
     if (::connect(s, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) == 0) {
@@ -172,29 +174,45 @@ std::string primary_ipv4() {
 }
 
 std::string primary_mac() {
-    // Find the adapter whose IPv4 matches primary_ipv4() and return its MAC.
-    // This way the MAC and IP always belong to the same interface — iOS
-    // correlates `deviceid` (MAC) and the RTSP socket IP.
-    const std::string target_ip = primary_ipv4();
+    // Find the adapter whose IP (v4 or v6) matches the one we advertise
+    // and return its MAC. iOS correlates `deviceid` (MAC) with the RTSP
+    // socket's local IP, so the two must come from the same interface.
+    // On an IPv6-only network primary_ipv4() is "0.0.0.0" — we'd never
+    // match anything and fall back to a bogus 02:00:... MAC that iOS
+    // refuses to re-pair with. Enumerate both families and match either.
+    const std::string target_v4 = primary_ipv4();
+    const std::string target_v6 = primary_ipv6();
 
     ULONG size = 15 * 1024;
     std::vector<unsigned char> buf(size);
     auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
-    DWORD rc = GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &size);
+    DWORD rc = GetAdaptersAddresses(AF_UNSPEC, 0, nullptr, adapters, &size);
     if (rc == ERROR_BUFFER_OVERFLOW) {
         buf.resize(size);
         adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
-        rc = GetAdaptersAddresses(AF_INET, 0, nullptr, adapters, &size);
+        rc = GetAdaptersAddresses(AF_UNSPEC, 0, nullptr, adapters, &size);
     }
     if (rc != NO_ERROR) return "02:00:00:00:00:00";
 
     for (auto* a = adapters; a; a = a->Next) {
         if (a->PhysicalAddressLength != 6) continue;
         for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
-            auto* sa = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr);
-            char ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
-            if (target_ip == ip) {
+            const auto* sa = u->Address.lpSockaddr;
+            if (!sa) continue;
+            char ip[INET6_ADDRSTRLEN] = {0};
+            if (sa->sa_family == AF_INET) {
+                const auto* in4 = reinterpret_cast<const sockaddr_in*>(sa);
+                inet_ntop(AF_INET, &in4->sin_addr, ip, sizeof(ip));
+            } else if (sa->sa_family == AF_INET6) {
+                const auto* in6 = reinterpret_cast<const sockaddr_in6*>(sa);
+                inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof(ip));
+            } else {
+                continue;
+            }
+            const bool match =
+                (!target_v4.empty() && target_v4 != "0.0.0.0" && target_v4 == ip) ||
+                (!target_v6.empty() && target_v6 == ip);
+            if (match) {
                 char out[18];
                 std::snprintf(out, sizeof(out),
                               "%02X:%02X:%02X:%02X:%02X:%02X",
