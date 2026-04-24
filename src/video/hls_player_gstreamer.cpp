@@ -35,6 +35,7 @@ struct HlsPlayer::Impl {
     GstElement*        appsink      = nullptr;
     GMainLoop*         loop         = nullptr;
     std::thread        loop_thread;
+    guint              bus_watch_id = 0;
     VideoRenderer*     renderer     = nullptr;
     std::atomic<bool>  running{false};
 
@@ -155,7 +156,7 @@ bool HlsPlayer::start(const std::string& url, VideoRenderer* renderer) {
                      G_CALLBACK(&Impl::on_new_sample), impl_);
 
     GstBus* bus = gst_element_get_bus(impl_->pipeline);
-    gst_bus_add_watch(bus, &Impl::on_bus_message, impl_);
+    impl_->bus_watch_id = gst_bus_add_watch(bus, &Impl::on_bus_message, impl_);
     gst_object_unref(bus);
 
     LOG_INFO << "HlsPlayer(gst) open " << url;
@@ -177,11 +178,21 @@ void HlsPlayer::stop() {
 
     // Drain the pipeline to NULL *before* quitting the main loop so
     // GStreamer has a chance to flush any in-flight buffer/message
-    // while its thread is still running. Otherwise we can destroy
-    // the bus with callbacks still pending and hit a use-after-free
-    // on the next start().
+    // while its thread is still running. Wait synchronously for the
+    // state transition to complete, otherwise we can destroy the bus
+    // with callbacks still pending and hit a use-after-free on the
+    // next start().
     if (impl_->pipeline) {
         gst_element_set_state(impl_->pipeline, GST_STATE_NULL);
+        gst_element_get_state(impl_->pipeline, nullptr, nullptr,
+                              GST_CLOCK_TIME_NONE);
+    }
+    // Remove the bus watch before quitting the loop / destroying the
+    // pipeline. Otherwise the watch source stays registered on the
+    // default main context and fires against a freed impl_ next time.
+    if (impl_->bus_watch_id) {
+        g_source_remove(impl_->bus_watch_id);
+        impl_->bus_watch_id = 0;
     }
     if (impl_->loop) g_main_loop_quit(impl_->loop);
     if (impl_->loop_thread.joinable()) impl_->loop_thread.join();
