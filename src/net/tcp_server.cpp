@@ -94,9 +94,13 @@ void TcpServer::accept_loop() {
 
         // Format the peer as a human-readable "ip:port". For v4-mapped
         // v6 addresses (::ffff:A.B.C.D), strip the prefix so iOS clients
-        // connecting over v4 still show up as plain dotted-quad.
+        // connecting over v4 still show up as plain dotted-quad. For
+        // real IPv6 peers bracket the address — "[2a0f:d00::1]:49152" —
+        // so downstream parsers (server.cpp, logs) can strip the port
+        // without guessing which colon belongs to which side.
         char ip[INET6_ADDRSTRLEN] = {0};
         uint16_t peer_port = 0;
+        bool peer_is_v6 = false;
         if (peer.ss_family == AF_INET6) {
             auto* in6 = reinterpret_cast<sockaddr_in6*>(&peer);
             if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr)) {
@@ -105,6 +109,7 @@ void TcpServer::accept_loop() {
                 inet_ntop(AF_INET, &a, ip, sizeof(ip));
             } else {
                 inet_ntop(AF_INET6, &in6->sin6_addr, ip, sizeof(ip));
+                peer_is_v6 = true;
             }
             peer_port = ntohs(in6->sin6_port);
         } else if (peer.ss_family == AF_INET) {
@@ -115,7 +120,9 @@ void TcpServer::accept_loop() {
 
         ClientSocket client;
         client.fd   = fd;
-        client.peer = std::string(ip) + ":" + std::to_string(peer_port);
+        client.peer = peer_is_v6
+            ? "[" + std::string(ip) + "]:" + std::to_string(peer_port)
+            : std::string(ip) + ":" + std::to_string(peer_port);
 
         LOG_INFO << "accepted " << client.peer;
         workers_.emplace_back([h = handler_, c = std::move(client)]() mutable {

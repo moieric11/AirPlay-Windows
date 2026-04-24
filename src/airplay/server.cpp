@@ -20,10 +20,20 @@ void Server::handle_client(ap::net::ClientSocket client) {
     RequestReader reader;
     Request req;
 
-    // Peer is "ip:port"; split off the IP for the NTP client destination.
+    // Peer is formatted by tcp_server as "ip:port" for v4 and v4-mapped,
+    // "[ip]:port" for real IPv6. Strip brackets first when present, then
+    // cut at the final ':'. The bracketed form is unambiguous; the
+    // unbracketed-v4 form has exactly one ':'.
     std::string peer_ip = client.peer;
-    auto colon = peer_ip.rfind(':');
-    if (colon != std::string::npos) peer_ip.resize(colon);
+    if (!peer_ip.empty() && peer_ip.front() == '[') {
+        const auto close_br = peer_ip.find(']');
+        peer_ip = (close_br == std::string::npos)
+                    ? peer_ip.substr(1)
+                    : peer_ip.substr(1, close_br - 1);
+    } else {
+        const auto colon = peer_ip.rfind(':');
+        if (colon != std::string::npos) peer_ip.resize(colon);
+    }
 
     ClientSession session(*ctx_.identity, peer_ip,
                           static_cast<int>(client.fd), ctx_.renderer);
