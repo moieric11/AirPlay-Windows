@@ -9,6 +9,7 @@
     #include <ws2tcpip.h>
 #else
     #include <arpa/inet.h>
+    #include <netdb.h>
     #include <netinet/in.h>
     #include <sys/socket.h>
     #include <sys/time.h>
@@ -91,7 +92,25 @@ bool NtpClient::start(socket_t sock, const std::string& remote_ip, uint16_t remo
 }
 
 void NtpClient::stop() {
-    if (!running_.exchange(false)) return;
+    // The thread may have exited on its own (e.g. inet_pton failed at
+    // startup because remote_ip_ is IPv6 — AF_INET rejects it and the
+    // worker sets running_=false and returns). In that case running_
+    // is already false here but thread_ is still JOINABLE. If we skip
+    // thread_.join() and let ~NtpClient() run, the std::thread
+    // destructor sees a joinable thread and calls std::terminate(),
+    // silently killing the whole process on teardown. Always join
+    // before returning.
+    const bool was_running = running_.exchange(false);
+    if (was_running && sock_ != INVALID_SOCK) {
+        // Wake a blocking recvfrom immediately instead of waiting for
+        // the 1 s SO_RCVTIMEO. shutdown() is non-destructive — the
+        // socket remains valid for its owner to closesocket() later.
+#if defined(_WIN32)
+        ::shutdown(sock_, SD_BOTH);
+#else
+        ::shutdown(sock_, SHUT_RDWR);
+#endif
+    }
     if (thread_.joinable()) thread_.join();
 }
 
@@ -106,13 +125,48 @@ void NtpClient::thread_fn() {
     };
     unsigned char response[128] = {0};
 
-    sockaddr_in remote{};
-    remote.sin_family = AF_INET;
-    remote.sin_port   = htons(remote_port_);
-    if (::inet_pton(AF_INET, remote_ip_.c_str(), &remote.sin_addr) != 1) {
-        LOG_ERROR << "NtpClient: inet_pton(" << remote_ip_ << ") failed";
-        running_ = false;
-        return;
+    // Resolve remote_ip_ into a sockaddr matching the family of sock_.
+    // bind_udp() produces a v6 dual-stack socket by default; iPhones
+    // that reach us over IPv6 also present their NTP peer as an IPv6
+    // address (which the old inet_pton(AF_INET, ...) silently rejected
+    // and made the thread exit immediately). getaddrinfo handles both
+    // families and, with AI_V4MAPPED, turns a v4 remote_ip_ into the
+    // ::ffff:x.y.z.w form so a dual-stack v6 socket can sendto it.
+    sockaddr_storage remote{};
+    socklen_t        remote_len = 0;
+    {
+        sockaddr_storage local_ss{};
+#if defined(_WIN32)
+        int local_len = sizeof(local_ss);
+#else
+        socklen_t local_len = sizeof(local_ss);
+#endif
+        const bool got_local =
+            ::getsockname(sock_, reinterpret_cast<sockaddr*>(&local_ss),
+                          &local_len) == 0;
+        const int sock_family =
+            got_local ? local_ss.ss_family : AF_UNSPEC;
+
+        addrinfo hints{};
+        hints.ai_family   = sock_family;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags    = AI_NUMERICHOST;
+        if (sock_family == AF_INET6) hints.ai_flags |= AI_V4MAPPED;
+        const std::string port_str = std::to_string(remote_port_);
+        addrinfo* info = nullptr;
+        const int gai = ::getaddrinfo(remote_ip_.c_str(),
+                                      port_str.c_str(),
+                                      &hints, &info);
+        if (gai != 0 || !info) {
+            LOG_ERROR << "NtpClient: getaddrinfo(" << remote_ip_
+                      << ") failed gai=" << gai
+                      << " family=" << sock_family;
+            running_ = false;
+            return;
+        }
+        std::memcpy(&remote, info->ai_addr, info->ai_addrlen);
+        remote_len = static_cast<socklen_t>(info->ai_addrlen);
+        ::freeaddrinfo(info);
     }
 
     set_recv_timeout(sock_, kRecvTimeout);
@@ -133,7 +187,7 @@ void NtpClient::thread_fn() {
         int sent = ::sendto(sock_,
                             reinterpret_cast<const char*>(request),
                             sizeof(request), 0,
-                            reinterpret_cast<sockaddr*>(&remote), sizeof(remote));
+                            reinterpret_cast<sockaddr*>(&remote), remote_len);
         if (sent < 0) {
             LOG_WARN << "NtpClient: sendto failed";
         } else {
@@ -160,6 +214,7 @@ void NtpClient::thread_fn() {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
+    LOG_INFO << "NtpClient thread exiting";
     LOG_INFO << "NTP client stopped (sent=" << probes_sent
              << ", received=" << probes_received << ")";
 }
