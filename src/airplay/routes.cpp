@@ -1098,6 +1098,11 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
             });
             ctx.hls_player->start(local_master, ctx.renderer);
             ctx.hls_player->set_rate(hls->playback_rate.load());
+            // Sync the renderer's playing flag so the pause badge
+            // doesn't linger from a prior audio session that left
+            // playing_=false (silence watchdog, FLUSH, etc.) while
+            // we wait for iOS to send its first POST /rate.
+            if (ctx.renderer) ctx.renderer->push_playback_rate(1.0f);
         }
     } else if (url.size() >= 5 &&
                url.compare(url.size() - 5, 5, ".m3u8") == 0) {
