@@ -1147,14 +1147,28 @@ void VideoRenderer::run(const std::string& title) {
                             ImGui::EndCombo();
                         }
                         // Custom W / H input fields for fine-grained tuning.
-                        int wh[2] = {cur_w, cur_h};
+                        // Persist the typed values across frames so a combo
+                        // preset selection above (or any other writer of
+                        // live_settings) can't clobber what the user is
+                        // typing — without this, every keystroke gets
+                        // re-rendered against cur_w/cur_h and the field
+                        // visibly snaps back to the combo's preset.
+                        static int  wh_buf[2]   = {2560, 1440};
+                        static bool wh_active   = false;
+                        if (!wh_active) {
+                            wh_buf[0] = cur_w;
+                            wh_buf[1] = cur_h;
+                        }
                         ImGui::SetNextItemWidth(160);
-                        if (ImGui::InputInt2("Custom WxH", wh,
-                                ImGuiInputTextFlags_EnterReturnsTrue)) {
-                            if (wh[0] >= 320 && wh[0] <= 7680 &&
-                                wh[1] >= 240 && wh[1] <= 4320) {
-                                live_settings_->mirror_width.store(wh[0]);
-                                live_settings_->mirror_height.store(wh[1]);
+                        const bool committed = ImGui::InputInt2(
+                            "Custom WxH", wh_buf,
+                            ImGuiInputTextFlags_EnterReturnsTrue);
+                        wh_active = ImGui::IsItemActive();
+                        if (committed) {
+                            if (wh_buf[0] >= 320 && wh_buf[0] <= 7680 &&
+                                wh_buf[1] >= 240 && wh_buf[1] <= 4320) {
+                                live_settings_->mirror_width.store(wh_buf[0]);
+                                live_settings_->mirror_height.store(wh_buf[1]);
                             }
                         }
                         ImGui::TextDisabled("Applies on next iPhone connection");
