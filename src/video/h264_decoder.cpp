@@ -52,19 +52,24 @@ struct H264Decoder::Impl {
     // av_hwframe_transfer_data into `sw_frame` (typically NV12) and
     // then sws_scale into our own I420 plane buffers so the renderer
     // path that expects Y / U / V plane pointers keeps working.
+    enum class HwBackend { None, D3D11VA, Cuvid };
+
     bool                 hwaccel_requested = false;
-    AVBufferRef*         hw_device_ctx     = nullptr;
+    AVBufferRef*         hw_device_d3d11   = nullptr;   // lazy
+    AVBufferRef*         hw_device_cuda    = nullptr;   // lazy
     AVFrame*             sw_frame          = nullptr;
     AVPixelFormat        hw_pix_fmt        = AV_PIX_FMT_NONE;
-    bool                 frame_is_hw = false;  // last decode was a HW frame
+    bool                 frame_is_hw       = false;
+    HwBackend            backend           = HwBackend::None;
 
     ~Impl() {
-        if (sws)             sws_freeContext(sws);
-        if (sw_frame)        av_frame_free(&sw_frame);
-        if (frame)           av_frame_free(&frame);
-        if (pkt)             av_packet_free(&pkt);
-        if (ctx)             avcodec_free_context(&ctx);
-        if (hw_device_ctx)   av_buffer_unref(&hw_device_ctx);
+        if (sws)              sws_freeContext(sws);
+        if (sw_frame)         av_frame_free(&sw_frame);
+        if (frame)            av_frame_free(&frame);
+        if (pkt)              av_packet_free(&pkt);
+        if (ctx)              avcodec_free_context(&ctx);
+        if (hw_device_d3d11)  av_buffer_unref(&hw_device_d3d11);
+        if (hw_device_cuda)   av_buffer_unref(&hw_device_cuda);
     }
 
     // get_format callback — libavcodec asks us which pixel format to
@@ -82,45 +87,104 @@ struct H264Decoder::Impl {
         return pix_fmts[0];
     }
 
+    // Try opening a hwaccel backend in cascade order:
+    //   1. cuvid  — NVIDIA NVDEC native (lowest latency on RTX/GTX)
+    //   2. D3D11VA — Microsoft DirectX video API (any vendor)
+    //   3. software fallback
+    // Returns the backend that succeeded along with the codec to use.
+    // The caller owns the device-context lazy lifecycle.
+    HwBackend try_open_hw_backend(AVCodecID id, const AVCodec*& out_codec) {
+        out_codec = nullptr;
+
+        // Stage 1: cuvid
+        const char* cuvid_name = (id == AV_CODEC_ID_HEVC) ? "hevc_cuvid"
+                              : (id == AV_CODEC_ID_H264) ? "h264_cuvid"
+                              : nullptr;
+        if (cuvid_name) {
+            const AVCodec* c = avcodec_find_decoder_by_name(cuvid_name);
+            if (c) {
+                if (!hw_device_cuda) {
+                    int rc = av_hwdevice_ctx_create(
+                        &hw_device_cuda, AV_HWDEVICE_TYPE_CUDA,
+                        nullptr, nullptr, 0);
+                    if (rc < 0) {
+                        char err[AV_ERROR_MAX_STRING_SIZE]{};
+                        av_strerror(rc, err, sizeof(err));
+                        LOG_INFO << "decoder: CUDA hwdevice not available ("
+                                 << err << ") — trying D3D11VA";
+                    }
+                }
+                if (hw_device_cuda) {
+                    out_codec = c;
+                    return HwBackend::Cuvid;
+                }
+            }
+        }
+
+        // Stage 2: D3D11VA (Windows)
+#if defined(_WIN32)
+        if (!hw_device_d3d11) {
+            int rc = av_hwdevice_ctx_create(
+                &hw_device_d3d11, AV_HWDEVICE_TYPE_D3D11VA,
+                nullptr, nullptr, 0);
+            if (rc < 0) {
+                char err[AV_ERROR_MAX_STRING_SIZE]{};
+                av_strerror(rc, err, sizeof(err));
+                LOG_INFO << "decoder: D3D11VA hwdevice not available ("
+                         << err << ") — falling back to software";
+            }
+        }
+        if (hw_device_d3d11) {
+            const AVCodec* c = avcodec_find_decoder(id);
+            if (c) {
+                out_codec = c;
+                return HwBackend::D3D11VA;
+            }
+        }
+#endif
+        return HwBackend::None;
+    }
+
     // Open (or re-open after a codec switch) libavcodec for `id`.
     bool open(AVCodecID id) {
-        const AVCodec* c = avcodec_find_decoder(id);
+        const AVCodec* c   = nullptr;
+        HwBackend      bk  = HwBackend::None;
+        AVBufferRef*   dev = nullptr;
+
+        if (hwaccel_requested) {
+            bk = try_open_hw_backend(id, c);
+            if (bk == HwBackend::Cuvid)   dev = hw_device_cuda;
+            if (bk == HwBackend::D3D11VA) dev = hw_device_d3d11;
+        }
+        if (!c) c = avcodec_find_decoder(id);
         if (!c) {
             LOG_ERROR << "decoder: codec " << avcodec_get_name(id)
                       << " not available in libavcodec";
             return false;
         }
+
         if (ctx) avcodec_free_context(&ctx);
         codec    = c;
         codec_id = id;
         ctx      = avcodec_alloc_context3(c);
         if (!ctx) return false;
 
-        // Wire up D3D11VA hardware decode if the user opted in. Lazy
-        // create the hw device once across codec switches.
-        bool hw_enabled = false;
-        if (hwaccel_requested) {
-#if defined(_WIN32)
-            const AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_D3D11VA;
-            if (!hw_device_ctx) {
-                int rc = av_hwdevice_ctx_create(&hw_device_ctx, hw_type,
-                                                 nullptr, nullptr, 0);
-                if (rc < 0) {
-                    char err[AV_ERROR_MAX_STRING_SIZE]{};
-                    av_strerror(rc, err, sizeof(err));
-                    LOG_WARN << "decoder: D3D11VA unavailable (" << err
-                             << ") — falling back to software";
-                }
+        // Wire the chosen HW backend into the codec context. cuvid
+        // doesn't need a get_format callback (always emits CUDA);
+        // D3D11VA does (we pick AV_PIX_FMT_D3D11 from the offered
+        // list).
+        if (bk != HwBackend::None && dev) {
+            ctx->hw_device_ctx = av_buffer_ref(dev);
+            if (bk == HwBackend::D3D11VA) {
+                hw_pix_fmt      = AV_PIX_FMT_D3D11;
+                ctx->get_format = &Impl::get_hw_format_cb;
+                ctx->opaque     = this;
+            } else {
+                hw_pix_fmt = AV_PIX_FMT_NONE; // cuvid handles formats
             }
-            if (hw_device_ctx) {
-                hw_pix_fmt         = AV_PIX_FMT_D3D11;
-                ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-                ctx->get_format    = &Impl::get_hw_format_cb;
-                ctx->opaque        = this;
-                hw_enabled         = true;
-            }
-#endif
         }
+        bool hw_enabled = (bk != HwBackend::None);
+        backend = bk;
 
         // Mirror is a real-time interactive stream — every ms of
         // decoder buffering is felt as input lag (camera-app demo:
@@ -159,13 +223,36 @@ struct H264Decoder::Impl {
 
         if (avcodec_open2(ctx, c, nullptr) != 0) {
             LOG_ERROR << "decoder: avcodec_open2 failed for "
-                      << avcodec_get_name(id);
-            return false;
+                      << avcodec_get_name(id) << " ("
+                      << (c->name ? c->name : "?") << ')';
+            // If we tried HW and it failed at open time, fall back
+            // to software so the user still sees something.
+            if (hw_enabled) {
+                LOG_WARN << "decoder: HW open failed — retrying software";
+                avcodec_free_context(&ctx);
+                c = avcodec_find_decoder(id);
+                if (!c) return false;
+                ctx = avcodec_alloc_context3(c);
+                if (!ctx) return false;
+                ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+                ctx->thread_type  = FF_THREAD_SLICE;
+                ctx->thread_count = 0;
+                if (avcodec_open2(ctx, c, nullptr) != 0) return false;
+                hw_enabled = false;
+                backend    = HwBackend::None;
+                hw_pix_fmt = AV_PIX_FMT_NONE;
+            } else {
+                return false;
+            }
         }
+        const char* tag =
+            (backend == HwBackend::Cuvid)   ? "[NVDEC cuvid]" :
+            (backend == HwBackend::D3D11VA) ? "[D3D11VA]"     :
+                                              "[software]";
         LOG_INFO << "decoder ready: " << avcodec_get_name(id)
-                 << " (libavcodec " << LIBAVCODEC_IDENT << ')'
-                 << (hw_enabled ? " [D3D11VA hwaccel]" : " [software]")
-                 << " [LOW_DELAY]";
+                 << " via " << (c->name ? c->name : "?")
+                 << " (libavcodec " << LIBAVCODEC_IDENT << ") "
+                 << tag << " [LOW_DELAY]";
         return true;
     }
 };
@@ -424,9 +511,10 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
     height  = impl_->frame->height;
     impl_->last_w = width;
     impl_->last_h = height;
-    impl_->frame_is_hw =
-        (impl_->hw_pix_fmt != AV_PIX_FMT_NONE &&
-         impl_->frame->format == impl_->hw_pix_fmt);
+    // Any HW backend (cuvid → CUDA, D3D11VA → D3D11) tags the frame
+    // with a hw_frames_ctx; software path leaves it null. This is
+    // the cleanest backend-agnostic detection.
+    impl_->frame_is_hw = (impl_->frame->hw_frames_ctx != nullptr);
 
     // If the decoder produced a GPU frame, pull it down to system
     // memory. The transferred frame is typically NV12 (8-bit) — we
