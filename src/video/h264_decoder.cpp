@@ -566,14 +566,30 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
              impl_->frame->format == AV_PIX_FMT_YUVJ420P);
     }
 
-    // YUV→RGB conversion for the optional ppm debug dump. Source is
-    // the system-memory frame: in software-decode mode that's
-    // impl_->frame directly (YUV420P / YUVJ420P); in hwaccel mode
-    // it's the sw_frame we just transferred above (NV12 / P010).
-    // Feeding impl_->frame to swscale when hwaccel is on would
-    // hand it a D3D11 texture handle and produce
-    // "d3d11 is not supported as input pixel format" spam.
+    // The YUV→RGB conversion (used only for dump_last_frame_ppm)
+    // moved out of the per-frame hot path — it cost ~2-5 ms per
+    // frame at 4K and was always overhead since dump_last_frame_ppm
+    // is invoked only on the very first decoded frame. The sws
+    // pass now lives inside dump_last_frame_ppm() itself, run on
+    // demand against the still-alive impl_->frame / impl_->sw_frame.
+
+    ++impl_->frames_out;
+    got_frame = true;
+    return true;
+}
+
+bool H264Decoder::dump_last_frame_ppm(const std::string& path) {
+    if (!impl_ || impl_->last_w == 0) return false;
+
+    // Lazily run YUV→RGB only when dump is actually requested. The
+    // source is the system-memory frame: software decode keeps it
+    // in impl_->frame; HW decode (cuvid / D3D11VA) put it in
+    // impl_->sw_frame after av_hwframe_transfer_data. Feeding the
+    // raw GPU AVFrame to swscale would crash with
+    // "d3d11 is not supported as input pixel format".
     AVFrame* rgb_src = impl_->frame_is_hw ? impl_->sw_frame : impl_->frame;
+    if (!rgb_src || rgb_src->width <= 0 || rgb_src->height <= 0) return false;
+
     AVPixelFormat src_fmt = static_cast<AVPixelFormat>(rgb_src->format);
     bool src_full_range = false;
     switch (src_fmt) {
@@ -585,35 +601,29 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
 
     impl_->sws = sws_getCachedContext(
         impl_->sws, rgb_src->width, rgb_src->height, src_fmt,
-        width, height, AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (impl_->sws) {
-        // Propagate the "source is full range" flag.
-        const int* inv_tbl = nullptr;
-        const int* tbl     = nullptr;
-        int src_range = 0, dst_range = 0, brightness = 0, contrast = 0, saturation = 0;
-        sws_getColorspaceDetails(impl_->sws,
-            const_cast<int**>(&inv_tbl), &src_range,
-            const_cast<int**>(&tbl),     &dst_range,
-            &brightness, &contrast, &saturation);
-        src_range = src_full_range ? 1 : 0;
-        sws_setColorspaceDetails(impl_->sws,
-            inv_tbl, src_range, tbl, dst_range,
-            brightness, contrast, saturation);
+        impl_->last_w, impl_->last_h, AV_PIX_FMT_RGB24,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!impl_->sws) return false;
 
-        impl_->last_rgb.assign(static_cast<std::size_t>(width) * height * 3, 0);
-        uint8_t* dst[1]        = { impl_->last_rgb.data() };
-        int      dst_stride[1] = { width * 3 };
-        sws_scale(impl_->sws, rgb_src->data, rgb_src->linesize,
-                  0, rgb_src->height, dst, dst_stride);
-    }
+    const int* inv_tbl = nullptr;
+    const int* tbl     = nullptr;
+    int src_range = 0, dst_range = 0, brightness = 0, contrast = 0, saturation = 0;
+    sws_getColorspaceDetails(impl_->sws,
+        const_cast<int**>(&inv_tbl), &src_range,
+        const_cast<int**>(&tbl),     &dst_range,
+        &brightness, &contrast, &saturation);
+    src_range = src_full_range ? 1 : 0;
+    sws_setColorspaceDetails(impl_->sws,
+        inv_tbl, src_range, tbl, dst_range,
+        brightness, contrast, saturation);
 
-    ++impl_->frames_out;
-    got_frame = true;
-    return true;
-}
+    impl_->last_rgb.assign(
+        static_cast<std::size_t>(impl_->last_w) * impl_->last_h * 3, 0);
+    uint8_t* dst[1]        = { impl_->last_rgb.data() };
+    int      dst_stride[1] = { impl_->last_w * 3 };
+    sws_scale(impl_->sws, rgb_src->data, rgb_src->linesize,
+              0, rgb_src->height, dst, dst_stride);
 
-bool H264Decoder::dump_last_frame_ppm(const std::string& path) {
-    if (impl_->last_rgb.empty() || impl_->last_w == 0) return false;
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return false;
     std::fprintf(f, "P6\n%d %d\n255\n", impl_->last_w, impl_->last_h);
