@@ -1232,6 +1232,26 @@ void VideoRenderer::run(const std::string& title) {
                         ImGui::TextDisabled("(LiveSettings not wired)");
                     }
                 }
+                if (ImGui::CollapsingHeader("Mirror Decoder",
+                        ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (live_settings_) {
+                        bool hw = live_settings_->mirror_hwaccel.load();
+                        if (ImGui::Checkbox("GPU decode (D3D11VA)", &hw)) {
+                            live_settings_->mirror_hwaccel.store(hw);
+                        }
+                        ImGui::TextDisabled(
+                            hw
+                              ? "Decode mirror H.264/HEVC on the GPU"
+                              : "Decode mirror H.264/HEVC on the CPU"
+                                " (libavcodec software)");
+                        ImGui::TextDisabled(
+                            "Falls back to software if D3D11VA is"
+                            " unavailable on the host.");
+                        ImGui::TextDisabled("Applies on next iPhone connection");
+                    } else {
+                        ImGui::TextDisabled("(LiveSettings not wired)");
+                    }
+                }
                 if (ImGui::CollapsingHeader("Network",
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     ImGui::TextDisabled("RTSP   :7000");

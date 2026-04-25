@@ -158,6 +158,7 @@ int main(int argc, char** argv) {
     live_settings.mirror_width.store(mirror_w);
     live_settings.mirror_height.store(mirror_h);
     live_settings.hevc_enabled.store(true);
+    live_settings.mirror_hwaccel.store(mirror_hwaccel);
     ctx.live = &live_settings;
     LOG_INFO << "AirPlay Streaming HLS path: "
              << (hls_playback ? "ENABLED (--hls-proxy-playback)"

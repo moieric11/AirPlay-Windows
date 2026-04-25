@@ -38,6 +38,7 @@ void Server::handle_client(ap::net::ClientSocket client) {
     ClientSession session(*ctx_.identity, peer_ip,
                           static_cast<int>(client.fd), ctx_.renderer,
                           ctx_.mirror_hwaccel);
+    session.live = ctx_.live;
 
     while (reader.read(static_cast<int>(client.fd), req)) {
         Response res = dispatch(ctx_, session, req);

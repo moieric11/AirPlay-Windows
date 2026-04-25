@@ -34,6 +34,13 @@ struct LiveSettings {
     // the requested resolution+codec combo.
     std::atomic<int>  max_fps{60};
     std::atomic<int>  refresh_rate{60};
+
+    // True → request D3D11VA hardware decoding for the H.264/HEVC
+    // mirror stream on Windows. The decoder falls back to software
+    // automatically if the platform / driver can't honor it.
+    // Read at SETUP time, so toggling at runtime applies to the
+    // next iPhone connection.
+    std::atomic<bool> mirror_hwaccel{false};
 };
 
 } // namespace ap::airplay

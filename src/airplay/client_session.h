@@ -12,6 +12,8 @@ namespace ap::video  { class VideoRenderer; }
 
 namespace ap::airplay {
 
+struct LiveSettings;
+
 // Per-TCP-connection state. The dispatcher gets a reference so handlers
 // spanning multiple requests on the same connection (pair-verify rounds,
 // fp-setup rounds, ANNOUNCE→SETUP→RECORD→TEARDOWN) can keep their state.
@@ -51,7 +53,15 @@ struct ClientSession {
 
     // True when the user passed --mirror-hwaccel; propagated to the
     // MirrorListener so its H264Decoder asks libavcodec for D3D11VA.
+    // Used as a fallback when `live` is null. With `live` set, the
+    // SETUP path reads `live->mirror_hwaccel.load()` so a UI toggle
+    // takes effect on the next iPhone handshake.
     bool mirror_hwaccel{false};
+
+    // Non-owning pointer to the shared user-tunable settings (set
+    // when the renderer's UI exposes runtime knobs). May be null on
+    // a headless build. Same lifetime as DeviceContext::live.
+    LiveSettings* live{nullptr};
 
     std::unique_ptr<ap::crypto::PairVerifySession> pair_verify;
     std::unique_ptr<ap::crypto::FairPlaySession>   fairplay;
