@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 project(airplay-windows VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -411,41 +411,27 @@ if(WIN32)
 endif()
 
 # ---- Runtime DLL deployment (Windows) ----------------------------------------
-# vcpkg's autodeploy doesn't always trigger reliably across MSBuild
-# generators / vcpkg versions, leaving the .exe complaining about a
-# missing SDL2.dll / SDL2_ttf.dll / avcodec-NN.dll on first run. Add
-# an explicit post-build copy from the vcpkg release bin to the
-# target directory so the .exe is runnable in place after every
-# build. Falls through silently when running outside the vcpkg
-# toolchain (Linux, vcpkg disabled, etc.).
-if(WIN32 AND VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
-    set(_vcpkg_release_bin
-        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
-    set(_vcpkg_debug_bin
-        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/bin")
+# Use $<TARGET_RUNTIME_DLLS:airplay-windows> (CMake 3.21+) to copy ONLY
+# the shared libraries the linker actually depends on transitively —
+# pulls SDL2.dll, SDL2_ttf.dll, avcodec-*.dll, libplist-*.dll,
+# gstreamer-1.0-0.dll, gstapp-*.dll, glib-2.0-0.dll, … without dragging
+# along .pdb files, gst-launch-1.0.exe, ffmpeg.exe, the static .lib
+# imports, headers, plugins, etc. — which were swelling the build dir
+# past 900 MB with the previous copy_directory_if_different approach.
+#
+# GStreamer plugins (lib/gstreamer-1.0/*.dll) load dynamically at run
+# time and are NOT in TARGET_RUNTIME_DLLS. We keep them where the
+# system GStreamer install put them and let gst_init() find them via
+# its registered plugin path — practically: as long as the user has
+# GStreamer's bin/ on PATH the plugins resolve at startup.
+if(WIN32)
     add_custom_command(TARGET airplay-windows POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-            "$<IF:$<CONFIG:Debug>,${_vcpkg_debug_bin},${_vcpkg_release_bin}>"
-            "$<TARGET_FILE_DIR:airplay-windows>"
-        COMMENT "Deploying vcpkg DLLs next to airplay-windows.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:airplay-windows>
+            $<TARGET_FILE_DIR:airplay-windows>
+        COMMAND_EXPAND_LISTS
+        COMMENT "Deploying linked runtime DLLs next to airplay-windows.exe"
         VERBATIM)
-endif()
-
-# GStreamer DLLs live outside vcpkg (system install). When we link
-# against them, copy the runtime set into the target directory too
-# so the binary is self-contained after a build. Best-effort — only
-# fires when GSTREAMER_ROOT is provided and the bin dir exists.
-if(WIN32 AND _use_gst AND GSTREAMER_FOUND AND GSTREAMER_ROOT)
-    string(REPLACE "\\" "/" _gst_root "${GSTREAMER_ROOT}")
-    set(_gst_bin "${_gst_root}/bin")
-    if(EXISTS "${_gst_bin}")
-        add_custom_command(TARGET airplay-windows POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-                "${_gst_bin}"
-                "$<TARGET_FILE_DIR:airplay-windows>"
-            COMMENT "Deploying GStreamer DLLs next to airplay-windows.exe"
-            VERBATIM)
-    endif()
 endif()
 
 # ---- Avahi (optional, Linux only — dev-mode mDNS) ----------------------------
