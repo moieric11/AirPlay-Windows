@@ -404,22 +404,30 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
         response.add_streams(parsed.streams, alloc);
     }
 
-    // Tell the overlay's DEVICES sidebar what just connected. Pick
-    // the most informative stream type as the displayed "kind"
-    // (Mirror > Audio).
+    // Tell the overlay's DEVICES sidebar what just connected. iOS
+    // splits the AirPlay 2 SETUP into multiple requests: a first
+    // session-setup carries deviceID / name / model in the plist
+    // (no streams), then per-stream SETUPs carry the type / port
+    // info (no name). Merge with any prior snapshot so the human
+    // name picked up from the session-setup survives the per-stream
+    // refreshes, and so kind="HLS" set later by /play is not
+    // downgraded back to Mirror/Audio.
     if (session.renderer) {
+        ap::video::VideoRenderer::DeviceInfo dev;
+        session.renderer->active_device_snapshot(dev);
+        dev.peer_ip    = session.remote_ip;
+        dev.session_id = session.streams->session_id();
+        if (!parsed.name.empty())  dev.name  = parsed.name;
+        if (!parsed.model.empty()) dev.model = parsed.model;
         bool has_mirror = false, has_audio = false;
         for (const auto& s : parsed.streams) {
             if (s.type == 110) has_mirror = true;
             else if (s.type == 96) has_audio = true;
         }
-        if (has_mirror || has_audio) {
-            ap::video::VideoRenderer::DeviceInfo dev;
-            dev.peer_ip    = session.remote_ip;
-            dev.session_id = session.streams->session_id();
-            dev.kind       = has_mirror ? "Mirror" : "Audio";
-            session.renderer->set_active_device(std::move(dev));
-        }
+        if (has_mirror && dev.kind != "HLS") dev.kind = "Mirror";
+        else if (has_audio && dev.kind != "HLS" && dev.kind != "Mirror")
+            dev.kind = "Audio";
+        session.renderer->set_active_device(std::move(dev));
     }
 
     r.body = response.serialize();
@@ -927,9 +935,11 @@ Response handle_play(const DeviceContext& ctx, ClientSession& session,
 
     // Update the DEVICES sidebar — HLS playback wins over any audio /
     // mirror kind a prior SETUP may have set, since the iPhone is now
-    // pushing video URLs to us.
+    // pushing video URLs to us. Preserve the name / model picked up
+    // from the prior session-setup plist instead of clobbering them.
     if (session.renderer) {
         ap::video::VideoRenderer::DeviceInfo dev;
+        session.renderer->active_device_snapshot(dev);
         dev.peer_ip    = session.remote_ip;
         dev.session_id = pr.session_id;
         dev.kind       = "HLS";

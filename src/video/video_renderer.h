@@ -93,6 +93,8 @@ public:
         std::string peer_ip;
         std::string session_id;
         std::string kind;        // "Mirror", "HLS", "Audio"
+        std::string name;        // "iPhone de Eric" — from SETUP plist
+        std::string model;       // "iPhone15,3" — from SETUP plist
     };
     void set_active_device(DeviceInfo info);
     void clear_active_device();

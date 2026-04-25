@@ -964,8 +964,11 @@ void VideoRenderer::run(const std::string& title) {
             ImGui::Dummy(ImVec2(16, 18));
             ImGui::SameLine();
             if (has_active_dev) {
-                ImGui::Text("%s — %s", active_dev.kind.c_str(),
-                            active_dev.peer_ip.c_str());
+                const char* primary_tb =
+                    !active_dev.name.empty()    ? active_dev.name.c_str()
+                  : !active_dev.peer_ip.empty() ? active_dev.peer_ip.c_str()
+                  : "iPhone";
+                ImGui::Text("%s — %s", active_dev.kind.c_str(), primary_tb);
             } else {
                 ImGui::TextDisabled("Idle — waiting for AirPlay");
             }
@@ -1018,9 +1021,23 @@ void VideoRenderer::run(const std::string& title) {
                 dl->AddCircleFilled(ImVec2(p.x + 6, p.y + 9), 4.5f, dot);
                 ImGui::Dummy(ImVec2(16, 18));
                 ImGui::SameLine();
-                ImGui::TextUnformatted(active_dev.peer_ip.empty()
-                    ? "iPhone" : active_dev.peer_ip.c_str());
+                // Prefer the human name if iOS sent one in the
+                // session-setup plist; fall back to peer IP otherwise.
+                const char* primary =
+                    !active_dev.name.empty() ? active_dev.name.c_str()
+                  : !active_dev.peer_ip.empty() ? active_dev.peer_ip.c_str()
+                  : "iPhone";
+                ImGui::TextUnformatted(primary);
                 ImGui::TextDisabled("  %s", active_dev.kind.c_str());
+                if (!active_dev.name.empty() && !active_dev.peer_ip.empty()) {
+                    // Show the IP underneath when we have a name — the
+                    // name and the IP together pinpoint the device on
+                    // the network.
+                    ImGui::TextDisabled("  %s", active_dev.peer_ip.c_str());
+                }
+                if (!active_dev.model.empty()) {
+                    ImGui::TextDisabled("  %s", active_dev.model.c_str());
+                }
                 if (!active_dev.session_id.empty()) {
                     // Truncate the AirPlay session id to a short
                     // identifier — the full string is just noise.
