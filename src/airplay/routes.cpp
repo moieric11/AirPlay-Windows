@@ -286,6 +286,37 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
         return r;
     }
 
+    // Single-device guard: if THIS ClientSession hasn't created its
+    // StreamSession yet (first SETUP from this iPhone) but the
+    // VideoRenderer already shows a paired device, another iPhone
+    // is currently mirroring. Refuse the new SETUP cleanly with
+    // 503 Service Unavailable so iOS gives up instead of feeding
+    // a second video stream into the shared frame buffer (which
+    // would interleave the two streams and corrupt both).
+    //
+    // Same-peer-ip is treated as a legitimate reconnection (network
+    // blip, app restart) and allowed through — the previous session
+    // will be torn down by ClientSession destruction when its TCP
+    // socket closes.
+    if (!session.streams && session.renderer) {
+        ap::video::VideoRenderer::DeviceInfo existing;
+        if (session.renderer->active_device_snapshot(existing) &&
+            !existing.peer_ip.empty() &&
+            existing.peer_ip != session.remote_ip) {
+            r.status_code = 503;
+            r.status_text = "Service Unavailable";
+            r.set_header("Connection", "close");
+            LOG_WARN << "airplay2 SETUP refused: receiver already paired"
+                     << " with " << (existing.name.empty()
+                                       ? existing.peer_ip
+                                       : existing.name)
+                     << " (" << existing.kind << ", sid="
+                     << existing.session_id << ") — second iPhone "
+                     << "from " << session.remote_ip << " rejected";
+            return r;
+        }
+    }
+
     if (!session.streams) {
         session.streams = std::make_unique<StreamSession>();
         session.streams->set_renderer(session.renderer);
