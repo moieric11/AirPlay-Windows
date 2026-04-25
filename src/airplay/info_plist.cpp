@@ -42,13 +42,13 @@ void set_bool(plist_t d, const char* k, bool v) {
     plist_dict_set_item(d, k, plist_new_bool(v ? 1 : 0));
 }
 
-plist_t make_display() {
+plist_t make_display(int width, int height) {
     plist_t d = plist_new_dict();
     set_uint(d, "features",      14);           // see UxPlay: display feature bits
-    set_uint(d, "width",         1920);
-    set_uint(d, "height",        1080);
-    set_uint(d, "widthPixels",   1920);
-    set_uint(d, "heightPixels",  1080);
+    set_uint(d, "width",         static_cast<uint64_t>(width));
+    set_uint(d, "height",        static_cast<uint64_t>(height));
+    set_uint(d, "widthPixels",   static_cast<uint64_t>(width));
+    set_uint(d, "heightPixels",  static_cast<uint64_t>(height));
     set_uint(d, "widthPhysical",  0);
     set_uint(d, "heightPhysical", 0);
     set_uint(d, "refreshRate",   60);
@@ -115,7 +115,8 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
     }
 
     plist_t displays = plist_new_array();
-    plist_array_append_item(displays, make_display());
+    plist_array_append_item(displays,
+        make_display(ctx.mirror_width, ctx.mirror_height));
     plist_dict_set_item(root, "displays", displays);
 
     plist_t formats = plist_new_array();

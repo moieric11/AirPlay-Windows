@@ -43,6 +43,15 @@ struct DeviceContext {
     // player opens http://localhost:<port>/master.m3u8 to fetch from
     // our own server which is proxying iOS via FCUP.
     uint16_t                    hls_local_port = 7100;
+
+    // Resolution we advertise to iOS in /info. iOS encodes the mirror
+    // stream to fit within this box (preserving aspect): a portrait
+    // iPhone session caps at this height and gets a proportional
+    // width. Default 2560x1440 — gives portrait phones ~664×1440
+    // instead of the 498×1080 you'd see at the legacy 1920x1080
+    // ceiling. Override with --mirror-res WxH.
+    int                         mirror_width  = 2560;
+    int                         mirror_height = 1440;
 };
 
 struct ClientSession;

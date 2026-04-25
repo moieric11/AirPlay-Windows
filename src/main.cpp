@@ -85,21 +85,55 @@ int main(int argc, char** argv) {
     // proxy for the rare cases where you want the video stream delivered
     // via the signed-CDN path we built.
     bool hls_playback = false;
+    int  mirror_w = 2560;   // matches DeviceContext default; CLI override
+    int  mirror_h = 1440;   //   below this comment.
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--hls-proxy-playback" || arg == "--hls") {
             hls_playback = true;
+        } else if ((arg == "--mirror-res" || arg == "-r") && i + 1 < argc) {
+            // Accept "WxH" or "WxHi" with either separator, e.g. 1920x1080,
+            // 2560x1440, 3840x2160. Anything malformed falls back silently
+            // to the default and logs a warning.
+            const std::string val = argv[++i];
+            const auto x = val.find_first_of("xX*");
+            if (x != std::string::npos) {
+                try {
+                    const int w = std::stoi(val.substr(0, x));
+                    const int h = std::stoi(val.substr(x + 1));
+                    if (w >= 320 && h >= 240 &&
+                        w <= 7680 && h <= 4320) {
+                        mirror_w = w;
+                        mirror_h = h;
+                    } else {
+                        LOG_WARN << "--mirror-res out of range (" << val
+                                 << "), keeping default";
+                    }
+                } catch (...) {
+                    LOG_WARN << "--mirror-res not parseable (" << val
+                             << "), keeping default";
+                }
+            }
         } else if (arg == "--help" || arg == "-h") {
-            std::puts("AirPlay-Windows [--hls-proxy-playback]\n"
-                      "  --hls-proxy-playback  advertise HLS capability so iOS\n"
-                      "                         hands video URLs to our proxy\n"
-                      "                         (experimental, VOD-style latency)");
+            std::puts(
+                "AirPlay-Windows [--hls-proxy-playback] [--mirror-res WxH]\n"
+                "  --hls-proxy-playback  advertise HLS capability so iOS\n"
+                "                        hands video URLs to our proxy\n"
+                "                        (experimental, VOD-style latency)\n"
+                "  --mirror-res WxH      advertise the given display\n"
+                "                        resolution to iOS (default 2560x1440;\n"
+                "                        higher = sharper portrait at the cost\n"
+                "                        of bandwidth, common: 1920x1080,\n"
+                "                        2560x1440, 3840x2160)");
             ap::net::global_shutdown();
             return 0;
         }
     }
 
     auto ctx = build_device_context(hls_playback);
+    ctx.mirror_width  = mirror_w;
+    ctx.mirror_height = mirror_h;
+    LOG_INFO << "Mirror display advertised: " << mirror_w << 'x' << mirror_h;
     LOG_INFO << "AirPlay Streaming HLS path: "
              << (hls_playback ? "ENABLED (--hls-proxy-playback)"
                               : "disabled (mirror + RAOP audio only)");
