@@ -9,9 +9,29 @@
 #include <thread>
 #include <vector>
 
+extern "C" {
+struct AVFrame;
+}
+
 namespace ap::airplay { struct LiveSettings; }
 
 namespace ap::video {
+
+// RAII handle around an FFmpeg refcounted AVFrame so the
+// renderer can own decoder output without copying any pixel
+// data — av_frame_clone shares the underlying buffer; the
+// destructor releases it back to libavcodec's pool. Move-only.
+struct DecodedFrame {
+    AVFrame* frame = nullptr;
+    DecodedFrame() = default;
+    explicit DecodedFrame(AVFrame* f) : frame(f) {}
+    ~DecodedFrame();
+
+    DecodedFrame(const DecodedFrame&)            = delete;
+    DecodedFrame& operator=(const DecodedFrame&) = delete;
+    DecodedFrame(DecodedFrame&& o) noexcept;
+    DecodedFrame& operator=(DecodedFrame&& o) noexcept;
+};
 
 // SDL2-backed real-time renderer for the decoded iPhone mirror stream.
 //
@@ -60,6 +80,18 @@ public:
                          const uint8_t* uv, int uv_stride,
                          int width, int height,
                          int64_t origin_ns = 0);
+
+    // Refcount-based push: take an av_frame_clone() of the
+    // decoder's most recent AVFrame, drop the previous slot, and
+    // hand the render thread a real FFmpeg ref. SDL upload reads
+    // frame->data[i] / frame->linesize[i] directly so the YUV
+    // planes never get memcpy'd between decode and upload (Codex
+    // recommended optim — saves one full memcpy of the planes per
+    // frame on the hot path). Single-slot semantics: if the render
+    // thread hasn't consumed the previous frame yet, it's dropped
+    // (latest-wins) so no backlog accumulates if the GPU is slow.
+    // Thread-safe.
+    void push_avframe(const AVFrame* src, int64_t origin_ns = 0);
 
     // Account for one encrypted-mirror-frame body received. Updates
     // total payload bytes + an EMA-smoothed Mbps so the status bar
@@ -155,6 +187,13 @@ private:
     bool                       has_frame_{false};
     bool                       frame_is_nv12_{false};
     int64_t                    frame_origin_ns_{0};
+    // When the AVFrame path is in use, the latest decoder frame
+    // sits here. Move-only RAII so an overwrite cleanly drops
+    // the previous ref. Mutually exclusive with the y_buf_ /
+    // u_buf_ / v_buf_ / uv_buf_ plane buffers above — exactly
+    // one of (has_avframe_, has_frame_) is true at a time.
+    DecodedFrame               slot_avframe_;
+    bool                       has_avframe_{false};
 
     // Pending cover-art JPEG, handed over to the render thread on the
     // next tick. cleared when consumed.

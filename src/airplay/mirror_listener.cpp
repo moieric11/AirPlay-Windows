@@ -502,30 +502,16 @@ void MirrorListener::reader_loop(socket_t client) {
                                          << " frames (" << dw << 'x' << dh << ')';
                             }
 
-                            // Push the decoded planes to the renderer.
-                            // Two paths: software decode produces
-                            // I420 (3 planes, push_frame); D3D11VA
-                            // hwaccel produces NV12 (Y + interleaved
-                            // UV, push_frame_nv12) and we feed that
-                            // directly to SDL_UpdateNVTexture so SDL's
-                            // GPU shader handles YUV→RGB without a
-                            // CPU NV12→I420 sws pass.
+                            // Hand the renderer a refcounted clone of
+                            // libavcodec's most recent AVFrame. Both the
+                            // software (I420) and hwaccel (NV12 post
+                            // sw-transfer) paths land in the same slot —
+                            // the renderer reads frame->data/linesize
+                            // directly, so the YUV planes never get
+                            // memcpy'd between decode and SDL upload.
                             if (renderer_) {
-                                const uint8_t *yp = nullptr, *uv = nullptr;
-                                int ys = 0, uvs = 0, fw = 0, fh = 0;
-                                if (decoder_->last_frame_nv12(yp, ys, uv, uvs,
-                                                              fw, fh)) {
-                                    renderer_->push_frame_nv12(yp, ys, uv, uvs,
-                                                               fw, fh, origin_ns);
-                                } else {
-                                    const uint8_t *u = nullptr, *v = nullptr;
-                                    int us = 0, vs = 0;
-                                    if (decoder_->last_frame_yuv(yp, ys, u, us,
-                                                                 v, vs, fw, fh)) {
-                                        renderer_->push_frame(yp, ys, u, us,
-                                                              v, vs, fw, fh,
-                                                              origin_ns);
-                                    }
+                                if (const AVFrame* af = decoder_->current_avframe()) {
+                                    renderer_->push_avframe(af, origin_ns);
                                 }
                             }
                         }

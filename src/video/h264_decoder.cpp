@@ -679,6 +679,13 @@ bool H264Decoder::last_frame_nv12(const uint8_t*& y,  int& y_stride,
     return y && uv;
 }
 
+const AVFrame* H264Decoder::current_avframe() const {
+    if (!impl_ || impl_->last_w == 0) return nullptr;
+    // HW path: sw_frame holds the post-transfer NV12 buffer.
+    // Software path: the decoder output AVFrame (YUV420P / YUVJ420P).
+    return impl_->frame_is_hw ? impl_->sw_frame : impl_->frame;
+}
+
 uint64_t H264Decoder::frames_decoded() const { return impl_ ? impl_->frames_out : 0; }
 
 bool H264Decoder::is_hevc() const {

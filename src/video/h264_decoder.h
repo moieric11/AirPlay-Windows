@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 
+extern "C" {
+struct AVFrame;
+}
+
 namespace ap::video {
 
 // Minimal FFmpeg-backed H.264 decoder sized for the mirror stream path.
@@ -71,6 +75,16 @@ public:
     bool last_frame_nv12(const uint8_t*& y,  int& y_stride,
                          const uint8_t*& uv, int& uv_stride,
                          int& width, int& height) const;
+
+    // The most recently decoded frame, in system memory:
+    //   - software path: the libavcodec output (typically
+    //     AV_PIX_FMT_YUV420P / YUVJ420P)
+    //   - hwaccel path: the post-transfer NV12 frame (cuvid, D3D11VA)
+    // Only valid until the next decode() call. Returned as a
+    // const pointer so the renderer can av_frame_ref / clone
+    // without touching decoder state. Returns nullptr until a
+    // first decode produces a frame.
+    const AVFrame* current_avframe() const;
 
     // Number of frames successfully decoded since init().
     uint64_t frames_decoded() const;

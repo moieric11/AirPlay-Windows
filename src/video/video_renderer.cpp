@@ -407,6 +407,63 @@ void VideoRenderer::set_live_settings(ap::airplay::LiveSettings* live) {
     live_settings_ = live;
 }
 
+// --- DecodedFrame RAII implementation -----------------------------
+DecodedFrame::~DecodedFrame() {
+    if (frame) av_frame_free(&frame);
+}
+DecodedFrame::DecodedFrame(DecodedFrame&& o) noexcept : frame(o.frame) {
+    o.frame = nullptr;
+}
+DecodedFrame& DecodedFrame::operator=(DecodedFrame&& o) noexcept {
+    if (this != &o) {
+        if (frame) av_frame_free(&frame);
+        frame = o.frame;
+        o.frame = nullptr;
+    }
+    return *this;
+}
+
+void VideoRenderer::push_avframe(const AVFrame* src, int64_t origin_ns) {
+    if (!src) return;
+    AVFrame* clone = av_frame_clone(src);
+    if (!clone) return;
+
+    // Stats: same FPS / WxH / counter bookkeeping as push_frame so
+    // the status bar stays accurate regardless of which entry
+    // point fed the slot.
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t prev_ns = last_push_ns_.exchange(now_ns);
+    if (prev_ns > 0) {
+        const double dt_s = (now_ns - prev_ns) / 1e9;
+        if (dt_s > 0.001 && dt_s < 1.0) {
+            const float inst_fps = static_cast<float>(1.0 / dt_s);
+            const float prev_ema = video_fps_ema_.load(std::memory_order_relaxed);
+            const float ema = (prev_ema <= 0.0f)
+                                  ? inst_fps
+                                  : prev_ema * 0.85f + inst_fps * 0.15f;
+            video_fps_ema_.store(ema, std::memory_order_relaxed);
+        }
+    }
+    video_w_seen_.store(clone->width,  std::memory_order_relaxed);
+    video_h_seen_.store(clone->height, std::memory_order_relaxed);
+    frames_total_.fetch_add(1, std::memory_order_relaxed);
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        // Move-assign: drops the previous frame's ref via
+        // av_frame_free in DecodedFrame::operator=.
+        slot_avframe_   = DecodedFrame{clone};
+        frame_w_        = clone->width;
+        frame_h_        = clone->height;
+        has_frame_      = false;       // legacy plane-buffer slot empty
+        frame_is_nv12_  = false;
+        has_avframe_    = true;
+        frame_origin_ns_= origin_ns;
+        cv_.notify_one();
+    }
+}
+
 void VideoRenderer::record_payload_bytes(std::size_t n) {
     payload_bytes_total_.fetch_add(static_cast<uint64_t>(n),
                                    std::memory_order_relaxed);
@@ -734,18 +791,33 @@ void VideoRenderer::run(const std::string& title) {
         if (!running_.load()) break;
 
         // --- Consume pending video frame -----------------------------
+        // Two producers feed the slot:
+        //   - push_avframe (mirror, refcounted AVFrame, zero-copy)
+        //   - push_frame / push_frame_nv12 (HLS, plane buffers)
+        // The AVFrame slot wins when present; legacy slot used by
+        // HLS players that haven't been migrated.
+        bool have_avf   = false;
         bool have_frame = false;
         bool have_nv12  = false;
         std::vector<unsigned char> y, u, v, uv;
+        DecodedFrame avf_local;
         int w = 0, h = 0;
         int64_t frame_origin_ns_local = 0;
         {
             std::unique_lock<std::mutex> lock(mtx_);
             cv_.wait_for(lock, std::chrono::milliseconds(16),
                          [this] {
-                             return has_frame_ || cover_dirty_ || !running_.load();
+                             return has_avframe_ || has_frame_ ||
+                                    cover_dirty_ || !running_.load();
                          });
-            if (has_frame_) {
+            if (has_avframe_) {
+                avf_local       = std::move(slot_avframe_);
+                w               = frame_w_;
+                h               = frame_h_;
+                frame_origin_ns_local = frame_origin_ns_;
+                has_avframe_    = false;
+                have_avf        = true;
+            } else if (has_frame_) {
                 have_nv12 = frame_is_nv12_;
                 if (have_nv12) {
                     y  = y_buf_;
@@ -760,9 +832,22 @@ void VideoRenderer::run(const std::string& title) {
             }
         }
 
-        if (have_frame) {
-            const Uint32 desired_fmt =
-                have_nv12 ? SDL_PIXELFORMAT_NV12 : SDL_PIXELFORMAT_IYUV;
+        // Decide the SDL pixel format to use; depends on which path
+        // delivered the frame.
+        Uint32 desired_fmt = SDL_PIXELFORMAT_IYUV;
+        AVFrame* af = avf_local.frame;
+        if (have_avf && af) {
+            if (af->format == AV_PIX_FMT_NV12) {
+                desired_fmt = SDL_PIXELFORMAT_NV12;
+            } else {
+                desired_fmt = SDL_PIXELFORMAT_IYUV;
+            }
+        } else if (have_frame) {
+            desired_fmt = have_nv12 ? SDL_PIXELFORMAT_NV12
+                                    : SDL_PIXELFORMAT_IYUV;
+        }
+
+        if (have_avf || have_frame) {
             if (!video_tex || video_tex_w != w || video_tex_h != h ||
                 video_tex_fmt != desired_fmt) {
                 if (video_tex) SDL_DestroyTexture(video_tex);
@@ -772,14 +857,30 @@ void VideoRenderer::run(const std::string& title) {
                 video_tex_h   = h;
                 video_tex_fmt = desired_fmt;
                 LOG_INFO << "VideoRenderer texture ("
-                         << (have_nv12 ? "NV12" : "IYUV")
+                         << (desired_fmt == SDL_PIXELFORMAT_NV12 ? "NV12"
+                                                                 : "IYUV")
                          << ") created " << w << 'x' << h;
             }
             if (video_tex) {
-                if (have_nv12) {
-                    // SDL_UpdateNVTexture (SDL 2.0.16+) uploads the
-                    // Y + interleaved-UV planes directly; SDL's GPU
-                    // shader handles the YUV→RGB during render.
+                if (have_avf && af) {
+                    // Direct upload from the refcounted AVFrame —
+                    // the planes never crossed our buffers, just
+                    // the FFmpeg pool → SDL staging texture.
+                    if (af->format == AV_PIX_FMT_NV12) {
+                        SDL_UpdateNVTexture(video_tex, nullptr,
+                            af->data[0], af->linesize[0],
+                            af->data[1], af->linesize[1]);
+                    } else {
+                        // YUV420P / YUVJ420P (full-range) — SDL
+                        // treats both as IYUV, slight color-range
+                        // bias on YUVJ but indistinguishable for
+                        // mirror.
+                        SDL_UpdateYUVTexture(video_tex, nullptr,
+                            af->data[0], af->linesize[0],
+                            af->data[1], af->linesize[1],
+                            af->data[2], af->linesize[2]);
+                    }
+                } else if (have_nv12) {
                     SDL_UpdateNVTexture(video_tex, nullptr,
                         y.data(), w, uv.data(), w);
                 } else {
@@ -789,6 +890,9 @@ void VideoRenderer::run(const std::string& title) {
             }
             last_video_frame_time = std::chrono::steady_clock::now();
         }
+        // avf_local destructor below releases our FFmpeg ref back
+        // to the pool the moment SDL's UpdateTexture has issued
+        // its CopySubresourceRegion to the GPU.
 
         // --- Drop the cover if clear_session was called --------------
         if (clear_cover_requested_.exchange(false, std::memory_order_relaxed)) {
