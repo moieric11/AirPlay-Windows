@@ -421,11 +421,30 @@ bool H264Decoder::set_parameter_sets_from_avcc(const uint8_t* blob,
         return false;
     }
 
+    // cuvid (NVDEC) binds its CUDA context to the SPS at create
+    // time and won't tolerate an in-stream resolution change —
+    // when iPhone rotates portrait↔landscape the new SPS has new
+    // dimensions and cuvidDecodePicture fails with
+    // CUDA_ERROR_INVALID_HANDLE. Force a full reopen on every
+    // SPS change for the cuvid backend; software / D3D11VA
+    // re-init internally and don't need this.
+    auto reopen_for_sps_change = [&](AVCodecID id,
+                                     const std::vector<uint8_t>& sps_new)
+            -> bool {
+        const bool codec_changed = (impl_->codec_id != id);
+        const bool sps_changed   = (impl_->sps_annexb != sps_new);
+        const bool cuvid_needs_reset =
+            (impl_->backend == Impl::HwBackend::Cuvid) && sps_changed;
+        if (codec_changed || cuvid_needs_reset) {
+            return impl_->open(id);
+        }
+        return true;
+    };
+
     // Try H.264 avcC first (common path).
     std::vector<uint8_t> new_sps, new_pps;
     if (parse_avcc(cfg, csz, new_sps, new_pps)) {
-        if (impl_->codec_id != AV_CODEC_ID_H264 &&
-            !impl_->open(AV_CODEC_ID_H264)) {
+        if (!reopen_for_sps_change(AV_CODEC_ID_H264, new_sps)) {
             return false;
         }
         impl_->vps_annexb.clear();
@@ -441,8 +460,7 @@ bool H264Decoder::set_parameter_sets_from_avcc(const uint8_t* blob,
     std::vector<uint8_t> new_vps;
     new_sps.clear(); new_pps.clear();
     if (parse_hvcc(cfg, csz, new_vps, new_sps, new_pps)) {
-        if (impl_->codec_id != AV_CODEC_ID_HEVC &&
-            !impl_->open(AV_CODEC_ID_HEVC)) {
+        if (!reopen_for_sps_change(AV_CODEC_ID_HEVC, new_sps)) {
             return false;
         }
         impl_->vps_annexb = std::move(new_vps);
