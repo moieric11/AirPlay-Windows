@@ -831,14 +831,14 @@ void VideoRenderer::run(const std::string& title) {
 
             // Text lines stacked left-aligned with a small margin.
             const int pad_x = 20;
-            int       y     = top_h + 10;
+            int       y_pos = top_h + 10;
             auto draw_text = [&](SDL_Texture* tex, int tw, int th) {
                 if (!tex) return;
                 int max_w = win_w - 2 * pad_x;
                 int w     = std::min(tw, max_w);
-                SDL_Rect r{pad_x, y, w, th};
+                SDL_Rect r{pad_x, y_pos, w, th};
                 SDL_RenderCopy(renderer, tex, nullptr, &r);
-                y += th + 4;
+                y_pos += th + 4;
             };
             draw_text(title_tex,  title_w,  title_h);
             draw_text(artist_tex, artist_w, artist_h);
