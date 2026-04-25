@@ -41,6 +41,13 @@ struct LiveSettings {
     // Read at SETUP time, so toggling at runtime applies to the
     // next iPhone connection.
     std::atomic<bool> mirror_hwaccel{false};
+
+    // SDL_RENDERER_PRESENTVSYNC. False → present immediately when a
+    // frame is ready, lower latency (up to ~16 ms saved at 60 Hz)
+    // at the cost of horizontal tearing during fast pans. Read at
+    // VideoRenderer init time and on the fly when toggled (the
+    // renderer rebuilds its SDL_Renderer when the value changes).
+    std::atomic<bool> vsync_enabled{true};
 };
 
 } // namespace ap::airplay

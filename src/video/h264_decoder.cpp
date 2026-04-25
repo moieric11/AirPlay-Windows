@@ -142,6 +142,17 @@ struct H264Decoder::Impl {
         ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
         ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
+        // Default libavcodec threading (FF_THREAD_FRAME) decodes
+        // multiple frames in parallel — great throughput, but it
+        // requires keeping N-1 in-flight frames in a queue, which
+        // shows up as input lag. FF_THREAD_SLICE parallelises
+        // within a single frame instead, so the decode pipeline
+        // never holds more than one frame at a time. Software
+        // mode gains the most; D3D11VA does its own GPU threading
+        // and is roughly indifferent.
+        ctx->thread_type  = FF_THREAD_SLICE;
+        ctx->thread_count = 0;   // 0 = auto (one per CPU core)
+
         if (avcodec_open2(ctx, c, nullptr) != 0) {
             LOG_ERROR << "decoder: avcodec_open2 failed for "
                       << avcodec_get_name(id);

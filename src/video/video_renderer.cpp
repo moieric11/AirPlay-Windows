@@ -532,9 +532,18 @@ void VideoRenderer::run(const std::string& title) {
         title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         kDefaultWinWidth, kDefaultWinHeight,
         SDL_WINDOW_RESIZABLE);
+    // Read the initial vsync preference from LiveSettings (default
+    // true). Toggling at runtime is handled by SDL_RenderSetVSync
+    // below in the render loop.
+    const bool vsync_initial = live_settings_
+        ? live_settings_->vsync_enabled.load(std::memory_order_relaxed)
+        : true;
+    Uint32 renderer_flags = SDL_RENDERER_ACCELERATED;
+    if (vsync_initial) renderer_flags |= SDL_RENDERER_PRESENTVSYNC;
     SDL_Renderer* renderer = window
-        ? SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC)
+        ? SDL_CreateRenderer(window, -1, renderer_flags)
         : nullptr;
+    bool vsync_active = vsync_initial;
     if (!window || !renderer) {
         LOG_ERROR << "SDL window/renderer create failed: " << SDL_GetError();
         if (renderer) SDL_DestroyRenderer(renderer);
@@ -625,6 +634,22 @@ void VideoRenderer::run(const std::string& title) {
     };
 
     while (running_.load()) {
+        // Honor live VSYNC toggle: SDL 2.0.18+ supports flipping
+        // VSYNC at runtime without rebuilding the renderer. The
+        // call is cheap enough to issue every frame; we still
+        // gate it on a state delta so we don't spam the driver.
+        if (live_settings_) {
+            const bool want_vsync =
+                live_settings_->vsync_enabled.load(std::memory_order_relaxed);
+            if (want_vsync != vsync_active) {
+                if (SDL_RenderSetVSync(renderer, want_vsync ? 1 : 0) == 0) {
+                    LOG_INFO << "VideoRenderer VSYNC "
+                             << (want_vsync ? "enabled" : "disabled");
+                    vsync_active = want_vsync;
+                }
+            }
+        }
+
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             // Always feed ImGui first so focus / hover / capture work.
@@ -1248,6 +1273,20 @@ void VideoRenderer::run(const std::string& title) {
                             "Falls back to software if D3D11VA is"
                             " unavailable on the host.");
                         ImGui::TextDisabled("Applies on next iPhone connection");
+
+                        ImGui::Separator();
+
+                        bool vsync = live_settings_->vsync_enabled.load();
+                        if (ImGui::Checkbox("VSYNC", &vsync)) {
+                            live_settings_->vsync_enabled.store(vsync);
+                        }
+                        ImGui::TextDisabled(
+                            vsync
+                              ? "Sync presents to monitor refresh"
+                                " (clean image, +0..16 ms latency)."
+                              : "Present immediately (lower latency,"
+                                " visible tearing on fast pans).");
+                        ImGui::TextDisabled("Applies live (no reconnect needed)");
                     } else {
                         ImGui::TextDisabled("(LiveSettings not wired)");
                     }
