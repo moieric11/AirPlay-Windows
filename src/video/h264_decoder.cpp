@@ -401,4 +401,8 @@ bool H264Decoder::last_frame_yuv(const uint8_t*& y, int& y_stride,
 
 uint64_t H264Decoder::frames_decoded() const { return impl_ ? impl_->frames_out : 0; }
 
+bool H264Decoder::is_hevc() const {
+    return impl_ && impl_->codec_id == AV_CODEC_ID_HEVC;
+}
+
 } // namespace ap::video

@@ -61,6 +61,12 @@ public:
     // Number of frames successfully decoded since init().
     uint64_t frames_decoded() const;
 
+    // True after set_parameter_sets_from_avcc() has reinitialised the
+    // backend with the HEVC codec (because iOS sent an hvcC config).
+    // Lets the mirror_listener pick the right NAL-header layout when
+    // logging decrypted IDR / non-IDR frames.
+    bool is_hevc() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -54,8 +54,27 @@ uint32_t get_u32_le(const unsigned char* b, int off) {
          | (static_cast<uint32_t>(b[off + 3]) << 24);
 }
 
-// SPS_PPS packet payload is the AVCC "avcC" decoder configuration record
-// (ISO 14496-15 §5.2.4.1.1), not a raw length-prefixed NAL pair:
+// Search the SPS_PPS payload for the fourcc of an inner config box,
+// returning the offset of the first byte of the box content (after
+// the 8-byte size+type header) or std::string::npos. iOS HEVC mirror
+// wraps the hvcC config in an MP4 VisualSampleEntry; this lets the
+// logger surface the wrapped form without duplicating the decoder's
+// unwrap logic.
+std::size_t find_inner_box_offset(const std::vector<unsigned char>& payload,
+                                  const char fourcc[4]) {
+    for (std::size_t i = 4; i + 4 <= payload.size(); ++i) {
+        if (payload[i + 0] == static_cast<uint8_t>(fourcc[0]) &&
+            payload[i + 1] == static_cast<uint8_t>(fourcc[1]) &&
+            payload[i + 2] == static_cast<uint8_t>(fourcc[2]) &&
+            payload[i + 3] == static_cast<uint8_t>(fourcc[3])) {
+            return i + 4;
+        }
+    }
+    return std::string::npos;
+}
+
+// SPS_PPS packet payload — for H.264 mirror it's the raw AVCC "avcC"
+// configuration record:
 //
 //   [0]    configurationVersion = 1
 //   [1]    AVCProfileIndication
@@ -67,37 +86,60 @@ uint32_t get_u32_le(const unsigned char* b, int off) {
 //   [8..]  SPS NAL bytes (incl. 1-byte NAL header)
 //   then:  numOfPictureParameterSets, ppsLength(BE16), PPS NAL
 //
-// We only parse the first SPS — plenty for a human-readable video line.
+// For HEVC mirror the payload is an MP4 VisualSampleEntry ("hvc1")
+// wrapping an "hvcC" inner box. We log a one-liner with codec +
+// payload size in that case — the decoder will unwrap and parse the
+// real config separately, so duplicating that work here just for a
+// log line isn't worth it.
 bool log_sps_from_sps_pps_payload(const std::vector<unsigned char>& payload) {
-    if (payload.size() < 8 || payload[0] != 0x01) {
-        LOG_WARN << "mirror: SPS/PPS — unexpected format, first byte 0x"
-                 << std::hex << static_cast<int>(payload.empty() ? 0 : payload[0]);
+    if (payload.size() < 8) {
+        LOG_WARN << "mirror: SPS/PPS payload too short ("
+                 << payload.size() << "B)";
         return false;
     }
-
-    uint8_t num_sps = payload[5] & 0x1f;
-    if (num_sps == 0) {
-        LOG_WARN << "mirror: avcC declares 0 SPS";
-        return false;
+    if (payload[0] == 0x01) {
+        // Raw avcC (the legacy H.264 mirror path).
+        const uint8_t num_sps = payload[5] & 0x1f;
+        if (num_sps == 0) {
+            LOG_WARN << "mirror: avcC declares 0 SPS";
+            return false;
+        }
+        const uint32_t sps_len =
+            (static_cast<uint32_t>(payload[6]) << 8) | payload[7];
+        if (sps_len == 0 || sps_len + 8 > payload.size()) {
+            LOG_WARN << "mirror: avcC SPS length " << sps_len
+                     << " out of range";
+            return false;
+        }
+        const uint8_t* sps = payload.data() + 8;
+        ap::airplay::SpsInfo info;
+        if (!ap::airplay::parse_h264_sps(sps, sps_len, info)) {
+            LOG_WARN << "mirror: SPS present but failed to parse";
+            return false;
+        }
+        LOG_INFO << "mirror video: H.264 "
+                 << ap::airplay::profile_name(info.profile_idc)
+                 << " level " << (info.level_idc / 10) << '.'
+                 << (info.level_idc % 10)
+                 << ", " << info.width << 'x' << info.height
+                 << (info.interlaced ? " (interlaced)" : "");
+        return true;
     }
-    uint32_t sps_len = (static_cast<uint32_t>(payload[6]) << 8) | payload[7];
-    if (sps_len == 0 || sps_len + 8 > payload.size()) {
-        LOG_WARN << "mirror: avcC SPS length " << sps_len << " out of range";
-        return false;
+    // First byte != 0x01: probably an MP4-wrapped sample entry. Look
+    // for an inner avcC or hvcC box and surface a corresponding line.
+    if (find_inner_box_offset(payload, "hvcC") != std::string::npos) {
+        LOG_INFO << "mirror video: HEVC (hvcC config wrapped in "
+                 << payload.size() << "B SampleEntry)";
+        return true;
     }
-
-    const uint8_t* sps = payload.data() + 8;
-    ap::airplay::SpsInfo info;
-    if (!ap::airplay::parse_h264_sps(sps, sps_len, info)) {
-        LOG_WARN << "mirror: SPS present but failed to parse";
-        return false;
+    if (find_inner_box_offset(payload, "avcC") != std::string::npos) {
+        LOG_INFO << "mirror video: H.264 (avcC config wrapped in "
+                 << payload.size() << "B SampleEntry)";
+        return true;
     }
-
-    LOG_INFO << "mirror video: H.264 " << ap::airplay::profile_name(info.profile_idc)
-             << " level " << (info.level_idc / 10) << '.' << (info.level_idc % 10)
-             << ", " << info.width << 'x' << info.height
-             << (info.interlaced ? " (interlaced)" : "");
-    return true;
+    LOG_WARN << "mirror: SPS/PPS — unexpected format, first byte 0x"
+             << std::hex << static_cast<int>(payload[0]);
+    return false;
 }
 
 std::string hex_dump(const unsigned char* b, std::size_t n, std::size_t max = 32) {
@@ -393,9 +435,15 @@ void MirrorListener::reader_loop(socket_t client) {
             if (!decrypt_->decrypt(payload.data(), static_cast<int>(payload_size))) {
                 LOG_WARN << "mirror: AES-CTR decrypt failed on frame " << frames;
             } else {
+                // Pick the right NAL-header layout based on which codec
+                // the SPS/PPS frame configured. is_hevc() flips after
+                // set_parameter_sets_from_avcc parses an hvcC blob.
+                const NalCodec nal_codec =
+                    (decoder_ && decoder_->is_hevc()) ? NalCodec::HEVC
+                                                      : NalCodec::H264;
                 std::vector<NalUnit> nals;
                 const bool ok = parse_nals_avcc_to_annexb(
-                    payload.data(), payload_size, nals);
+                    payload.data(), payload_size, nals, nal_codec);
 
                 if (!ok) {
                     LOG_WARN << "mirror frame[" << frames << "]: malformed NAL "
@@ -411,7 +459,8 @@ void MirrorListener::reader_loop(socket_t client) {
                                  << frame_name(ftype) << " → "
                                  << nals.size() << " NAL(s):";
                         for (const auto& n : nals) {
-                            LOG_INFO << "  NAL " << nal_type_name(n.type)
+                            LOG_INFO << "  NAL "
+                                     << nal_type_name(n.type, nal_codec)
                                      << "(type=" << n.type
                                      << ", ref_idc=" << n.ref_idc
                                      << ", size=" << n.size << "B)";
@@ -464,9 +513,13 @@ void MirrorListener::reader_loop(socket_t client) {
                  << "): " << c << " frames, " << bytes_by_type[t] << " B";
     }
     if (!nal_counts.empty()) {
+        const NalCodec final_codec =
+            (decoder_ && decoder_->is_hevc()) ? NalCodec::HEVC
+                                              : NalCodec::H264;
         LOG_INFO << "NAL units decoded (after decrypt + AVCC→Annex-B):";
         for (const auto& [t, c] : nal_counts) {
-            LOG_INFO << "  " << nal_type_name(t) << " (type=" << t << "): "
+            LOG_INFO << "  " << nal_type_name(t, final_codec)
+                     << " (type=" << t << "): "
                      << c << " NAL(s)";
         }
     }
