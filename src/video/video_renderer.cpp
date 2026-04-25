@@ -850,10 +850,21 @@ void VideoRenderer::run(const std::string& title) {
             SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
         };
 
+        // Suppress the pause badge entirely on Screen Mirroring
+        // sessions: there, "no audio" doesn't mean "playback paused"
+        // (it just means whatever is on the iPhone screen has no
+        // soundtrack — a menu, the home screen, a static page). The
+        // badge made sense in audio-only / HLS playback flows where
+        // the user actually paused content. In mirror it just sat
+        // there until the user pressed pause+play to clear it.
+        const bool show_pause_badge =
+            !playing_now &&
+            (!has_active_dev || active_dev.kind != "Mirror");
+
         if (show_video) {
             SDL_Rect dst = fit_inside(video_tex_w, video_tex_h, win_w, win_h);
             SDL_RenderCopy(renderer, video_tex, nullptr, &dst);
-            if (!playing_now) {
+            if (show_pause_badge) {
                 draw_pause_badge(dst);
             }
         } else if (cover_tex) {
@@ -867,7 +878,7 @@ void VideoRenderer::run(const std::string& title) {
             // Pause indicator: two white bars on a semi-transparent black
             // square, centered on the cover. Only while iOS reports
             // rate: 0 via text/parameters (or POST /rate?value=0).
-            if (!playing_now) {
+            if (show_pause_badge) {
                 draw_pause_badge(dst);
             }
 
