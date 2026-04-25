@@ -1178,55 +1178,25 @@ void VideoRenderer::run(const std::string& title) {
                 }
                 if (ImGui::CollapsingHeader("Frame rate")) {
                     if (live_settings_) {
-                        struct FpsPreset { const char* label; int v; };
-                        static const FpsPreset fps_presets[] = {
-                            {"30",  30},
-                            {"60 (default)", 60},
-                            {"90",  90},
-                            {"120 (ProMotion)", 120},
-                        };
+                        // Both fields are advertised in /info as upper
+                        // bounds — iOS will never go above 60 fps for
+                        // mirror anyway, so cap the sliders at 60 to
+                        // surface the realistic range. Pull the value
+                        // down to 30 / 24 / 15 if you want a smoother,
+                        // deterministic frame cadence.
                         int cur_max  = live_settings_->max_fps.load();
                         int cur_rate = live_settings_->refresh_rate.load();
-                        // maxFPS: combo + custom
-                        const char* preview_max = "Custom";
-                        for (const auto& p : fps_presets) {
-                            if (p.v == cur_max) { preview_max = p.label; break; }
+                        ImGui::SetNextItemWidth(180);
+                        if (ImGui::SliderInt("maxFPS", &cur_max, 1, 60)) {
+                            live_settings_->max_fps.store(cur_max);
                         }
-                        ImGui::SetNextItemWidth(140);
-                        if (ImGui::BeginCombo("maxFPS", preview_max)) {
-                            for (const auto& p : fps_presets) {
-                                const bool sel = (p.v == cur_max);
-                                if (ImGui::Selectable(p.label, sel)) {
-                                    live_settings_->max_fps.store(p.v);
-                                }
-                                if (sel) ImGui::SetItemDefaultFocus();
-                            }
-                            ImGui::EndCombo();
-                        }
-                        // Persistent buffer for the typed FPS values so a
-                        // combo selection above doesn't clobber typing.
-                        static int  fps_buf[2]   = {60, 60};
-                        static bool fps_active   = false;
-                        if (!fps_active) {
-                            fps_buf[0] = cur_max;
-                            fps_buf[1] = cur_rate;
-                        }
-                        ImGui::SetNextItemWidth(160);
-                        const bool fps_committed = ImGui::InputInt2(
-                            "Custom max/refresh", fps_buf,
-                            ImGuiInputTextFlags_EnterReturnsTrue);
-                        fps_active = ImGui::IsItemActive();
-                        if (fps_committed) {
-                            if (fps_buf[0] >= 15 && fps_buf[0] <= 240) {
-                                live_settings_->max_fps.store(fps_buf[0]);
-                            }
-                            if (fps_buf[1] >= 15 && fps_buf[1] <= 240) {
-                                live_settings_->refresh_rate.store(fps_buf[1]);
-                            }
+                        ImGui::SetNextItemWidth(180);
+                        if (ImGui::SliderInt("refreshRate", &cur_rate, 1, 60)) {
+                            live_settings_->refresh_rate.store(cur_rate);
                         }
                         ImGui::TextDisabled(
-                            "iPhone hardware ASIC may not reach the hint at"
-                            " high res.");
+                            "iOS caps mirror at 60 fps regardless of hint;"
+                            " lower values force a deterministic cadence.");
                         ImGui::TextDisabled("Applies on next iPhone connection");
                     } else {
                         ImGui::TextDisabled("(LiveSettings not wired)");
