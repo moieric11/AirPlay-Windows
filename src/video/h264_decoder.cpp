@@ -129,6 +129,19 @@ struct H264Decoder::Impl {
 #endif
         }
 
+        // Mirror is a real-time interactive stream — every ms of
+        // decoder buffering is felt as input lag (camera-app demo:
+        // pan the phone, see the mirror trail behind). AV_CODEC_FLAG_LOW_DELAY
+        // tells libavcodec to skip the display-order reorder buffer
+        // (HEVC's "has_b_frames" lookahead in particular) and emit
+        // each frame the moment it's decoded. Combined with
+        // AV_CODEC_FLAG2_FAST it also enables the fastest decode
+        // shortcuts at the cost of strict-spec compliance — fine
+        // for screen mirroring where the encoder we're paired with
+        // is iOS's hardware ASIC, not a malicious bitstream.
+        ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
+        ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+
         if (avcodec_open2(ctx, c, nullptr) != 0) {
             LOG_ERROR << "decoder: avcodec_open2 failed for "
                       << avcodec_get_name(id);
@@ -136,7 +149,8 @@ struct H264Decoder::Impl {
         }
         LOG_INFO << "decoder ready: " << avcodec_get_name(id)
                  << " (libavcodec " << LIBAVCODEC_IDENT << ')'
-                 << (hw_enabled ? " [D3D11VA hwaccel]" : " [software]");
+                 << (hw_enabled ? " [D3D11VA hwaccel]" : " [software]")
+                 << " [LOW_DELAY+FAST]";
         return true;
     }
 };
