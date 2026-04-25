@@ -2,13 +2,33 @@
 #include "log.h"
 
 #include <SDL.h>
+#include <SDL_syswm.h>
 #include <SDL_ttf.h>
+
+#include "imgui.h"
+#include "imgui_impl_sdl2.h"
+#include "imgui_impl_sdlrenderer2.h"
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#if defined(_WIN32)
+    #include <dwmapi.h>
+    // Duplicate the Win11 backdrop constants locally so we don't require
+    // the very latest Windows SDK headers at build time. The DwmApi call
+    // is still resolved at runtime against dwmapi.dll, which silently
+    // accepts unknown attributes on pre-Win11 hosts.
+    #ifndef DWMWA_SYSTEMBACKDROP_TYPE
+        #define DWMWA_SYSTEMBACKDROP_TYPE 38
+    #endif
+    #ifndef DWMSBT_MAINWINDOW
+        #define DWMSBT_MAINWINDOW 2
+    #endif
+#endif
 
 extern "C" {
     #include <libavcodec/avcodec.h>
@@ -19,8 +39,62 @@ extern "C" {
 namespace ap::video {
 namespace {
 
-constexpr int kDefaultWinWidth  = 600;
-constexpr int kDefaultWinHeight = 1080;
+// Match the design mockup's 1380x880 reference. The right panel
+// collapses on demand so a portrait phone stream still gets a tall
+// stage when the user shrinks the window.
+constexpr int kDefaultWinWidth  = 1280;
+constexpr int kDefaultWinHeight = 880;
+constexpr int kSidebarWidth     = 220;
+constexpr int kOptionsWidth     = 300;
+constexpr int kStatusBarHeight  = 28;
+constexpr int kToolbarHeight    = 40;
+
+#if defined(_WIN32)
+// Enable the Windows 11 Mica system backdrop on an SDL-owned window.
+// No-op on pre-Win11 hosts (DwmSetWindowAttribute silently ignores
+// unknown attribute IDs — the function just returns a non-zero HRESULT).
+void enable_mica_backdrop(SDL_Window* w) {
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(w, &info)) return;
+    HWND hwnd = info.info.win.window;
+    int backdrop = DWMSBT_MAINWINDOW;
+    ::DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
+                            &backdrop, sizeof(backdrop));
+}
+#else
+void enable_mica_backdrop(SDL_Window*) {}
+#endif
+
+// Minimal "OBS-ish" dark palette for the overlay. We tweak the full
+// theme later; this just moves the default ImGui colours into a style
+// that reads as part of the receiver window rather than a pale demo.
+void apply_overlay_theme() {
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.WindowRounding  = 8.0f;
+    s.FrameRounding   = 4.0f;
+    s.GrabRounding    = 4.0f;
+    s.ScrollbarRounding = 6.0f;
+    s.WindowPadding   = ImVec2(12, 10);
+    s.FramePadding    = ImVec2(8, 4);
+    s.ItemSpacing     = ImVec2(8, 6);
+
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_WindowBg]        = ImVec4(0.10f, 0.11f, 0.13f, 0.85f);
+    c[ImGuiCol_Border]          = ImVec4(0.22f, 0.23f, 0.26f, 0.60f);
+    c[ImGuiCol_Text]            = ImVec4(0.92f, 0.93f, 0.95f, 1.00f);
+    c[ImGuiCol_TextDisabled]    = ImVec4(0.55f, 0.57f, 0.60f, 1.00f);
+    c[ImGuiCol_FrameBg]         = ImVec4(0.16f, 0.17f, 0.20f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]  = ImVec4(0.22f, 0.23f, 0.26f, 1.00f);
+    c[ImGuiCol_FrameBgActive]   = ImVec4(0.28f, 0.30f, 0.34f, 1.00f);
+    c[ImGuiCol_Button]          = ImVec4(0.20f, 0.22f, 0.26f, 1.00f);
+    c[ImGuiCol_ButtonHovered]   = ImVec4(0.26f, 0.28f, 0.33f, 1.00f);
+    c[ImGuiCol_ButtonActive]    = ImVec4(0.34f, 0.36f, 0.42f, 1.00f);
+    c[ImGuiCol_Header]          = ImVec4(0.18f, 0.20f, 0.24f, 1.00f);
+    c[ImGuiCol_HeaderHovered]   = ImVec4(0.24f, 0.26f, 0.30f, 1.00f);
+    c[ImGuiCol_HeaderActive]    = ImVec4(0.30f, 0.33f, 0.38f, 1.00f);
+    c[ImGuiCol_Separator]       = ImVec4(0.30f, 0.32f, 0.36f, 0.55f);
+}
 
 void copy_plane(std::vector<unsigned char>& dst,
                 const uint8_t* src, int stride,
@@ -318,6 +392,25 @@ void VideoRenderer::clear_session() {
     cv_.notify_one();
 }
 
+void VideoRenderer::set_active_device(DeviceInfo info) {
+    std::lock_guard<std::mutex> lock(device_mtx_);
+    device_     = std::move(info);
+    has_device_ = true;
+}
+
+void VideoRenderer::clear_active_device() {
+    std::lock_guard<std::mutex> lock(device_mtx_);
+    has_device_ = false;
+    device_     = {};
+}
+
+bool VideoRenderer::active_device_snapshot(DeviceInfo& out) const {
+    std::lock_guard<std::mutex> lock(device_mtx_);
+    if (!has_device_) return false;
+    out = device_;
+    return true;
+}
+
 void VideoRenderer::set_idle_info(const std::string& name,
                                   const std::string& ip) {
     std::lock_guard<std::mutex> lock(meta_mtx_);
@@ -348,6 +441,27 @@ void VideoRenderer::push_frame(const uint8_t* y, int y_stride,
     if (width <= 0 || height <= 0) return;
     const int c_w = width  / 2;
     const int c_h = height / 2;
+
+    // Sample inter-frame interval for the overlay's video-FPS readout.
+    // Keep this outside the mtx_ critical section since the producer
+    // thread shouldn't have to wait on the mutex just to update stats.
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t prev_ns = last_push_ns_.exchange(now_ns);
+    if (prev_ns > 0) {
+        const double dt_s = (now_ns - prev_ns) / 1e9;
+        if (dt_s > 0.001 && dt_s < 1.0) {
+            const float inst_fps = static_cast<float>(1.0 / dt_s);
+            const float prev_ema = video_fps_ema_.load(std::memory_order_relaxed);
+            const float ema = (prev_ema <= 0.0f)
+                                  ? inst_fps
+                                  : prev_ema * 0.85f + inst_fps * 0.15f;
+            video_fps_ema_.store(ema, std::memory_order_relaxed);
+        }
+    }
+    video_w_seen_.store(width,  std::memory_order_relaxed);
+    video_h_seen_.store(height, std::memory_order_relaxed);
+    frames_total_.fetch_add(1, std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> lock(mtx_);
     copy_plane(y_buf_, y, y_stride, width, height);
@@ -389,6 +503,22 @@ void VideoRenderer::run(const std::string& title) {
     }
     LOG_INFO << "VideoRenderer window up (" << kDefaultWinWidth
              << 'x' << kDefaultWinHeight << ", resizable)";
+
+    // Win11 Mica backdrop. No-op on pre-Win11 — caller sees a regular
+    // opaque window chrome instead of the subtle acrylic blur.
+    enable_mica_backdrop(window);
+
+    // Dear ImGui on top of the SDL renderer. The overlay runs in this
+    // same thread and GPU context — zero frame copy, no IPC.
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    (void)io;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui::StyleColorsDark();
+    apply_overlay_theme();
+    ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
+    ImGui_ImplSDLRenderer2_Init(renderer);
 
     SDL_Texture* video_tex = nullptr;
     int          video_tex_w = 0, video_tex_h = 0;
@@ -437,6 +567,13 @@ void VideoRenderer::run(const std::string& title) {
     auto last_video_frame_time = std::chrono::steady_clock::now()
                                  - std::chrono::seconds(10);
 
+    // Persistent UI toggles. Survive across frames; mutated from ImGui
+    // buttons. Defaults match the design mockup (right panel visible).
+    struct UiState {
+        bool show_options = true;
+        bool show_demo    = false; // F12 toggles ImGui demo, dev only
+    } ui;
+
     bool fullscreen = false;
     auto toggle_fullscreen = [&]() {
         fullscreen = !fullscreen;
@@ -448,13 +585,18 @@ void VideoRenderer::run(const std::string& title) {
     while (running_.load()) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            // Always feed ImGui first so focus / hover / capture work.
+            ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) {
                 LOG_INFO << "VideoRenderer received SDL_QUIT";
                 closed_  = true;
                 running_ = false;
                 break;
             }
-            if (e.type == SDL_KEYDOWN) {
+            // When ImGui has keyboard / mouse capture (user interacting with
+            // the overlay), don't let the native shortcuts steal the input.
+            const ImGuiIO& io_poll = ImGui::GetIO();
+            if (e.type == SDL_KEYDOWN && !io_poll.WantCaptureKeyboard) {
                 switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE:
                         if (fullscreen) toggle_fullscreen();
@@ -464,12 +606,16 @@ void VideoRenderer::run(const std::string& title) {
                     case SDLK_F11:
                         toggle_fullscreen();
                         break;
+                    case SDLK_F12:
+                        ui.show_demo = !ui.show_demo;
+                        break;
                     default: break;
                 }
             }
             if (e.type == SDL_MOUSEBUTTONDOWN &&
                 e.button.button == SDL_BUTTON_LEFT &&
-                e.button.clicks == 2) {
+                e.button.clicks == 2 &&
+                !io_poll.WantCaptureMouse) {
                 toggle_fullscreen();
             }
         }
@@ -603,13 +749,39 @@ void VideoRenderer::run(const std::string& title) {
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - last_video_frame_time).count() < 500;
         const bool playing_now = playing_.load(std::memory_order_relaxed);
+        DeviceInfo active_dev;
+        const bool has_active_dev = active_device_snapshot(active_dev);
         const bool show_video = video_tex && (video_fresh || !playing_now);
 
         int win_w = 0, win_h = 0;
         SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
+        const int full_w = win_w;
+        const int full_h = win_h;
 
+        // Layout: top toolbar, sidebar (left), options panel (right,
+        // optional), status bar (bottom). The remainder is the video
+        // stage.
+        const int options_w = ui.show_options ? kOptionsWidth : 0;
+        const int stage_x = kSidebarWidth;
+        const int stage_y = kToolbarHeight;
+        const int stage_w = std::max(0, full_w - kSidebarWidth - options_w);
+        const int stage_h = std::max(0, full_h - kToolbarHeight - kStatusBarHeight);
+
+        // Override win_w/win_h locally so the existing video-fit and
+        // idle-text centring math operates inside the stage rect
+        // rather than the whole window. Restore after the SDL drawing
+        // pass, before the ImGui pass references full window size.
+        win_w = stage_w;
+        win_h = stage_h;
+
+        // Clear the whole window first (background under all panels),
+        // then clip subsequent SDL draws to the stage rect via
+        // viewport — the ImGui panels will paint over the cleared
+        // sides afterwards.
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
+        const SDL_Rect stage_rect{stage_x, stage_y, stage_w, stage_h};
+        SDL_RenderSetViewport(renderer, &stage_rect);
 
         auto draw_pause_badge = [&](const SDL_Rect& dst) {
             const int badge = std::min(dst.w, dst.h) / 6;
@@ -727,6 +899,262 @@ void VideoRenderer::run(const std::string& title) {
             y_cursor += idle_ip_h + 12;
             draw_centered(idle_msg_tex,  idle_msg_w,  idle_msg_h,  y_cursor);
         }
+
+        // Restore full-window viewport so ImGui can draw the side panels
+        // and status bar across the whole window. win_w / win_h were
+        // overridden to stage dims for the SDL drawing pass; bring them
+        // back to the full window size for the ImGui pass.
+        SDL_RenderSetViewport(renderer, nullptr);
+        win_w = full_w;
+        win_h = full_h;
+
+        // --- Dear ImGui overlay pass ---------------------------------
+        // Runs every frame after the SDL_Render* video pass. The fixed
+        // panels (sidebar / options / status) cover everything outside
+        // the stage rect; the stage rect itself stays untouched so the
+        // video / cover / idle texture is still visible.
+        ImGui_ImplSDLRenderer2_NewFrame();
+        ImGui_ImplSDL2_NewFrame();
+        ImGui::NewFrame();
+
+        const ImGuiWindowFlags kPanelFlags =
+            ImGuiWindowFlags_NoCollapse  | ImGuiWindowFlags_NoMove        |
+            ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoTitleBar    |
+            ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoNavFocus  | ImGuiWindowFlags_NoSavedSettings;
+
+        const float status_bar_h = static_cast<float>(kStatusBarHeight);
+        const float toolbar_h    = static_cast<float>(kToolbarHeight);
+        const float side_bar_w   = static_cast<float>(kSidebarWidth);
+        const float opts_bar_w   = static_cast<float>(kOptionsWidth);
+        const float fw           = static_cast<float>(full_w);
+        const float fh           = static_cast<float>(full_h);
+
+        // ---- Top toolbar (app title + active device + actions) ----
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+        ImGui::SetNextWindowSize(ImVec2(fw, toolbar_h));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 8));
+        if (ImGui::Begin("##toolbar", nullptr,
+                         kPanelFlags | ImGuiWindowFlags_NoScrollbar)) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(0.92f, 0.93f, 0.95f, 1.0f));
+            ImGui::TextUnformatted("AirPlay-Windows");
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::TextDisabled(" | ");
+            ImGui::SameLine();
+            const bool video_recent =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_video_frame_time).count() < 1500;
+            ImDrawList* dl_tb = ImGui::GetWindowDrawList();
+            const ImVec2 dot_p = ImGui::GetCursorScreenPos();
+            const ImU32 dot_col = video_recent
+                ? IM_COL32(80, 220, 130, 230)     // streaming  : green
+                : (has_active_dev
+                    ? IM_COL32(220, 200, 90, 230) // paired-quiet: amber
+                    : IM_COL32(170, 170, 170, 180)); // idle     : grey
+            dl_tb->AddCircleFilled(ImVec2(dot_p.x + 6, dot_p.y + 9),
+                                   4.5f, dot_col);
+            ImGui::Dummy(ImVec2(16, 18));
+            ImGui::SameLine();
+            if (has_active_dev) {
+                ImGui::Text("%s — %s", active_dev.kind.c_str(),
+                            active_dev.peer_ip.c_str());
+            } else {
+                ImGui::TextDisabled("Idle — waiting for AirPlay");
+            }
+            // Right-aligned quick toggles.
+            const float btn_options_w = 110.0f;
+            const float btn_full_w    = 100.0f;
+            const float gap = 8.0f;
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(fw - btn_options_w - btn_full_w - gap - 12.0f);
+            if (ImGui::Button(
+                    ui.show_options ? "Hide options" : "Show options",
+                    ImVec2(btn_options_w, 0))) {
+                ui.show_options = !ui.show_options;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(fullscreen ? "Exit fullscreen" : "Fullscreen",
+                              ImVec2(btn_full_w, 0))) {
+                toggle_fullscreen();
+            }
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+
+        // ---- Left sidebar : DEVICES -------------------------------
+        ImGui::SetNextWindowPos(ImVec2(0.0f, toolbar_h));
+        ImGui::SetNextWindowSize(ImVec2(side_bar_w, fh - toolbar_h - status_bar_h));
+        if (ImGui::Begin("##devices_sidebar", nullptr, kPanelFlags)) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(0.65f, 0.68f, 0.72f, 1.0f));
+            ImGui::TextUnformatted("DEVICES");
+            ImGui::PopStyleColor();
+            ImGui::Separator();
+            const bool video_streaming =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_video_frame_time).count() < 1500;
+            if (has_active_dev) {
+                // Pulsing dot in front of the device name when the
+                // pipeline is actively producing frames; muted dot
+                // otherwise (paired but quiet).
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                const float t = video_streaming
+                    ? 0.55f + 0.45f * std::sin(
+                        static_cast<float>(ImGui::GetTime()) * 3.5f)
+                    : 0.30f;
+                const ImU32 dot = video_streaming
+                    ? IM_COL32(80, 220, 130,
+                               static_cast<int>(t * 255.0f))
+                    : IM_COL32(170, 170, 170, 180);
+                dl->AddCircleFilled(ImVec2(p.x + 6, p.y + 9), 4.5f, dot);
+                ImGui::Dummy(ImVec2(16, 18));
+                ImGui::SameLine();
+                ImGui::TextUnformatted(active_dev.peer_ip.empty()
+                    ? "iPhone" : active_dev.peer_ip.c_str());
+                ImGui::TextDisabled("  %s", active_dev.kind.c_str());
+                if (!active_dev.session_id.empty()) {
+                    // Truncate the AirPlay session id to a short
+                    // identifier — the full string is just noise.
+                    const std::string short_id =
+                        active_dev.session_id.size() > 8
+                          ? active_dev.session_id.substr(0, 8) + "…"
+                          : active_dev.session_id;
+                    ImGui::TextDisabled("  sid %s", short_id.c_str());
+                }
+            } else {
+                ImGui::TextDisabled("No device connected");
+                ImGui::Spacing();
+                ImGui::TextDisabled("Open AirPlay on iOS and");
+                ImGui::TextDisabled("pick this receiver to start");
+                ImGui::TextDisabled("mirroring.");
+            }
+        }
+        ImGui::End();
+
+        // ---- Right options panel ----------------------------------
+        if (ui.show_options) {
+            ImGui::SetNextWindowPos(ImVec2(fw - opts_bar_w, toolbar_h));
+            ImGui::SetNextWindowSize(ImVec2(opts_bar_w, fh - toolbar_h - status_bar_h));
+            if (ImGui::Begin("##options_panel", nullptr, kPanelFlags)) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      ImVec4(0.65f, 0.68f, 0.72f, 1.0f));
+                ImGui::TextUnformatted("OPTIONS");
+                ImGui::PopStyleColor();
+                ImGui::Separator();
+                if (ImGui::CollapsingHeader("Source",
+                        ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::TextDisabled("iOS-driven (read-only)");
+                }
+                if (ImGui::CollapsingHeader("Network",
+                        ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::TextDisabled("RTSP   :7000");
+                    ImGui::TextDisabled("HLS    :7100");
+                    ImGui::TextDisabled("mDNS   advertising");
+                }
+                if (ImGui::CollapsingHeader("Recording")) {
+                    ImGui::TextDisabled("(not yet implemented)");
+                }
+                if (ImGui::CollapsingHeader("Hotkeys")) {
+                    ImGui::BulletText("F      Toggle fullscreen");
+                    ImGui::BulletText("F11    Toggle fullscreen");
+                    ImGui::BulletText("F12    Toggle ImGui demo");
+                    ImGui::BulletText("Esc    Exit fullscreen / quit");
+                }
+            }
+            ImGui::End();
+        }
+
+        // ---- Bottom status bar ------------------------------------
+        ImGui::SetNextWindowPos(ImVec2(0.0f, fh - status_bar_h));
+        ImGui::SetNextWindowSize(ImVec2(fw, status_bar_h));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 4));
+        if (ImGui::Begin("##status_bar", nullptr,
+                         kPanelFlags | ImGuiWindowFlags_NoScrollbar)) {
+            const ImGuiIO& io_ui = ImGui::GetIO();
+            const bool playing = playing_.load(std::memory_order_relaxed);
+            const bool has_video =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_video_frame_time).count() < 1500;
+            const int      vid_w = video_w_seen_.load(std::memory_order_relaxed);
+            const int      vid_h = video_h_seen_.load(std::memory_order_relaxed);
+            const float    vid_fps = video_fps_ema_.load(std::memory_order_relaxed);
+            const uint64_t total = frames_total_.load(std::memory_order_relaxed);
+#if defined(HAVE_GSTREAMER_HLS)
+            constexpr const char* kHlsBackend = "GStreamer";
+#else
+            constexpr const char* kHlsBackend = "libavformat";
+#endif
+            const auto sep = [&]() {
+                ImGui::SameLine();
+                ImGui::TextDisabled(" | ");
+                ImGui::SameLine();
+            };
+            ImGui::Text("State: %s", has_video
+                                       ? (playing ? "Playing" : "Paused")
+                                       : "Idle");
+            sep();
+            if (vid_w > 0 && vid_h > 0) {
+                ImGui::Text("Video: %dx%d @ %.1f", vid_w, vid_h,
+                            has_video ? vid_fps : 0.0f);
+            } else {
+                ImGui::TextDisabled("Video: —");
+            }
+            sep();
+            ImGui::Text("Frames: %llu", static_cast<unsigned long long>(total));
+            sep();
+            ImGui::Text("Stage: %dx%d", stage_w, stage_h);
+            sep();
+            ImGui::Text("Renderer: %.0f fps", io_ui.Framerate);
+            sep();
+            ImGui::TextDisabled("HLS backend: %s", kHlsBackend);
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+
+        // Pulsing "Waiting for AirPlay" ring centered in the stage when
+        // no fresh video frame is on screen. Drawn to the background
+        // list so the side panels still cover it where they overlap.
+        {
+            const bool video_streaming_idle =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_video_frame_time).count() < 1500;
+            if (!video_streaming_idle && !has_active_dev &&
+                stage_w > 0 && stage_h > 0) {
+                ImDrawList* bg = ImGui::GetBackgroundDrawList();
+                const float cx = static_cast<float>(stage_x) + stage_w * 0.5f;
+                // Sit the rings above the SDL idle text (drawn around
+                // 50% of the stage by the existing code) so the two
+                // don't fight for the same pixels.
+                const float cy = static_cast<float>(stage_y) + stage_h * 0.30f;
+                const float t  = static_cast<float>(ImGui::GetTime());
+                for (int i = 0; i < 2; ++i) {
+                    const float speed  = (i == 0) ? 1.6f : 2.4f;
+                    const float phase  = (i == 0) ? 0.0f : 1.05f;
+                    const float pulse  =
+                        0.5f + 0.5f * std::sin(t * speed + phase);
+                    const float r_min  = (i == 0) ? 32.0f : 18.0f;
+                    const float r_max  = (i == 0) ? 58.0f : 32.0f;
+                    const float radius = r_min + (r_max - r_min) * pulse;
+                    const int   alpha  =
+                        static_cast<int>((1.0f - pulse) * 110.0f);
+                    bg->AddCircle(ImVec2(cx, cy), radius,
+                                  IM_COL32(120, 180, 240, alpha),
+                                  64, 2.0f);
+                }
+                bg->AddCircleFilled(ImVec2(cx, cy), 8.0f,
+                                    IM_COL32(120, 180, 240, 220));
+            }
+        }
+
+        if (ui.show_demo) ImGui::ShowDemoWindow(&ui.show_demo);
+
+        ImGui::Render();
+        ImGui_ImplSDLRenderer2_RenderDrawData(
+            ImGui::GetDrawData(), renderer);
+
         SDL_RenderPresent(renderer);
     }
 
@@ -742,6 +1170,9 @@ void VideoRenderer::run(const std::string& title) {
     for (TTF_Font* f : fonts_big)   if (f) TTF_CloseFont(f);
     for (TTF_Font* f : fonts_small) if (f) TTF_CloseFont(f);
     TTF_Quit();
+    ImGui_ImplSDLRenderer2_Shutdown();
+    ImGui_ImplSDL2_Shutdown();
+    ImGui::DestroyContext();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();

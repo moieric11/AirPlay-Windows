@@ -404,6 +404,24 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
         response.add_streams(parsed.streams, alloc);
     }
 
+    // Tell the overlay's DEVICES sidebar what just connected. Pick
+    // the most informative stream type as the displayed "kind"
+    // (Mirror > Audio).
+    if (session.renderer) {
+        bool has_mirror = false, has_audio = false;
+        for (const auto& s : parsed.streams) {
+            if (s.type == 110) has_mirror = true;
+            else if (s.type == 96) has_audio = true;
+        }
+        if (has_mirror || has_audio) {
+            ap::video::VideoRenderer::DeviceInfo dev;
+            dev.peer_ip    = session.remote_ip;
+            dev.session_id = session.streams->session_id();
+            dev.kind       = has_mirror ? "Mirror" : "Audio";
+            session.renderer->set_active_device(std::move(dev));
+        }
+    }
+
     r.body = response.serialize();
     r.set_header("Session", session.streams->session_id());
     return r;
@@ -489,7 +507,10 @@ Response handle_teardown(const DeviceContext& ctx, ClientSession& session, const
         LOG_INFO << "TEARDOWN: sdp.reset() done";
         // Wipe the idle-mode UI so a new connection doesn't inherit the
         // last track's cover, metadata and progress.
-        if (session.renderer) session.renderer->clear_session();
+        if (session.renderer) {
+            session.renderer->clear_session();
+            session.renderer->clear_active_device();
+        }
         LOG_INFO << "TEARDOWN: renderer.clear_session() done";
         // Full session end: stop the HLS player so the player thread
         // doesn't keep fetching stale segments.
@@ -903,6 +924,17 @@ Response handle_play(const DeviceContext& ctx, ClientSession& session,
     HlsSessionRegistry::instance().set_active_session(pr.session_id);
     if (ctx.hls_player) ctx.hls_player->stop();
     reset_hls_media_state(*hls, pr.url, pr.start_position_seconds);
+
+    // Update the DEVICES sidebar — HLS playback wins over any audio /
+    // mirror kind a prior SETUP may have set, since the iPhone is now
+    // pushing video URLs to us.
+    if (session.renderer) {
+        ap::video::VideoRenderer::DeviceInfo dev;
+        dev.peer_ip    = session.remote_ip;
+        dev.session_id = pr.session_id;
+        dev.kind       = "HLS";
+        session.renderer->set_active_device(std::move(dev));
+    }
 
     const int master_request_id = hls->master_request_id.load();
     if (!send_fcup_request(reverse_fd, pr.url, pr.session_id, master_request_id)) {

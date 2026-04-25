@@ -86,6 +86,18 @@ public:
     // iPhone is currently streaming. Thread-safe. Call once at startup.
     void set_idle_info(const std::string& name, const std::string& ip);
 
+    // What the overlay's DEVICES sidebar shows. Set/cleared from the
+    // RTSP layer when SETUP / POST /play / TEARDOWN happen. Single
+    // active session per receiver — multi-device support comes later.
+    struct DeviceInfo {
+        std::string peer_ip;
+        std::string session_id;
+        std::string kind;        // "Mirror", "HLS", "Audio"
+    };
+    void set_active_device(DeviceInfo info);
+    void clear_active_device();
+    bool active_device_snapshot(DeviceInfo& out) const;
+
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
     bool user_closed() const { return closed_.load(); }
@@ -148,6 +160,23 @@ private:
     // steady_clock nanoseconds until which the silence watchdog is
     // forbidden from pushing rate=1. Set by note_flush().
     std::atomic<int64_t>       flush_grace_until_ns_{0};
+
+    // The currently-streaming device, if any. Set from RTSP threads;
+    // read from the render thread on every overlay frame. Single slot
+    // (single-iPhone assumption).
+    mutable std::mutex         device_mtx_;
+    DeviceInfo                 device_;
+    bool                       has_device_{false};
+
+    // Live stats sampled in push_frame so the status bar can report
+    // the actual stream rate (not just the renderer's wall-clock fps).
+    // EMA on the inter-frame interval gives a smooth-but-responsive
+    // number; total counter is monotonic for sanity.
+    std::atomic<float>         video_fps_ema_{0.0f};
+    std::atomic<int64_t>       last_push_ns_{0};
+    std::atomic<int>           video_w_seen_{0};
+    std::atomic<int>           video_h_seen_{0};
+    std::atomic<uint64_t>      frames_total_{0};
 };
 
 } // namespace ap::video

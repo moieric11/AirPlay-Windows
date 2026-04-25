@@ -215,6 +215,39 @@ else()
     message(STATUS "HLS backend: libavformat (default; -DUSE_GSTREAMER_HLS=ON for GStreamer)")
 endif()
 
+# ---- Dear ImGui (in-app overlay UI) ------------------------------------------
+# Pinned vendored copy of Dear ImGui + the SDL2 / SDLRenderer2 backends. We
+# draw directly over the SDL renderer — zero IPC, zero frame copy, runs in
+# the same thread/GPU context as the video texture. The overlay gives us a
+# device sidebar, live stats, hotkeys config, recording HUD, etc., without
+# a webview.
+include(FetchContent)
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.5
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(imgui)
+
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer2.cpp
+)
+target_include_directories(imgui PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends)
+target_link_libraries(imgui PUBLIC ${SDL2_TARGET})
+if(MSVC)
+    # Quiet the upstream warnings — we don't control imgui's source hygiene.
+    target_compile_options(imgui PRIVATE /W0)
+endif()
+
 # ---- Sources ------------------------------------------------------------------
 add_executable(airplay-windows
     src/main.cpp
@@ -251,7 +284,7 @@ add_executable(airplay-windows
 )
 
 target_include_directories(airplay-windows PRIVATE src)
-target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET} ${SDL2_TTF_TARGET})
+target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET} ${SDL2_TTF_TARGET} imgui)
 if(USE_GSTREAMER_HLS AND GSTREAMER_FOUND)
     target_link_libraries(airplay-windows PRIVATE PkgConfig::GSTREAMER)
     target_compile_definitions(airplay-windows PRIVATE HAVE_GSTREAMER_HLS=1)
@@ -323,8 +356,10 @@ else()
 endif()
 
 if(WIN32)
-    # ws2_32: Winsock; iphlpapi: GetAdaptersAddresses; dnsapi: native mDNS.
-    target_link_libraries(airplay-windows PRIVATE ws2_32 iphlpapi dnsapi)
+    # ws2_32: Winsock; iphlpapi: GetAdaptersAddresses; dnsapi: native mDNS;
+    # dwmapi: DwmSetWindowAttribute for the Win11 Mica backdrop on the
+    # VideoRenderer window.
+    target_link_libraries(airplay-windows PRIVATE ws2_32 iphlpapi dnsapi dwmapi)
 endif()
 
 # ---- Avahi (optional, Linux only — dev-mode mDNS) ----------------------------
