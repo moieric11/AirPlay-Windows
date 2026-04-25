@@ -54,6 +54,13 @@ struct H264Decoder::Impl {
     // path that expects Y / U / V plane pointers keeps working.
     enum class HwBackend { None, D3D11VA, Cuvid };
 
+    // Per-decode scratch buffer for the Annex-B packet that gets
+    // fed to libavcodec. Reused across frames; clear() preserves
+    // capacity, so after the first IDR (which determines the peak
+    // size) we never reallocate the heap again. Removes the per-
+    // frame buf.reserve+insert+insert+insert allocation jitter.
+    std::vector<uint8_t> packet_scratch;
+
     bool                 hwaccel_requested = false;
     AVBufferRef*         hw_device_d3d11   = nullptr;   // lazy
     AVBufferRef*         hw_device_cuda    = nullptr;   // lazy
@@ -494,12 +501,19 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
     if (!impl_->ctx) return false;
     if (!nal_data || nal_size == 0) return false;
 
-    // Build the Annex-B packet. Every IDR gets the parameter sets
-    // prepended. H.264 needs SPS+PPS; HEVC additionally needs VPS
-    // before them.
-    std::vector<uint8_t> buf;
-    buf.reserve(nal_size + impl_->vps_annexb.size() +
-                impl_->sps_annexb.size() + impl_->pps_annexb.size());
+    // Build the Annex-B packet in the per-decoder scratch buffer.
+    // clear() preserves capacity — after the first IDR (which sets
+    // the peak size) the vector never reallocates again, so each
+    // subsequent frame is heap-jitter-free.
+    auto& buf = impl_->packet_scratch;
+    buf.clear();
+    const std::size_t header_bytes = is_idr
+        ? (impl_->vps_annexb.size() + impl_->sps_annexb.size() +
+           impl_->pps_annexb.size())
+        : 0;
+    if (buf.capacity() < nal_size + header_bytes) {
+        buf.reserve(nal_size + header_bytes);
+    }
     if (is_idr) {
         if (!impl_->vps_annexb.empty()) {
             buf.insert(buf.end(),
