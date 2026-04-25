@@ -1,4 +1,6 @@
 #include "airplay/info_plist.h"
+#include "airplay/live_settings.h"
+#include "airplay/routes.h"
 #include "log.h"
 
 #include <cstdint>
@@ -94,7 +96,13 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
     set_str (root, "name",          ctx.name);
     set_str (root, "pi",            ctx.pi);
     set_str (root, "sourceVersion", ctx.srcvers);
-    set_uint(root, "features",      parse_features(ctx.features));
+    // Recompose the features bits with the live HEVC toggle: bit 42
+    // (high word 0x400, "Screen Multi Codec") allows iOS to encode
+    // the mirror stream with HEVC; clearing it pins iOS to H.264.
+    uint64_t feat = parse_features(ctx.features);
+    if (hevc) feat |=  (UINT64_C(0x400) << 32);
+    else      feat &= ~(UINT64_C(0x400) << 32);
+    set_uint(root, "features",      feat);
     set_uint(root, "statusFlags",   68);   // UxPlay default (bits 2+6 set)
     set_uint(root, "vv",            2);
     set_bool(root, "keepAliveLowPower",        true);
@@ -114,9 +122,21 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
             plist_new_data(reinterpret_cast<const char*>(zero), sizeof(zero)));
     }
 
+    // Resolution & HEVC bit are user-tunable via the overlay's
+    // OPTIONS panel — read from LiveSettings when present (mutated
+    // by the UI thread), fall back to the static DeviceContext
+    // fields otherwise. iOS only consumes /info on connection, so
+    // changes apply on the next handshake.
+    int mirror_w = ctx.mirror_width;
+    int mirror_h = ctx.mirror_height;
+    bool hevc    = true;
+    if (ctx.live) {
+        mirror_w = ctx.live->mirror_width.load(std::memory_order_relaxed);
+        mirror_h = ctx.live->mirror_height.load(std::memory_order_relaxed);
+        hevc     = ctx.live->hevc_enabled.load(std::memory_order_relaxed);
+    }
     plist_t displays = plist_new_array();
-    plist_array_append_item(displays,
-        make_display(ctx.mirror_width, ctx.mirror_height));
+    plist_array_append_item(displays, make_display(mirror_w, mirror_h));
     plist_dict_set_item(root, "displays", displays);
 
     plist_t formats = plist_new_array();

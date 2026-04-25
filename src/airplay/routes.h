@@ -11,6 +11,8 @@ namespace ap::video  { class VideoRenderer; class HlsPlayer; }
 
 namespace ap::airplay {
 
+struct LiveSettings;
+
 // DeviceContext carries the identity fields the AirPlay handshake replays back
 // (deviceid, model, name, features, pi, ...). They are generated once at
 // startup and referenced by both the mDNS TXT record and the HTTP handlers.
@@ -50,8 +52,18 @@ struct DeviceContext {
     // width. Default 2560x1440 — gives portrait phones ~664×1440
     // instead of the 498×1080 you'd see at the legacy 1920x1080
     // ceiling. Override with --mirror-res WxH.
+    //
+    // These two ints are the static fallback used when `live` is
+    // null. With `live` set the /info builder reads from there, so
+    // the UI can change resolution at runtime (effective on the
+    // next iPhone connection).
     int                         mirror_width  = 2560;
     int                         mirror_height = 1440;
+
+    // Mutable settings exposed by the overlay UI. Optional — when
+    // null, /info falls back to the static fields above. Lifetime
+    // owned by main(); held non-owning here.
+    LiveSettings*               live = nullptr;
 };
 
 struct ClientSession;

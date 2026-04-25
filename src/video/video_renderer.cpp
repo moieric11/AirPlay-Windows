@@ -1,4 +1,5 @@
 #include "video/video_renderer.h"
+#include "airplay/live_settings.h"
 #include "log.h"
 
 #include <SDL.h>
@@ -399,6 +400,10 @@ void VideoRenderer::clear_session() {
     payload_mbps_ema_.store(0.0f, std::memory_order_relaxed);
     last_payload_ns_.store(0, std::memory_order_relaxed);
     cv_.notify_one();
+}
+
+void VideoRenderer::set_live_settings(ap::airplay::LiveSettings* live) {
+    live_settings_ = live;
 }
 
 void VideoRenderer::record_payload_bytes(std::size_t n) {
@@ -1107,6 +1112,71 @@ void VideoRenderer::run(const std::string& title) {
                 if (ImGui::CollapsingHeader("Source",
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     ImGui::TextDisabled("iOS-driven (read-only)");
+                }
+                if (ImGui::CollapsingHeader("Mirror Resolution",
+                        ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (live_settings_) {
+                        struct Preset { const char* label; int w; int h; };
+                        static const Preset presets[] = {
+                            {"1920x1080  (Full HD)",      1920, 1080},
+                            {"2560x1440  (QHD, default)", 2560, 1440},
+                            {"2868x2868  (iPhone native)",2868, 2868},
+                            {"3840x2160  (4K UHD)",       3840, 2160},
+                        };
+                        int cur_w = live_settings_->mirror_width.load();
+                        int cur_h = live_settings_->mirror_height.load();
+                        // Find the preset that matches the current
+                        // values, or "Custom" if none does.
+                        int sel = -1;
+                        for (int i = 0; i < (int)IM_ARRAYSIZE(presets); ++i) {
+                            if (presets[i].w == cur_w && presets[i].h == cur_h) {
+                                sel = i; break;
+                            }
+                        }
+                        const char* preview = sel >= 0
+                            ? presets[sel].label : "Custom";
+                        if (ImGui::BeginCombo("##mirror_res", preview)) {
+                            for (int i = 0; i < (int)IM_ARRAYSIZE(presets); ++i) {
+                                const bool selected = (sel == i);
+                                if (ImGui::Selectable(presets[i].label, selected)) {
+                                    live_settings_->mirror_width.store(presets[i].w);
+                                    live_settings_->mirror_height.store(presets[i].h);
+                                }
+                                if (selected) ImGui::SetItemDefaultFocus();
+                            }
+                            ImGui::EndCombo();
+                        }
+                        // Custom W / H input fields for fine-grained tuning.
+                        int wh[2] = {cur_w, cur_h};
+                        ImGui::SetNextItemWidth(160);
+                        if (ImGui::InputInt2("Custom WxH", wh,
+                                ImGuiInputTextFlags_EnterReturnsTrue)) {
+                            if (wh[0] >= 320 && wh[0] <= 7680 &&
+                                wh[1] >= 240 && wh[1] <= 4320) {
+                                live_settings_->mirror_width.store(wh[0]);
+                                live_settings_->mirror_height.store(wh[1]);
+                            }
+                        }
+                        ImGui::TextDisabled("Applies on next iPhone connection");
+                    } else {
+                        ImGui::TextDisabled("(LiveSettings not wired)");
+                    }
+                }
+                if (ImGui::CollapsingHeader("Compression",
+                        ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (live_settings_) {
+                        bool hevc = live_settings_->hevc_enabled.load();
+                        if (ImGui::Checkbox("Allow HEVC (H.265)", &hevc)) {
+                            live_settings_->hevc_enabled.store(hevc);
+                        }
+                        ImGui::TextDisabled(
+                            hevc
+                              ? "iOS may pick HEVC at high resolution"
+                              : "Force H.264 (more CPU, more bandwidth)");
+                        ImGui::TextDisabled("Applies on next iPhone connection");
+                    } else {
+                        ImGui::TextDisabled("(LiveSettings not wired)");
+                    }
                 }
                 if (ImGui::CollapsingHeader("Network",
                         ImGuiTreeNodeFlags_DefaultOpen)) {

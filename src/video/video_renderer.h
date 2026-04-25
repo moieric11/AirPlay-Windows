@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+namespace ap::airplay { struct LiveSettings; }
+
 namespace ap::video {
 
 // SDL2-backed real-time renderer for the decoded iPhone mirror stream.
@@ -106,6 +108,12 @@ public:
     void clear_active_device();
     bool active_device_snapshot(DeviceInfo& out) const;
 
+    // Hand the renderer a (non-owning) pointer to the user-tunable
+    // settings. The OPTIONS panel reads/writes these directly so
+    // resolution / HEVC toggles take effect on the next iPhone
+    // /info request without a process restart.
+    void set_live_settings(ap::airplay::LiveSettings* live);
+
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
     bool user_closed() const { return closed_.load(); }
@@ -192,6 +200,12 @@ private:
     std::atomic<uint64_t>      payload_bytes_total_{0};
     std::atomic<float>         payload_mbps_ema_{0.0f};
     std::atomic<int64_t>       last_payload_ns_{0};
+
+    // Non-owning pointer to the shared user-tunable settings; read
+    // and written on the render thread (the only place ImGui UI
+    // runs), but the underlying fields are atomic so the RTSP
+    // server thread reads cleanly from /info handlers.
+    ap::airplay::LiveSettings* live_settings_ = nullptr;
 };
 
 } // namespace ap::video

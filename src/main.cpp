@@ -8,6 +8,7 @@
 //   5. Block until Ctrl-C, then tear everything down cleanly.
 
 #include "airplay/hls_local_server.h"
+#include "airplay/live_settings.h"
 #include "airplay/server.h"
 #include "video/hls_player.h"
 #include "crypto/identity.h"
@@ -134,6 +135,16 @@ int main(int argc, char** argv) {
     ctx.mirror_width  = mirror_w;
     ctx.mirror_height = mirror_h;
     LOG_INFO << "Mirror display advertised: " << mirror_w << 'x' << mirror_h;
+
+    // Live-mutable settings exposed to the overlay UI. Seed from the
+    // CLI defaults; the UI thread can change values at runtime, and
+    // /info reads them on every iPhone handshake (so changes take
+    // effect on the next reconnect).
+    ap::airplay::LiveSettings live_settings;
+    live_settings.mirror_width.store(mirror_w);
+    live_settings.mirror_height.store(mirror_h);
+    live_settings.hevc_enabled.store(true);
+    ctx.live = &live_settings;
     LOG_INFO << "AirPlay Streaming HLS path: "
              << (hls_playback ? "ENABLED (--hls-proxy-playback)"
                               : "disabled (mirror + RAOP audio only)");
@@ -173,6 +184,7 @@ int main(int argc, char** argv) {
         (local_ip.empty() || local_ip == "0.0.0.0") && !local_ipv6.empty()
             ? local_ipv6 : local_ip;
     renderer.set_idle_info(ctx.name, display_ip);
+    renderer.set_live_settings(&live_settings);
     ctx.renderer = &renderer;
 
     ap::video::HlsPlayer hls_player;
