@@ -494,13 +494,29 @@ void MirrorListener::reader_loop(socket_t client) {
                                          << " frames (" << dw << 'x' << dh << ')';
                             }
 
-                            // Push the decoded YUV420P planes to the
-                            // renderer (if any) so it shows up on screen.
+                            // Push the decoded planes to the renderer.
+                            // Two paths: software decode produces
+                            // I420 (3 planes, push_frame); D3D11VA
+                            // hwaccel produces NV12 (Y + interleaved
+                            // UV, push_frame_nv12) and we feed that
+                            // directly to SDL_UpdateNVTexture so SDL's
+                            // GPU shader handles YUV→RGB without a
+                            // CPU NV12→I420 sws pass.
                             if (renderer_) {
-                                const uint8_t *y = nullptr, *u = nullptr, *v = nullptr;
-                                int ys = 0, us = 0, vs = 0, fw = 0, fh = 0;
-                                if (decoder_->last_frame_yuv(y, ys, u, us, v, vs, fw, fh)) {
-                                    renderer_->push_frame(y, ys, u, us, v, vs, fw, fh);
+                                const uint8_t *yp = nullptr, *uv = nullptr;
+                                int ys = 0, uvs = 0, fw = 0, fh = 0;
+                                if (decoder_->last_frame_nv12(yp, ys, uv, uvs,
+                                                              fw, fh)) {
+                                    renderer_->push_frame_nv12(yp, ys, uv, uvs,
+                                                               fw, fh);
+                                } else {
+                                    const uint8_t *u = nullptr, *v = nullptr;
+                                    int us = 0, vs = 0;
+                                    if (decoder_->last_frame_yuv(yp, ys, u, us,
+                                                                 v, vs, fw, fh)) {
+                                        renderer_->push_frame(yp, ys, u, us,
+                                                              v, vs, fw, fh);
+                                    }
                                 }
                             }
                         }

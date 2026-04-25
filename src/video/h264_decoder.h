@@ -63,6 +63,15 @@ public:
                         const uint8_t*& v, int& v_stride,
                         int& width, int& height) const;
 
+    // Raw NV12 plane pointers (Y + interleaved UV) to the most recently
+    // decoded frame, when the decoder pulled it from D3D11VA. Returns
+    // false on the software path (use last_frame_yuv() there) or when
+    // no HW frame is available. Skipping the NV12→I420 sws conversion
+    // saves a CPU pass per frame at 4K.
+    bool last_frame_nv12(const uint8_t*& y,  int& y_stride,
+                         const uint8_t*& uv, int& uv_stride,
+                         int& width, int& height) const;
+
     // Number of frames successfully decoded since init().
     uint64_t frames_decoded() const;
 

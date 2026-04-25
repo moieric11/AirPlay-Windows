@@ -56,16 +56,9 @@ struct H264Decoder::Impl {
     AVBufferRef*         hw_device_ctx     = nullptr;
     AVFrame*             sw_frame          = nullptr;
     AVPixelFormat        hw_pix_fmt        = AV_PIX_FMT_NONE;
-    SwsContext*          hw_to_i420_sws    = nullptr;
-    std::vector<uint8_t> i420_y;     // owned plane buffers post-conversion
-    std::vector<uint8_t> i420_u;
-    std::vector<uint8_t> i420_v;
-    int                  i420_w     = 0;
-    int                  i420_h     = 0;
     bool                 frame_is_hw = false;  // last decode was a HW frame
 
     ~Impl() {
-        if (hw_to_i420_sws) sws_freeContext(hw_to_i420_sws);
         if (sws)             sws_freeContext(sws);
         if (sw_frame)        av_frame_free(&sw_frame);
         if (frame)           av_frame_free(&frame);
@@ -425,9 +418,10 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
          impl_->frame->format == impl_->hw_pix_fmt);
 
     // If the decoder produced a GPU frame, pull it down to system
-    // memory and convert to I420 so the renderer's plane API stays
-    // unchanged. The transferred frame is typically NV12 (8-bit) or
-    // P010 (10-bit HEVC); sws handles either.
+    // memory. The transferred frame is typically NV12 (8-bit) — we
+    // expose it as-is (no sws NV12→I420 conversion) so the renderer
+    // can SDL_UpdateNVTexture directly and let SDL's GPU shader do
+    // the YUV→RGB. Saves a per-frame CPU pass at 4K.
     if (impl_->frame_is_hw) {
         av_frame_unref(impl_->sw_frame);
         const int rc = av_hwframe_transfer_data(impl_->sw_frame,
@@ -438,45 +432,9 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
             LOG_WARN << "H264Decoder: hwframe_transfer_data failed " << err;
             return false;
         }
-        const auto src_fmt =
-            static_cast<AVPixelFormat>(impl_->sw_frame->format);
-        const int sw_w = impl_->sw_frame->width;
-        const int sw_h = impl_->sw_frame->height;
-
-        // (Re)build the NV12/P010→I420 sws context on resolution or
-        // format changes. Lazy + cached.
-        if (!impl_->hw_to_i420_sws ||
-            impl_->i420_w != sw_w || impl_->i420_h != sw_h) {
-            if (impl_->hw_to_i420_sws) {
-                sws_freeContext(impl_->hw_to_i420_sws);
-                impl_->hw_to_i420_sws = nullptr;
-            }
-            impl_->hw_to_i420_sws = sws_getContext(
-                sw_w, sw_h, src_fmt,
-                sw_w, sw_h, AV_PIX_FMT_YUV420P,
-                SWS_BILINEAR, nullptr, nullptr, nullptr);
-            impl_->i420_w = sw_w;
-            impl_->i420_h = sw_h;
-            impl_->i420_y.resize(static_cast<std::size_t>(sw_w) * sw_h);
-            impl_->i420_u.resize(static_cast<std::size_t>(sw_w / 2) *
-                                 (sw_h / 2));
-            impl_->i420_v.resize(static_cast<std::size_t>(sw_w / 2) *
-                                 (sw_h / 2));
-        }
-        if (impl_->hw_to_i420_sws) {
-            uint8_t* dst[3] = {
-                impl_->i420_y.data(),
-                impl_->i420_u.data(),
-                impl_->i420_v.data(),
-            };
-            const int dst_stride[3] = { sw_w, sw_w / 2, sw_w / 2 };
-            sws_scale(impl_->hw_to_i420_sws,
-                      impl_->sw_frame->data, impl_->sw_frame->linesize,
-                      0, sw_h, dst, dst_stride);
-            impl_->last_is_yuv420 = true;
-        } else {
-            impl_->last_is_yuv420 = false;
-        }
+        // The transferred sw_frame is the source of truth for HW
+        // decode; expose its NV12 planes via last_frame_nv12().
+        impl_->last_is_yuv420 = false;
     } else {
         impl_->last_is_yuv420 =
             (impl_->frame->format == AV_PIX_FMT_YUV420P ||
@@ -545,25 +503,31 @@ bool H264Decoder::last_frame_yuv(const uint8_t*& y, int& y_stride,
                                  const uint8_t*& u, int& u_stride,
                                  const uint8_t*& v, int& v_stride,
                                  int& width, int& height) const {
-    if (!impl_ || !impl_->last_is_yuv420 || impl_->last_w == 0)
-        return false;
-    if (impl_->frame_is_hw) {
-        // Hardware-decoded frame already pulled to sys memory and
-        // converted to I420 in our own plane buffers.
-        if (impl_->i420_y.empty() || impl_->i420_u.empty() ||
-            impl_->i420_v.empty()) return false;
-        y = impl_->i420_y.data(); y_stride = impl_->i420_w;
-        u = impl_->i420_u.data(); u_stride = impl_->i420_w / 2;
-        v = impl_->i420_v.data(); v_stride = impl_->i420_w / 2;
-    } else {
-        if (!impl_->frame) return false;
-        y = impl_->frame->data[0]; y_stride = impl_->frame->linesize[0];
-        u = impl_->frame->data[1]; u_stride = impl_->frame->linesize[1];
-        v = impl_->frame->data[2]; v_stride = impl_->frame->linesize[2];
-    }
+    // Software path only — HW path produces NV12, see
+    // last_frame_nv12() for that.
+    if (!impl_ || !impl_->last_is_yuv420 || impl_->last_w == 0 ||
+        impl_->frame_is_hw || !impl_->frame) return false;
+    y = impl_->frame->data[0]; y_stride = impl_->frame->linesize[0];
+    u = impl_->frame->data[1]; u_stride = impl_->frame->linesize[1];
+    v = impl_->frame->data[2]; v_stride = impl_->frame->linesize[2];
     width  = impl_->last_w;
     height = impl_->last_h;
     return y && u && v;
+}
+
+bool H264Decoder::last_frame_nv12(const uint8_t*& y,  int& y_stride,
+                                  const uint8_t*& uv, int& uv_stride,
+                                  int& width, int& height) const {
+    if (!impl_ || !impl_->frame_is_hw || !impl_->sw_frame ||
+        impl_->last_w == 0) return false;
+    if (impl_->sw_frame->format != AV_PIX_FMT_NV12) return false;
+    y         = impl_->sw_frame->data[0];
+    y_stride  = impl_->sw_frame->linesize[0];
+    uv        = impl_->sw_frame->data[1];
+    uv_stride = impl_->sw_frame->linesize[1];
+    width  = impl_->last_w;
+    height = impl_->last_h;
+    return y && uv;
 }
 
 uint64_t H264Decoder::frames_decoded() const { return impl_ ? impl_->frames_out : 0; }

@@ -509,9 +509,48 @@ void VideoRenderer::push_frame(const uint8_t* y, int y_stride,
     copy_plane(y_buf_, y, y_stride, width, height);
     copy_plane(u_buf_, u, u_stride, c_w,   c_h);
     copy_plane(v_buf_, v, v_stride, c_w,   c_h);
-    frame_w_   = width;
-    frame_h_   = height;
-    has_frame_ = true;
+    frame_w_       = width;
+    frame_h_       = height;
+    has_frame_     = true;
+    frame_is_nv12_ = false;
+    cv_.notify_one();
+}
+
+void VideoRenderer::push_frame_nv12(const uint8_t* y,  int y_stride,
+                                    const uint8_t* uv, int uv_stride,
+                                    int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    const int uv_h = height / 2;
+
+    // Stats: identical book-keeping as push_frame so the FPS EMA /
+    // total counter stay accurate regardless of which path filled
+    // the slot.
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t prev_ns = last_push_ns_.exchange(now_ns);
+    if (prev_ns > 0) {
+        const double dt_s = (now_ns - prev_ns) / 1e9;
+        if (dt_s > 0.001 && dt_s < 1.0) {
+            const float inst_fps = static_cast<float>(1.0 / dt_s);
+            const float prev_ema = video_fps_ema_.load(std::memory_order_relaxed);
+            const float ema = (prev_ema <= 0.0f)
+                                  ? inst_fps
+                                  : prev_ema * 0.85f + inst_fps * 0.15f;
+            video_fps_ema_.store(ema, std::memory_order_relaxed);
+        }
+    }
+    video_w_seen_.store(width,  std::memory_order_relaxed);
+    video_h_seen_.store(height, std::memory_order_relaxed);
+    frames_total_.fetch_add(1, std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    copy_plane(y_buf_,  y,  y_stride,  width, height);
+    // UV interleaved plane: width bytes wide, height/2 rows tall.
+    copy_plane(uv_buf_, uv, uv_stride, width, uv_h);
+    frame_w_       = width;
+    frame_h_       = height;
+    has_frame_     = true;
+    frame_is_nv12_ = true;
     cv_.notify_one();
 }
 
@@ -573,6 +612,7 @@ void VideoRenderer::run(const std::string& title) {
 
     SDL_Texture* video_tex = nullptr;
     int          video_tex_w = 0, video_tex_h = 0;
+    Uint32       video_tex_fmt = 0;  // SDL_PIXELFORMAT_IYUV or SDL_PIXELFORMAT_NV12
 
     SDL_Texture* cover_tex = nullptr;
     int          cover_tex_w = 0, cover_tex_h = 0;
@@ -690,7 +730,8 @@ void VideoRenderer::run(const std::string& title) {
 
         // --- Consume pending video frame -----------------------------
         bool have_frame = false;
-        std::vector<unsigned char> y, u, v;
+        bool have_nv12  = false;
+        std::vector<unsigned char> y, u, v, uv;
         int w = 0, h = 0;
         {
             std::unique_lock<std::mutex> lock(mtx_);
@@ -699,7 +740,13 @@ void VideoRenderer::run(const std::string& title) {
                              return has_frame_ || cover_dirty_ || !running_.load();
                          });
             if (has_frame_) {
-                y = y_buf_; u = u_buf_; v = v_buf_;
+                have_nv12 = frame_is_nv12_;
+                if (have_nv12) {
+                    y  = y_buf_;
+                    uv = uv_buf_;
+                } else {
+                    y = y_buf_; u = u_buf_; v = v_buf_;
+                }
                 w = frame_w_; h = frame_h_;
                 has_frame_ = false;
                 have_frame = true;
@@ -707,17 +754,31 @@ void VideoRenderer::run(const std::string& title) {
         }
 
         if (have_frame) {
-            if (!video_tex || video_tex_w != w || video_tex_h != h) {
+            const Uint32 desired_fmt =
+                have_nv12 ? SDL_PIXELFORMAT_NV12 : SDL_PIXELFORMAT_IYUV;
+            if (!video_tex || video_tex_w != w || video_tex_h != h ||
+                video_tex_fmt != desired_fmt) {
                 if (video_tex) SDL_DestroyTexture(video_tex);
                 video_tex = SDL_CreateTexture(renderer,
-                    SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, w, h);
-                video_tex_w = w; video_tex_h = h;
-                LOG_INFO << "VideoRenderer texture (IYUV) created "
-                         << w << 'x' << h;
+                    desired_fmt, SDL_TEXTUREACCESS_STREAMING, w, h);
+                video_tex_w   = w;
+                video_tex_h   = h;
+                video_tex_fmt = desired_fmt;
+                LOG_INFO << "VideoRenderer texture ("
+                         << (have_nv12 ? "NV12" : "IYUV")
+                         << ") created " << w << 'x' << h;
             }
             if (video_tex) {
-                SDL_UpdateYUVTexture(video_tex, nullptr,
-                    y.data(), w, u.data(), w / 2, v.data(), w / 2);
+                if (have_nv12) {
+                    // SDL_UpdateNVTexture (SDL 2.0.16+) uploads the
+                    // Y + interleaved-UV planes directly; SDL's GPU
+                    // shader handles the YUV→RGB during render.
+                    SDL_UpdateNVTexture(video_tex, nullptr,
+                        y.data(), w, uv.data(), w);
+                } else {
+                    SDL_UpdateYUVTexture(video_tex, nullptr,
+                        y.data(), w, u.data(), w / 2, v.data(), w / 2);
+                }
             }
             last_video_frame_time = std::chrono::steady_clock::now();
         }

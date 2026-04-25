@@ -46,6 +46,15 @@ public:
                     const uint8_t* v, int v_stride,
                     int width, int height);
 
+    // Same idea but for NV12-formatted frames (one Y plane + one
+    // interleaved UV plane). Used by the D3D11VA mirror decode path
+    // so we can SDL_UpdateNVTexture directly and skip the
+    // NV12→I420 sws conversion the previous I420-only API forced.
+    // Thread-safe.
+    void push_frame_nv12(const uint8_t* y,  int y_stride,
+                         const uint8_t* uv, int uv_stride,
+                         int width, int height);
+
     // Account for one encrypted-mirror-frame body received. Updates
     // total payload bytes + an EMA-smoothed Mbps so the status bar
     // can show live bandwidth without the renderer having to peek
@@ -126,14 +135,19 @@ private:
     std::thread       thread_;
 
     // Single-slot frame buffer (producer overwrites, consumer reads).
+    // Two layouts share the same slot — `frame_is_nv12_` selects:
+    //   I420  → y_buf_, u_buf_, v_buf_ (3 planes)
+    //   NV12  → y_buf_, uv_buf_         (2 planes, interleaved UV)
     std::mutex                 mtx_;
     std::condition_variable    cv_;
     std::vector<unsigned char> y_buf_;
     std::vector<unsigned char> u_buf_;
     std::vector<unsigned char> v_buf_;
+    std::vector<unsigned char> uv_buf_;     // NV12 only
     int                        frame_w_{0};
     int                        frame_h_{0};
     bool                       has_frame_{false};
+    bool                       frame_is_nv12_{false};
 
     // Pending cover-art JPEG, handed over to the render thread on the
     // next tick. cleared when consumed.
