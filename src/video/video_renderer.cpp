@@ -1618,7 +1618,7 @@ void VideoRenderer::run(const std::string& title) {
         // returns. Captures decrypt + decode + render + VSYNC.
         // Ignored when origin_ns is 0 (HLS / non-mirror frames or
         // older callers that didn't tag).
-        if (have_frame && frame_origin_ns_local > 0) {
+        if ((have_frame || have_avf) && frame_origin_ns_local > 0) {
             const int64_t now_ns2 =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
