@@ -394,6 +394,14 @@ void MirrorListener::reader_loop(socket_t client) {
             if (n < 0)  { LOG_WARN << "mirror: payload recv error";     break; }
         }
 
+        // Tag the moment the encrypted body finished arriving on the
+        // wire. Forwarded into the renderer so the status bar can
+        // surface end-to-end local-pipeline latency
+        // (decrypt + decode + render + present − this point).
+        const int64_t origin_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+
         ++frames;
         total_header += kHeaderSize;
         total_body   += payload_size;
@@ -508,14 +516,15 @@ void MirrorListener::reader_loop(socket_t client) {
                                 if (decoder_->last_frame_nv12(yp, ys, uv, uvs,
                                                               fw, fh)) {
                                     renderer_->push_frame_nv12(yp, ys, uv, uvs,
-                                                               fw, fh);
+                                                               fw, fh, origin_ns);
                                 } else {
                                     const uint8_t *u = nullptr, *v = nullptr;
                                     int us = 0, vs = 0;
                                     if (decoder_->last_frame_yuv(yp, ys, u, us,
                                                                  v, vs, fw, fh)) {
                                         renderer_->push_frame(yp, ys, u, us,
-                                                              v, vs, fw, fh);
+                                                              v, vs, fw, fh,
+                                                              origin_ns);
                                     }
                                 }
                             }

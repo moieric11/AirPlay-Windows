@@ -41,10 +41,15 @@ public:
 
     // Producer entry point. Copies each YUV plane into internal buffers
     // (skipping AVFrame padding via per-plane strides). Thread-safe.
+    // origin_ns: optional steady_clock timestamp captured upstream
+    // (typically right after the encrypted frame body finished
+    // arriving over TCP). Used by the renderer to compute the
+    // local-pipeline latency surfaced in the status bar.
     void push_frame(const uint8_t* y, int y_stride,
                     const uint8_t* u, int u_stride,
                     const uint8_t* v, int v_stride,
-                    int width, int height);
+                    int width, int height,
+                    int64_t origin_ns = 0);
 
     // Same idea but for NV12-formatted frames (one Y plane + one
     // interleaved UV plane). Used by the D3D11VA mirror decode path
@@ -53,7 +58,8 @@ public:
     // Thread-safe.
     void push_frame_nv12(const uint8_t* y,  int y_stride,
                          const uint8_t* uv, int uv_stride,
-                         int width, int height);
+                         int width, int height,
+                         int64_t origin_ns = 0);
 
     // Account for one encrypted-mirror-frame body received. Updates
     // total payload bytes + an EMA-smoothed Mbps so the status bar
@@ -148,6 +154,7 @@ private:
     int                        frame_h_{0};
     bool                       has_frame_{false};
     bool                       frame_is_nv12_{false};
+    int64_t                    frame_origin_ns_{0};
 
     // Pending cover-art JPEG, handed over to the render thread on the
     // next tick. cleared when consumed.
@@ -214,6 +221,11 @@ private:
     std::atomic<uint64_t>      payload_bytes_total_{0};
     std::atomic<float>         payload_mbps_ema_{0.0f};
     std::atomic<int64_t>       last_payload_ns_{0};
+
+    // Local-pipeline latency: t_present - t_origin (origin tagged
+    // upstream when the encrypted frame body finished arriving).
+    // EMA-smoothed for status bar readability.
+    std::atomic<float>         pipeline_latency_ms_ema_{0.0f};
 
     // Non-owning pointer to the shared user-tunable settings; read
     // and written on the render thread (the only place ImGui UI

@@ -399,6 +399,7 @@ void VideoRenderer::clear_session() {
     payload_bytes_total_.store(0, std::memory_order_relaxed);
     payload_mbps_ema_.store(0.0f, std::memory_order_relaxed);
     last_payload_ns_.store(0, std::memory_order_relaxed);
+    pipeline_latency_ms_ema_.store(0.0f, std::memory_order_relaxed);
     cv_.notify_one();
 }
 
@@ -479,7 +480,8 @@ void VideoRenderer::push_metadata(const std::string& title,
 void VideoRenderer::push_frame(const uint8_t* y, int y_stride,
                                const uint8_t* u, int u_stride,
                                const uint8_t* v, int v_stride,
-                               int width, int height) {
+                               int width, int height,
+                               int64_t origin_ns) {
     if (width <= 0 || height <= 0) return;
     const int c_w = width  / 2;
     const int c_h = height / 2;
@@ -509,16 +511,18 @@ void VideoRenderer::push_frame(const uint8_t* y, int y_stride,
     copy_plane(y_buf_, y, y_stride, width, height);
     copy_plane(u_buf_, u, u_stride, c_w,   c_h);
     copy_plane(v_buf_, v, v_stride, c_w,   c_h);
-    frame_w_       = width;
-    frame_h_       = height;
-    has_frame_     = true;
-    frame_is_nv12_ = false;
+    frame_w_         = width;
+    frame_h_         = height;
+    has_frame_       = true;
+    frame_is_nv12_   = false;
+    frame_origin_ns_ = origin_ns;
     cv_.notify_one();
 }
 
 void VideoRenderer::push_frame_nv12(const uint8_t* y,  int y_stride,
                                     const uint8_t* uv, int uv_stride,
-                                    int width, int height) {
+                                    int width, int height,
+                                    int64_t origin_ns) {
     if (width <= 0 || height <= 0) return;
     const int uv_h = height / 2;
 
@@ -547,10 +551,11 @@ void VideoRenderer::push_frame_nv12(const uint8_t* y,  int y_stride,
     copy_plane(y_buf_,  y,  y_stride,  width, height);
     // UV interleaved plane: width bytes wide, height/2 rows tall.
     copy_plane(uv_buf_, uv, uv_stride, width, uv_h);
-    frame_w_       = width;
-    frame_h_       = height;
-    has_frame_     = true;
-    frame_is_nv12_ = true;
+    frame_w_         = width;
+    frame_h_         = height;
+    has_frame_       = true;
+    frame_is_nv12_   = true;
+    frame_origin_ns_ = origin_ns;
     cv_.notify_one();
 }
 
@@ -733,6 +738,7 @@ void VideoRenderer::run(const std::string& title) {
         bool have_nv12  = false;
         std::vector<unsigned char> y, u, v, uv;
         int w = 0, h = 0;
+        int64_t frame_origin_ns_local = 0;
         {
             std::unique_lock<std::mutex> lock(mtx_);
             cv_.wait_for(lock, std::chrono::milliseconds(16),
@@ -748,6 +754,7 @@ void VideoRenderer::run(const std::string& title) {
                     y = y_buf_; u = u_buf_; v = v_buf_;
                 }
                 w = frame_w_; h = frame_h_;
+                frame_origin_ns_local = frame_origin_ns_;
                 has_frame_ = false;
                 have_frame = true;
             }
@@ -1445,6 +1452,12 @@ void VideoRenderer::run(const std::string& title) {
             sep();
             ImGui::Text("Total: %s", fmt_total(total_b).c_str());
             sep();
+            const float lat_ms =
+                pipeline_latency_ms_ema_.load(std::memory_order_relaxed);
+            // Only show when a recent video frame populated it,
+            // otherwise the EMA is stale or zero.
+            ImGui::Text("Lat: %.1f ms", has_video ? lat_ms : 0.0f);
+            sep();
             ImGui::TextDisabled("HLS backend: %s", kHlsBackend);
         }
         ImGui::End();
@@ -1492,6 +1505,26 @@ void VideoRenderer::run(const std::string& title) {
             ImGui::GetDrawData(), renderer);
 
         SDL_RenderPresent(renderer);
+
+        // Pipeline-latency measurement: from when the encrypted
+        // frame body finished arriving on the wire (origin_ns
+        // tagged in MirrorListener) to right after present
+        // returns. Captures decrypt + decode + render + VSYNC.
+        // Ignored when origin_ns is 0 (HLS / non-mirror frames or
+        // older callers that didn't tag).
+        if (have_frame && frame_origin_ns_local > 0) {
+            const int64_t now_ns2 =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            const float lat_ms =
+                static_cast<float>((now_ns2 - frame_origin_ns_local) / 1e6);
+            const float prev_ema =
+                pipeline_latency_ms_ema_.load(std::memory_order_relaxed);
+            const float ema = (prev_ema <= 0.0f)
+                                  ? lat_ms
+                                  : prev_ema * 0.90f + lat_ms * 0.10f;
+            pipeline_latency_ms_ema_.store(ema, std::memory_order_relaxed);
+        }
     }
 
     if (title_tex)     SDL_DestroyTexture(title_tex);
