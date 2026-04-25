@@ -7,7 +7,7 @@
     {
       "name": "ffmpeg",
       "default-features": false,
-      "features": ["avcodec", "avformat", "swscale"]
+      "features": ["avcodec", "avformat", "swscale", "nvcodec"]
     },
     "sdl2",
     "sdl2-ttf"
