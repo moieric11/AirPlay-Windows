@@ -60,6 +60,13 @@ struct DeviceContext {
     int                         mirror_width  = 2560;
     int                         mirror_height = 1440;
 
+    // When true, the H.264/HEVC mirror decoder requests D3D11VA
+    // hardware acceleration on Windows — frames decode on the GPU,
+    // get pulled to system memory, converted to I420, and fed to
+    // the renderer. Software fallback is automatic when the
+    // platform / driver can't honor the request.
+    bool                        mirror_hwaccel = false;
+
     // Mutable settings exposed by the overlay UI. Optional — when
     // null, /info falls back to the static fields above. Lifetime
     // owned by main(); held non-owning here.

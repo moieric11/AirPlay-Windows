@@ -86,12 +86,15 @@ int main(int argc, char** argv) {
     // proxy for the rare cases where you want the video stream delivered
     // via the signed-CDN path we built.
     bool hls_playback = false;
+    bool mirror_hwaccel = false;
     int  mirror_w = 2560;   // matches DeviceContext default; CLI override
     int  mirror_h = 1440;   //   below this comment.
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--hls-proxy-playback" || arg == "--hls") {
             hls_playback = true;
+        } else if (arg == "--mirror-hwaccel") {
+            mirror_hwaccel = true;
         } else if ((arg == "--mirror-res" || arg == "-r") && i + 1 < argc) {
             // Accept "WxH" or "WxHi" with either separator, e.g. 1920x1080,
             // 2560x1440, 3840x2160. Anything malformed falls back silently
@@ -118,6 +121,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--help" || arg == "-h") {
             std::puts(
                 "AirPlay-Windows [--hls-proxy-playback] [--mirror-res WxH]\n"
+                "                [--mirror-hwaccel]\n"
                 "  --hls-proxy-playback  advertise HLS capability so iOS\n"
                 "                        hands video URLs to our proxy\n"
                 "                        (experimental, VOD-style latency)\n"
@@ -125,16 +129,26 @@ int main(int argc, char** argv) {
                 "                        resolution to iOS (default 2560x1440;\n"
                 "                        higher = sharper portrait at the cost\n"
                 "                        of bandwidth, common: 1920x1080,\n"
-                "                        2560x1440, 3840x2160)");
+                "                        2560x1440, 3840x2160)\n"
+                "  --mirror-hwaccel      decode mirror H.264/HEVC on the GPU\n"
+                "                        via D3D11VA (Windows only). Falls back\n"
+                "                        to software when the platform / driver\n"
+                "                        can't honor it. Useful for very high\n"
+                "                        resolutions / HEVC where software\n"
+                "                        decode would saturate the CPU.");
             ap::net::global_shutdown();
             return 0;
         }
     }
 
     auto ctx = build_device_context(hls_playback);
-    ctx.mirror_width  = mirror_w;
-    ctx.mirror_height = mirror_h;
+    ctx.mirror_width   = mirror_w;
+    ctx.mirror_height  = mirror_h;
+    ctx.mirror_hwaccel = mirror_hwaccel;
     LOG_INFO << "Mirror display advertised: " << mirror_w << 'x' << mirror_h;
+    LOG_INFO << "Mirror decoder: "
+             << (mirror_hwaccel ? "D3D11VA hwaccel (--mirror-hwaccel)"
+                                : "software (libavcodec)");
 
     // Live-mutable settings exposed to the overlay UI. Seed from the
     // CLI defaults; the UI thread can change values at runtime, and

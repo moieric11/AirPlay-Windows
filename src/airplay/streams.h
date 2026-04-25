@@ -67,6 +67,7 @@ public:
         uint64_t                   stream_connection_id = 0;
         int                        ct          = 0;
         int                        sample_rate = 44100;
+        bool                       mirror_hwaccel = false;
     };
 
     bool setup_stream(int type, uint16_t& data_port, uint16_t& control_port,

@@ -49,9 +49,11 @@ public:
     // Enable in-place AES-CTR decryption of VIDEO_IDR / VIDEO_NON_IDR frame
     // payloads before they are logged. Call BEFORE start(). Pass the audio
     // AES key (from fairplay_decrypt) and the streamConnectionID from the
-    // per-stream SETUP entry.
+    // per-stream SETUP entry. `hwaccel` requests D3D11VA on Windows for
+    // the H.264/HEVC decoder.
     bool enable_decrypt(const std::vector<unsigned char>& aes_key_audio,
-                        uint64_t stream_connection_id);
+                        uint64_t stream_connection_id,
+                        bool hwaccel = false);
 
     // Attach an external renderer — decoded frames (YUV420P) are pushed to
     // it on the reader thread. The listener does not own the renderer.

@@ -21,9 +21,11 @@ namespace ap::airplay {
 struct ClientSession {
     ClientSession(const ap::crypto::Identity& id, std::string peer_ip,
                   int socket_fd = -1,
-                  ap::video::VideoRenderer* r = nullptr)
+                  ap::video::VideoRenderer* r = nullptr,
+                  bool mirror_hwaccel_in = false)
         : identity(id), remote_ip(std::move(peer_ip)),
-          fd(socket_fd), renderer(r) {}
+          fd(socket_fd), renderer(r),
+          mirror_hwaccel(mirror_hwaccel_in) {}
 
     const ap::crypto::Identity& identity;
 
@@ -46,6 +48,10 @@ struct ClientSession {
     // Non-owning; handed down to the StreamSession on first SETUP so the
     // mirror stream's decoded frames can be drawn.
     ap::video::VideoRenderer* renderer{nullptr};
+
+    // True when the user passed --mirror-hwaccel; propagated to the
+    // MirrorListener so its H264Decoder asks libavcodec for D3D11VA.
+    bool mirror_hwaccel{false};
 
     std::unique_ptr<ap::crypto::PairVerifySession> pair_verify;
     std::unique_ptr<ap::crypto::FairPlaySession>   fairplay;

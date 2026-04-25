@@ -6,7 +6,9 @@
 
 extern "C" {
     #include <libavcodec/avcodec.h>
+    #include <libavutil/hwcontext.h>
     #include <libavutil/imgutils.h>
+    #include <libavutil/pixdesc.h>
     #include <libswscale/swscale.h>
 }
 
@@ -45,11 +47,46 @@ struct H264Decoder::Impl {
     bool                 last_is_yuv420 = false;
     uint64_t             frames_out  = 0;
 
+    // Hardware-accelerated decode via D3D11VA on Windows. The decoder
+    // outputs frames whose `data[]` is a GPU texture handle; we run
+    // av_hwframe_transfer_data into `sw_frame` (typically NV12) and
+    // then sws_scale into our own I420 plane buffers so the renderer
+    // path that expects Y / U / V plane pointers keeps working.
+    bool                 hwaccel_requested = false;
+    AVBufferRef*         hw_device_ctx     = nullptr;
+    AVFrame*             sw_frame          = nullptr;
+    AVPixelFormat        hw_pix_fmt        = AV_PIX_FMT_NONE;
+    SwsContext*          hw_to_i420_sws    = nullptr;
+    std::vector<uint8_t> i420_y;     // owned plane buffers post-conversion
+    std::vector<uint8_t> i420_u;
+    std::vector<uint8_t> i420_v;
+    int                  i420_w     = 0;
+    int                  i420_h     = 0;
+    bool                 frame_is_hw = false;  // last decode was a HW frame
+
     ~Impl() {
-        if (sws)   sws_freeContext(sws);
-        if (frame) av_frame_free(&frame);
-        if (pkt)   av_packet_free(&pkt);
-        if (ctx)   avcodec_free_context(&ctx);
+        if (hw_to_i420_sws) sws_freeContext(hw_to_i420_sws);
+        if (sws)             sws_freeContext(sws);
+        if (sw_frame)        av_frame_free(&sw_frame);
+        if (frame)           av_frame_free(&frame);
+        if (pkt)             av_packet_free(&pkt);
+        if (ctx)             avcodec_free_context(&ctx);
+        if (hw_device_ctx)   av_buffer_unref(&hw_device_ctx);
+    }
+
+    // get_format callback — libavcodec asks us which pixel format to
+    // output, after parsing the SPS. We pick AV_PIX_FMT_D3D11 when
+    // the encoder + system support it, otherwise let libavcodec
+    // pick its software default (NV12 / YUV420P).
+    static AVPixelFormat get_hw_format_cb(AVCodecContext* c,
+                                          const AVPixelFormat* pix_fmts) {
+        auto* self = static_cast<Impl*>(c->opaque);
+        if (self) {
+            for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+                if (*p == self->hw_pix_fmt) return *p;
+            }
+        }
+        return pix_fmts[0];
     }
 
     // Open (or re-open after a codec switch) libavcodec for `id`.
@@ -65,13 +102,41 @@ struct H264Decoder::Impl {
         codec_id = id;
         ctx      = avcodec_alloc_context3(c);
         if (!ctx) return false;
+
+        // Wire up D3D11VA hardware decode if the user opted in. Lazy
+        // create the hw device once across codec switches.
+        bool hw_enabled = false;
+        if (hwaccel_requested) {
+#if defined(_WIN32)
+            const AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_D3D11VA;
+            if (!hw_device_ctx) {
+                int rc = av_hwdevice_ctx_create(&hw_device_ctx, hw_type,
+                                                 nullptr, nullptr, 0);
+                if (rc < 0) {
+                    char err[AV_ERROR_MAX_STRING_SIZE]{};
+                    av_strerror(rc, err, sizeof(err));
+                    LOG_WARN << "decoder: D3D11VA unavailable (" << err
+                             << ") — falling back to software";
+                }
+            }
+            if (hw_device_ctx) {
+                hw_pix_fmt         = AV_PIX_FMT_D3D11;
+                ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+                ctx->get_format    = &Impl::get_hw_format_cb;
+                ctx->opaque        = this;
+                hw_enabled         = true;
+            }
+#endif
+        }
+
         if (avcodec_open2(ctx, c, nullptr) != 0) {
             LOG_ERROR << "decoder: avcodec_open2 failed for "
                       << avcodec_get_name(id);
             return false;
         }
         LOG_INFO << "decoder ready: " << avcodec_get_name(id)
-                 << " (libavcodec " << LIBAVCODEC_IDENT << ')';
+                 << " (libavcodec " << LIBAVCODEC_IDENT << ')'
+                 << (hw_enabled ? " [D3D11VA hwaccel]" : " [software]");
         return true;
     }
 };
@@ -79,10 +144,12 @@ struct H264Decoder::Impl {
 H264Decoder::H264Decoder()  : impl_(std::make_unique<Impl>()) {}
 H264Decoder::~H264Decoder() = default;
 
-bool H264Decoder::init() {
+bool H264Decoder::init(bool hwaccel) {
     impl_->pkt = av_packet_alloc();
     impl_->frame = av_frame_alloc();
-    if (!impl_->pkt || !impl_->frame) return false;
+    impl_->sw_frame = av_frame_alloc();
+    if (!impl_->pkt || !impl_->frame || !impl_->sw_frame) return false;
+    impl_->hwaccel_requested = hwaccel;
     return impl_->open(AV_CODEC_ID_H264);
 }
 
@@ -328,8 +395,68 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
     height  = impl_->frame->height;
     impl_->last_w = width;
     impl_->last_h = height;
-    impl_->last_is_yuv420 = (impl_->frame->format == AV_PIX_FMT_YUV420P ||
-                             impl_->frame->format == AV_PIX_FMT_YUVJ420P);
+    impl_->frame_is_hw =
+        (impl_->hw_pix_fmt != AV_PIX_FMT_NONE &&
+         impl_->frame->format == impl_->hw_pix_fmt);
+
+    // If the decoder produced a GPU frame, pull it down to system
+    // memory and convert to I420 so the renderer's plane API stays
+    // unchanged. The transferred frame is typically NV12 (8-bit) or
+    // P010 (10-bit HEVC); sws handles either.
+    if (impl_->frame_is_hw) {
+        av_frame_unref(impl_->sw_frame);
+        const int rc = av_hwframe_transfer_data(impl_->sw_frame,
+                                                impl_->frame, 0);
+        if (rc < 0) {
+            char err[AV_ERROR_MAX_STRING_SIZE]{};
+            av_strerror(rc, err, sizeof(err));
+            LOG_WARN << "H264Decoder: hwframe_transfer_data failed " << err;
+            return false;
+        }
+        const auto src_fmt =
+            static_cast<AVPixelFormat>(impl_->sw_frame->format);
+        const int sw_w = impl_->sw_frame->width;
+        const int sw_h = impl_->sw_frame->height;
+
+        // (Re)build the NV12/P010→I420 sws context on resolution or
+        // format changes. Lazy + cached.
+        if (!impl_->hw_to_i420_sws ||
+            impl_->i420_w != sw_w || impl_->i420_h != sw_h) {
+            if (impl_->hw_to_i420_sws) {
+                sws_freeContext(impl_->hw_to_i420_sws);
+                impl_->hw_to_i420_sws = nullptr;
+            }
+            impl_->hw_to_i420_sws = sws_getContext(
+                sw_w, sw_h, src_fmt,
+                sw_w, sw_h, AV_PIX_FMT_YUV420P,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+            impl_->i420_w = sw_w;
+            impl_->i420_h = sw_h;
+            impl_->i420_y.resize(static_cast<std::size_t>(sw_w) * sw_h);
+            impl_->i420_u.resize(static_cast<std::size_t>(sw_w / 2) *
+                                 (sw_h / 2));
+            impl_->i420_v.resize(static_cast<std::size_t>(sw_w / 2) *
+                                 (sw_h / 2));
+        }
+        if (impl_->hw_to_i420_sws) {
+            uint8_t* dst[3] = {
+                impl_->i420_y.data(),
+                impl_->i420_u.data(),
+                impl_->i420_v.data(),
+            };
+            const int dst_stride[3] = { sw_w, sw_w / 2, sw_w / 2 };
+            sws_scale(impl_->hw_to_i420_sws,
+                      impl_->sw_frame->data, impl_->sw_frame->linesize,
+                      0, sw_h, dst, dst_stride);
+            impl_->last_is_yuv420 = true;
+        } else {
+            impl_->last_is_yuv420 = false;
+        }
+    } else {
+        impl_->last_is_yuv420 =
+            (impl_->frame->format == AV_PIX_FMT_YUV420P ||
+             impl_->frame->format == AV_PIX_FMT_YUVJ420P);
+    }
 
     // iOS delivers full-range YUV as "YUVJ420P". That pixel format is
     // deprecated in modern libswscale (prints a warning per frame) — remap
@@ -389,11 +516,22 @@ bool H264Decoder::last_frame_yuv(const uint8_t*& y, int& y_stride,
                                  const uint8_t*& u, int& u_stride,
                                  const uint8_t*& v, int& v_stride,
                                  int& width, int& height) const {
-    if (!impl_ || !impl_->last_is_yuv420 || !impl_->frame ||
-        impl_->last_w == 0) return false;
-    y = impl_->frame->data[0];      y_stride = impl_->frame->linesize[0];
-    u = impl_->frame->data[1];      u_stride = impl_->frame->linesize[1];
-    v = impl_->frame->data[2];      v_stride = impl_->frame->linesize[2];
+    if (!impl_ || !impl_->last_is_yuv420 || impl_->last_w == 0)
+        return false;
+    if (impl_->frame_is_hw) {
+        // Hardware-decoded frame already pulled to sys memory and
+        // converted to I420 in our own plane buffers.
+        if (impl_->i420_y.empty() || impl_->i420_u.empty() ||
+            impl_->i420_v.empty()) return false;
+        y = impl_->i420_y.data(); y_stride = impl_->i420_w;
+        u = impl_->i420_u.data(); u_stride = impl_->i420_w / 2;
+        v = impl_->i420_v.data(); v_stride = impl_->i420_w / 2;
+    } else {
+        if (!impl_->frame) return false;
+        y = impl_->frame->data[0]; y_stride = impl_->frame->linesize[0];
+        u = impl_->frame->data[1]; u_stride = impl_->frame->linesize[1];
+        v = impl_->frame->data[2]; v_stride = impl_->frame->linesize[2];
+    }
     width  = impl_->last_w;
     height = impl_->last_h;
     return y && u && v;

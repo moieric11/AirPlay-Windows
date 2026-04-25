@@ -203,14 +203,15 @@ MirrorListener::~MirrorListener() { stop(); }
 
 bool MirrorListener::enable_decrypt(
         const std::vector<unsigned char>& aes_key_audio,
-        uint64_t stream_connection_id) {
+        uint64_t stream_connection_id,
+        bool hwaccel) {
     decrypt_ = std::make_unique<ap::crypto::MirrorDecrypt>();
     if (!decrypt_->init(aes_key_audio, stream_connection_id)) {
         decrypt_.reset();
         return false;
     }
     decoder_ = std::make_unique<ap::video::H264Decoder>();
-    if (!decoder_->init()) {
+    if (!decoder_->init(hwaccel)) {
         LOG_WARN << "H264Decoder init failed — decrypted NALs will be logged "
                     "but not decoded";
         decoder_.reset();

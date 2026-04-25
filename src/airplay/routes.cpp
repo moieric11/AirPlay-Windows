@@ -423,6 +423,7 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
             opts.stream_connection_id = parsed.streams[i].stream_conn_id;
             opts.ct                   = parsed.streams[i].ct;
             opts.sample_rate          = 44100;  // TODO: parse from SETUP when != 44.1k
+            opts.mirror_hwaccel       = session.mirror_hwaccel;
 
             if (!session.streams->setup_stream(parsed.streams[i].type, d, c, opts)) {
                 LOG_ERROR << "airplay2 SETUP: could not bind stream #" << i;

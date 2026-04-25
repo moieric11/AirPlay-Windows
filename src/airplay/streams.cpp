@@ -184,7 +184,8 @@ bool StreamSession::setup_stream(int type,
 
         // Wire AES-CTR decryption before starting the accept loop.
         if (!opts.aes_key.empty() && opts.stream_connection_id != 0) {
-            if (!mirror_->enable_decrypt(opts.aes_key, opts.stream_connection_id)) {
+            if (!mirror_->enable_decrypt(opts.aes_key, opts.stream_connection_id,
+                                         opts.mirror_hwaccel)) {
                 LOG_WARN << "SETUP stream 110: could not init AES-CTR decrypt "
                             "(stream will be logged encrypted)";
             }
