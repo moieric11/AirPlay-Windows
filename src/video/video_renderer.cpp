@@ -741,9 +741,14 @@ void VideoRenderer::run(const std::string& title) {
         }
 
         // --- Decide which texture to show ----------------------------
-        // Video takes priority if we got a recent frame. While paused,
-        // keep the last video frame on screen instead of falling back to
-        // stale cover art.
+        // Video takes priority if we got a recent frame. iOS stops
+        // emitting H.264 frames whenever the mirror content is static
+        // (menu screens, paused video, idle home screen) — the encoder
+        // is too efficient to bother re-sending identical frames. We
+        // therefore keep the last video texture on screen as long as
+        // a device is paired, regardless of the 500 ms freshness
+        // window. Only on TEARDOWN (clear_active_device) does the
+        // texture stop showing and we fall back to idle.
         const auto now = std::chrono::steady_clock::now();
         const bool video_fresh =
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -751,7 +756,8 @@ void VideoRenderer::run(const std::string& title) {
         const bool playing_now = playing_.load(std::memory_order_relaxed);
         DeviceInfo active_dev;
         const bool has_active_dev = active_device_snapshot(active_dev);
-        const bool show_video = video_tex && (video_fresh || !playing_now);
+        const bool show_video =
+            video_tex && (video_fresh || has_active_dev || !playing_now);
 
         int win_w = 0, win_h = 0;
         SDL_GetRendererOutputSize(renderer, &win_w, &win_h);
@@ -1092,9 +1098,15 @@ void VideoRenderer::run(const std::string& title) {
                 ImGui::TextDisabled(" | ");
                 ImGui::SameLine();
             };
-            ImGui::Text("State: %s", has_video
-                                       ? (playing ? "Playing" : "Paused")
-                                       : "Idle");
+            // "Streaming" = paired AND frames flowing; "Connected" =
+            // paired but iOS quiet (static menu, paused video — common
+            // in mirror); "Idle" = nothing connected.
+            const char* state_label =
+                has_active_dev
+                    ? (has_video ? (playing ? "Streaming" : "Paused")
+                                 : "Connected")
+                    : "Idle";
+            ImGui::Text("State: %s", state_label);
             sep();
             if (vid_w > 0 && vid_h > 0) {
                 ImGui::Text("Video: %dx%d @ %.1f", vid_w, vid_h,
