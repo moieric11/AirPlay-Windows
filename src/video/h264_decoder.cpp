@@ -163,20 +163,84 @@ bool parse_hvcc(const uint8_t* blob, std::size_t size,
     return !vps_out.empty() && !sps_out.empty() && !pps_out.empty();
 }
 
+// Some iOS mirror flows (notably HEVC) deliver the config wrapped
+// inside an MP4 VisualSampleEntry: the payload begins with
+// [size:u32 BE][fourcc "avc1"|"hvc1"|"hev1"|"avc3"][...VisualSampleEntry
+// fields...][child box "avcC"|"hvcC"|...]. Find the inner config
+// box by scanning for its fourcc and return a pointer to the box
+// content (after the 8-byte size+type header). Returns false if no
+// known config child box is present.
+bool find_inner_config_box(const uint8_t* blob, std::size_t size,
+                           const uint8_t*& inner_blob,
+                           std::size_t&    inner_size) {
+    static const char* const kFourccs[] = {"avcC", "hvcC"};
+    for (const char* fourcc : kFourccs) {
+        // Need at least 4 bytes of size field before the fourcc.
+        for (std::size_t i = 4; i + 4 <= size; ++i) {
+            if (blob[i + 0] == static_cast<uint8_t>(fourcc[0]) &&
+                blob[i + 1] == static_cast<uint8_t>(fourcc[1]) &&
+                blob[i + 2] == static_cast<uint8_t>(fourcc[2]) &&
+                blob[i + 3] == static_cast<uint8_t>(fourcc[3])) {
+                const uint8_t* sz = blob + i - 4;
+                const std::size_t box_size =
+                    (static_cast<std::size_t>(sz[0]) << 24) |
+                    (static_cast<std::size_t>(sz[1]) << 16) |
+                    (static_cast<std::size_t>(sz[2]) << 8)  |
+                     static_cast<std::size_t>(sz[3]);
+                if (box_size >= 9 && (i - 4) + box_size <= size) {
+                    inner_blob = blob + i + 4;            // after fourcc
+                    inner_size = box_size - 8;            // minus header
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 // Accept either an H.264 avcC or an HEVC hvcC blob, reinit the
 // decoder on codec change. Historical name kept for callers.
 bool H264Decoder::set_parameter_sets_from_avcc(const uint8_t* blob,
                                                std::size_t size) {
-    if (!blob || size < 7 || blob[0] != 0x01) {
-        LOG_WARN << "decoder: config blob missing or wrong version";
+    if (!blob || size < 7) {
+        LOG_WARN << "decoder: config blob missing or too short ("
+                 << size << "B)";
+        return false;
+    }
+
+    // Most iOS H.264 mirror flows hand us the raw avcC blob whose
+    // configurationVersion byte is 0x01. Newer HEVC mirror flows
+    // wrap the config in an MP4 SampleEntry — first byte is 0x00
+    // (the high byte of the box size), and the inner avcC / hvcC
+    // box sits a few dozen bytes in. Detect the wrapped case and
+    // unwrap once before trying the parsers.
+    const uint8_t* cfg = blob;
+    std::size_t    csz = size;
+    if (cfg[0] != 0x01) {
+        const uint8_t* inner = nullptr;
+        std::size_t    isize = 0;
+        if (find_inner_config_box(blob, size, inner, isize)) {
+            LOG_INFO << "decoder: unwrapped MP4 SampleEntry, inner "
+                     << "config box " << isize << "B";
+            cfg = inner;
+            csz = isize;
+        } else {
+            LOG_WARN << "decoder: config blob has no avcC/hvcC inner "
+                        "box and no leading 0x01 (" << size << "B)";
+            return false;
+        }
+    }
+    if (cfg[0] != 0x01) {
+        LOG_WARN << "decoder: inner config wrong version (0x"
+                 << std::hex << static_cast<int>(cfg[0]) << ')';
         return false;
     }
 
     // Try H.264 avcC first (common path).
     std::vector<uint8_t> new_sps, new_pps;
-    if (parse_avcc(blob, size, new_sps, new_pps)) {
+    if (parse_avcc(cfg, csz, new_sps, new_pps)) {
         if (impl_->codec_id != AV_CODEC_ID_H264 &&
             !impl_->open(AV_CODEC_ID_H264)) {
             return false;
@@ -193,7 +257,7 @@ bool H264Decoder::set_parameter_sets_from_avcc(const uint8_t* blob,
     // Fall through to HEVC hvcC.
     std::vector<uint8_t> new_vps;
     new_sps.clear(); new_pps.clear();
-    if (parse_hvcc(blob, size, new_vps, new_sps, new_pps)) {
+    if (parse_hvcc(cfg, csz, new_vps, new_sps, new_pps)) {
         if (impl_->codec_id != AV_CODEC_ID_HEVC &&
             !impl_->open(AV_CODEC_ID_HEVC)) {
             return false;
