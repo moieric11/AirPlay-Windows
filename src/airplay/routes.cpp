@@ -5,6 +5,7 @@
 #include "airplay/fcup.h"
 #include "airplay/hls_session.h"
 #include "airplay/info_plist.h"
+#include "airplay/live_settings.h"
 #include "airplay/reverse_channel.h"
 #include "airplay/sdp.h"
 #include "airplay/streams.h"
