@@ -1185,21 +1185,17 @@ void VideoRenderer::run(const std::string& title) {
                 }
                 if (ImGui::CollapsingHeader("Frame rate")) {
                     if (live_settings_) {
-                        // Both fields are advertised in /info as upper
-                        // bounds — iOS will never go above 60 fps for
-                        // mirror anyway, so cap the sliders at 60 to
-                        // surface the realistic range. Pull the value
-                        // down to 30 / 24 / 15 if you want a smoother,
-                        // deterministic frame cadence.
-                        int cur_max  = live_settings_->max_fps.load();
-                        int cur_rate = live_settings_->refresh_rate.load();
-                        ImGui::SetNextItemWidth(180);
-                        if (ImGui::SliderInt("maxFPS", &cur_max, 1, 60)) {
-                            live_settings_->max_fps.store(cur_max);
-                        }
-                        ImGui::SetNextItemWidth(180);
-                        if (ImGui::SliderInt("refreshRate", &cur_rate, 1, 60)) {
-                            live_settings_->refresh_rate.store(cur_rate);
+                        // iOS effectively takes the min of maxFPS and
+                        // refreshRate, so two separate sliders meant
+                        // the same thing twice. Drive both atomics
+                        // from a single "Frame rate cap" knob and
+                        // keep the underlying fields in lockstep.
+                        int cap = live_settings_->max_fps.load();
+                        ImGui::SetNextItemWidth(200);
+                        if (ImGui::SliderInt("Frame rate cap",
+                                             &cap, 1, 60, "%d fps")) {
+                            live_settings_->max_fps.store(cap);
+                            live_settings_->refresh_rate.store(cap);
                         }
                         ImGui::TextDisabled(
                             "iOS caps mirror at 60 fps regardless of hint;"
