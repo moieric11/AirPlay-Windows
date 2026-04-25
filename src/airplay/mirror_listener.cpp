@@ -458,7 +458,7 @@ void MirrorListener::reader_loop(socket_t client) {
                                 "stream after decrypt ("
                              << nals.size() << " NAL(s) parsed before stopping)";
                 } else {
-                    for (const auto& n : nals) nal_counts[n.type]++;
+                    for (const auto& nal : nals) nal_counts[nal.type]++;
                     // Verbose: first IDR, first non-IDR, and any multi-NAL frame.
                     const bool first_of_kind = (counts[ftype] == 1);
                     const bool multi_nal     = (nals.size() > 1);
@@ -466,12 +466,12 @@ void MirrorListener::reader_loop(socket_t client) {
                         LOG_INFO << "mirror frame[" << frames << "] "
                                  << frame_name(ftype) << " → "
                                  << nals.size() << " NAL(s):";
-                        for (const auto& n : nals) {
+                        for (const auto& nal : nals) {
                             LOG_INFO << "  NAL "
-                                     << nal_type_name(n.type, nal_codec)
-                                     << "(type=" << n.type
-                                     << ", ref_idc=" << n.ref_idc
-                                     << ", size=" << n.size << "B)";
+                                     << nal_type_name(nal.type, nal_codec)
+                                     << "(type=" << nal.type
+                                     << ", ref_idc=" << nal.ref_idc
+                                     << ", size=" << nal.size << "B)";
                         }
                     }
 

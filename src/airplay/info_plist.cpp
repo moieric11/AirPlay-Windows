@@ -90,6 +90,20 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
 #else
     plist_t root = plist_new_dict();
 
+    // Resolution & HEVC bit are user-tunable via the overlay's
+    // OPTIONS panel — read from LiveSettings when present (mutated
+    // by the UI thread), fall back to the static DeviceContext
+    // fields otherwise. iOS only consumes /info on connection, so
+    // changes apply on the next handshake.
+    int mirror_w = ctx.mirror_width;
+    int mirror_h = ctx.mirror_height;
+    bool hevc    = true;
+    if (ctx.live) {
+        mirror_w = ctx.live->mirror_width.load(std::memory_order_relaxed);
+        mirror_h = ctx.live->mirror_height.load(std::memory_order_relaxed);
+        hevc     = ctx.live->hevc_enabled.load(std::memory_order_relaxed);
+    }
+
     set_str (root, "deviceid",      ctx.deviceid);
     set_str (root, "macAddress",    ctx.deviceid);
     set_str (root, "model",         ctx.model);
@@ -122,19 +136,6 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
             plist_new_data(reinterpret_cast<const char*>(zero), sizeof(zero)));
     }
 
-    // Resolution & HEVC bit are user-tunable via the overlay's
-    // OPTIONS panel — read from LiveSettings when present (mutated
-    // by the UI thread), fall back to the static DeviceContext
-    // fields otherwise. iOS only consumes /info on connection, so
-    // changes apply on the next handshake.
-    int mirror_w = ctx.mirror_width;
-    int mirror_h = ctx.mirror_height;
-    bool hevc    = true;
-    if (ctx.live) {
-        mirror_w = ctx.live->mirror_width.load(std::memory_order_relaxed);
-        mirror_h = ctx.live->mirror_height.load(std::memory_order_relaxed);
-        hevc     = ctx.live->hevc_enabled.load(std::memory_order_relaxed);
-    }
     plist_t displays = plist_new_array();
     plist_array_append_item(displays, make_display(mirror_w, mirror_h));
     plist_dict_set_item(root, "displays", displays);
