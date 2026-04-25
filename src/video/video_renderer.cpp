@@ -1146,30 +1146,37 @@ void VideoRenderer::run(const std::string& title) {
                             }
                             ImGui::EndCombo();
                         }
-                        // Custom W / H input fields for fine-grained tuning.
-                        // Persist the typed values across frames so a combo
-                        // preset selection above (or any other writer of
-                        // live_settings) can't clobber what the user is
-                        // typing — without this, every keystroke gets
-                        // re-rendered against cur_w/cur_h and the field
-                        // visibly snaps back to the combo's preset.
-                        static int  wh_buf[2]   = {2560, 1440};
-                        static bool wh_active   = false;
-                        if (!wh_active) {
-                            wh_buf[0] = cur_w;
-                            wh_buf[1] = cur_h;
-                        }
-                        ImGui::SetNextItemWidth(160);
-                        const bool committed = ImGui::InputInt2(
-                            "Custom WxH", wh_buf,
+                        // Custom W / H input fields. Each tracks its own
+                        // active state — InputInt2's IsItemActive only
+                        // covers the last component (height), so editing
+                        // the width field would always be flagged "not
+                        // active" and clobbered on the next frame.
+                        static int  width_buf    = 2560;
+                        static int  height_buf   = 1440;
+                        static bool width_active = false;
+                        static bool height_active= false;
+                        if (!width_active)  width_buf  = cur_w;
+                        if (!height_active) height_buf = cur_h;
+
+                        ImGui::SetNextItemWidth(80);
+                        const bool w_commit = ImGui::InputInt(
+                            "Width##custom", &width_buf, 0, 0,
                             ImGuiInputTextFlags_EnterReturnsTrue);
-                        wh_active = ImGui::IsItemActive();
-                        if (committed) {
-                            if (wh_buf[0] >= 320 && wh_buf[0] <= 7680 &&
-                                wh_buf[1] >= 240 && wh_buf[1] <= 4320) {
-                                live_settings_->mirror_width.store(wh_buf[0]);
-                                live_settings_->mirror_height.store(wh_buf[1]);
-                            }
+                        width_active = ImGui::IsItemActive();
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(80);
+                        const bool h_commit = ImGui::InputInt(
+                            "Height##custom", &height_buf, 0, 0,
+                            ImGuiInputTextFlags_EnterReturnsTrue);
+                        height_active = ImGui::IsItemActive();
+
+                        if (w_commit && width_buf >= 320 &&
+                            width_buf <= 7680) {
+                            live_settings_->mirror_width.store(width_buf);
+                        }
+                        if (h_commit && height_buf >= 240 &&
+                            height_buf <= 4320) {
+                            live_settings_->mirror_height.store(height_buf);
                         }
                         ImGui::TextDisabled("Applies on next iPhone connection");
                     } else {
