@@ -35,11 +35,14 @@ struct LiveSettings {
     std::atomic<int>  max_fps{60};
     std::atomic<int>  refresh_rate{60};
 
-    // True → request D3D11VA hardware decoding for the H.264/HEVC
-    // mirror stream on Windows. The decoder falls back to software
-    // automatically if the platform / driver can't honor it.
-    // Read at SETUP time, so toggling at runtime applies to the
-    // next iPhone connection.
+    // False → keep the software libavcodec path (default). On
+    // benchmarking with cuvid (NVDEC on RTX 3080) and D3D11VA we
+    // measured ~30-38 ms of local-pipeline latency vs ~12 ms in
+    // software, because the HW path pays two synchronous PCIe
+    // round-trips (av_hwframe_transfer_data + SDL_UpdateNVTexture)
+    // that single-stream mirror doesn't amortise. Software wins
+    // for single-stream low-latency mirror; users who want CPU
+    // offload (multi-stream or weak CPUs) flip this to true.
     std::atomic<bool> mirror_hwaccel{false};
 
     // SDL_RENDERER_PRESENTVSYNC. False → present immediately when a

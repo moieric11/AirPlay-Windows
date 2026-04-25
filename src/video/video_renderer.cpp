@@ -1329,17 +1329,19 @@ void VideoRenderer::run(const std::string& title) {
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     if (live_settings_) {
                         bool hw = live_settings_->mirror_hwaccel.load();
-                        if (ImGui::Checkbox("GPU decode (D3D11VA)", &hw)) {
+                        if (ImGui::Checkbox("GPU decode (cuvid / D3D11VA)",
+                                            &hw)) {
                             live_settings_->mirror_hwaccel.store(hw);
                         }
                         ImGui::TextDisabled(
                             hw
-                              ? "Decode mirror H.264/HEVC on the GPU"
-                              : "Decode mirror H.264/HEVC on the CPU"
-                                " (libavcodec software)");
-                        ImGui::TextDisabled(
-                            "Falls back to software if D3D11VA is"
-                            " unavailable on the host.");
+                              ? "GPU pipeline: NVDEC cuvid (NVIDIA) →"
+                                " D3D11VA fallback. Higher latency than"
+                                " software on single-stream mirror"
+                                " (~30 ms vs 12 ms in tests) but offloads"
+                                " the CPU."
+                              : "Software libavcodec — fastest end-to-end"
+                                " latency on single-stream mirror.");
                         ImGui::TextDisabled("Applies on next iPhone connection");
 
                         ImGui::Separator();

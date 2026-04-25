@@ -131,11 +131,13 @@ int main(int argc, char** argv) {
                 "                        of bandwidth, common: 1920x1080,\n"
                 "                        2560x1440, 3840x2160)\n"
                 "  --mirror-hwaccel      decode mirror H.264/HEVC on the GPU\n"
-                "                        via D3D11VA (Windows only). Falls back\n"
-                "                        to software when the platform / driver\n"
-                "                        can't honor it. Useful for very high\n"
-                "                        resolutions / HEVC where software\n"
-                "                        decode would saturate the CPU.");
+                "                        (NVDEC cuvid → D3D11VA cascade).\n"
+                "                        Off by default: benchmarks show\n"
+                "                        software libavcodec is faster\n"
+                "                        end-to-end on single-stream mirror\n"
+                "                        because GPU paths pay 2 PCIe trips\n"
+                "                        per frame. Useful for CPU-constrained\n"
+                "                        machines or future multi-stream.");
             ap::net::global_shutdown();
             return 0;
         }
@@ -146,9 +148,10 @@ int main(int argc, char** argv) {
     ctx.mirror_height  = mirror_h;
     ctx.mirror_hwaccel = mirror_hwaccel;
     LOG_INFO << "Mirror display advertised: " << mirror_w << 'x' << mirror_h;
-    LOG_INFO << "Mirror decoder: "
-             << (mirror_hwaccel ? "D3D11VA hwaccel (--mirror-hwaccel)"
-                                : "software (libavcodec)");
+    LOG_INFO << "Mirror decoder default: "
+             << (mirror_hwaccel
+                   ? "GPU hwaccel (--mirror-hwaccel; cuvid → D3D11VA cascade)"
+                   : "software libavcodec (toggle GPU in OPTIONS panel)");
 
     // Live-mutable settings exposed to the overlay UI. Seed from the
     // CLI defaults; the UI thread can change values at runtime, and
