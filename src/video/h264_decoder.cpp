@@ -203,6 +203,14 @@ struct H264Decoder::Impl {
         // Dropped — the LOW_DELAY win was the bigger one anyway.
         ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
 
+        // Quiet "Invalid pkt_timebase, passing timestamps as-is"
+        // from hevc_cuvid / h264_cuvid. iOS doesn't carry PTS in
+        // the mirror bitstream and we don't synthesise any, so
+        // the time base is genuinely "raw frame counter". Setting
+        // pkt_timebase to AV_TIME_BASE_Q satisfies the warning
+        // without changing semantics.
+        ctx->pkt_timebase = AVRational{ 1, AV_TIME_BASE };
+
         // Default libavcodec threading (FF_THREAD_FRAME) decodes
         // multiple frames in parallel — great throughput, but it
         // requires keeping N-1 in-flight frames in a queue, which
