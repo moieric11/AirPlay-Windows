@@ -137,18 +137,37 @@ if(NOT SDL2_TTF_TARGET)
         "  Linux:   apt install libsdl2-ttf-dev")
 endif()
 
-# ---- GStreamer (optional, HLS playback backend) -------------------------------
-# Default HLS backend is libavformat (single-file, cross-platform). Enable
-# USE_GSTREAMER_HLS to swap for the GStreamer backend (hls_player_gstreamer.cpp),
-# which handles HLS live-edge buffering, variant switching and codec muxing
-# more gracefully than raw libavformat — at the cost of another runtime dep
-# (libgstreamer-1.0 + gst-plugins-{base,good,bad} + gst-libav).
-option(USE_GSTREAMER_HLS "Use GStreamer for HLS playback (instead of libavformat)" OFF)
+# ---- GStreamer (preferred HLS backend if available) ---------------------------
+# We have two HLS backends:
+#   - GStreamer (hls_player_gstreamer.cpp) — handles HLS live-edge buffering,
+#     variant switching, HEVC mux gracefully.
+#   - libavformat (hls_player.cpp) — single-file, no extra runtime dep, but
+#     less robust on YouTube-style mlhls streams.
+#
+# USE_GSTREAMER_HLS = AUTO (default): pick GStreamer if pkg-config finds it,
+# else fall back to libavformat. ON forces GStreamer (errors if not found),
+# OFF forces libavformat. So a single `cmake build` directory does the right
+# thing on a developer machine that has GStreamer installed.
+set(USE_GSTREAMER_HLS "AUTO" CACHE STRING
+    "HLS backend: AUTO (prefer GStreamer if found), ON (require it), OFF (libavformat)")
+set_property(CACHE USE_GSTREAMER_HLS PROPERTY STRINGS AUTO ON OFF)
 set(HLS_PLAYER_SRC src/video/hls_player.cpp)
-if(USE_GSTREAMER_HLS)
+set(_use_gst FALSE)
+if(USE_GSTREAMER_HLS STREQUAL "ON")
+    set(_use_gst TRUE)
+elseif(USE_GSTREAMER_HLS STREQUAL "AUTO")
+    set(_use_gst TRUE)         # tentative — checked below
+endif()
+if(_use_gst)
     if(NOT PkgConfig_FOUND)
-        message(FATAL_ERROR "USE_GSTREAMER_HLS=ON requires pkg-config")
+        if(USE_GSTREAMER_HLS STREQUAL "ON")
+            message(FATAL_ERROR "USE_GSTREAMER_HLS=ON requires pkg-config")
+        endif()
+        message(STATUS "HLS backend: pkg-config missing → falling back to libavformat")
+        set(_use_gst FALSE)
     endif()
+endif()
+if(_use_gst)
     # Windows convenience: -DGSTREAMER_ROOT=... propagates into
     # PKG_CONFIG_PATH. Accepts either:
     #   - the install root:
@@ -199,20 +218,27 @@ if(USE_GSTREAMER_HLS)
     pkg_check_modules(GSTREAMER IMPORTED_TARGET
         gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
     if(NOT GSTREAMER_FOUND)
-        message(FATAL_ERROR
-            "USE_GSTREAMER_HLS=ON but gstreamer-1.0/gstreamer-app-1.0/gstreamer-video-1.0 not found.\n"
-            "  Windows: install GStreamer MSVC x86_64 from\n"
-            "           https://gstreamer.freedesktop.org/download/ and either\n"
-            "             set PKG_CONFIG_PATH before cmake, or pass\n"
-            "             -DGSTREAMER_ROOT=\"C:/Program Files/gstreamer/1.0/msvc_x86_64\"\n"
-            "  Linux:   apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev\n"
-            "                       libgstreamer-plugins-bad1.0-dev gstreamer1.0-libav\n"
-            "                       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad")
+        if(USE_GSTREAMER_HLS STREQUAL "ON")
+            message(FATAL_ERROR
+                "USE_GSTREAMER_HLS=ON but gstreamer-1.0/gstreamer-app-1.0/gstreamer-video-1.0 not found.\n"
+                "  Windows: install GStreamer MSVC x86_64 from\n"
+                "           https://gstreamer.freedesktop.org/download/ and either\n"
+                "             set PKG_CONFIG_PATH before cmake, or pass\n"
+                "             -DGSTREAMER_ROOT=\"C:/Program Files/gstreamer/1.0/msvc_x86_64\"\n"
+                "  Linux:   apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev\n"
+                "                       libgstreamer-plugins-bad1.0-dev gstreamer1.0-libav\n"
+                "                       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad")
+        endif()
+        message(STATUS "HLS backend: GStreamer not found → using libavformat")
+        set(_use_gst FALSE)
+    else()
+        message(STATUS "HLS backend: GStreamer (${GSTREAMER_VERSION})")
+        set(HLS_PLAYER_SRC src/video/hls_player_gstreamer.cpp)
     endif()
-    message(STATUS "HLS backend: GStreamer (${GSTREAMER_VERSION})")
-    set(HLS_PLAYER_SRC src/video/hls_player_gstreamer.cpp)
-else()
-    message(STATUS "HLS backend: libavformat (default; -DUSE_GSTREAMER_HLS=ON for GStreamer)")
+endif()
+if(NOT _use_gst)
+    message(STATUS "HLS backend: libavformat "
+                   "(force GStreamer with -DUSE_GSTREAMER_HLS=ON)")
 endif()
 
 # ---- Dear ImGui (in-app overlay UI) ------------------------------------------
@@ -285,7 +311,7 @@ add_executable(airplay-windows
 
 target_include_directories(airplay-windows PRIVATE src)
 target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET} ${SDL2_TTF_TARGET} imgui)
-if(USE_GSTREAMER_HLS AND GSTREAMER_FOUND)
+if(_use_gst AND GSTREAMER_FOUND)
     target_link_libraries(airplay-windows PRIVATE PkgConfig::GSTREAMER)
     target_compile_definitions(airplay-windows PRIVATE HAVE_GSTREAMER_HLS=1)
 endif()
