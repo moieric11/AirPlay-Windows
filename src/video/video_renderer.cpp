@@ -389,7 +389,44 @@ void VideoRenderer::clear_session() {
     progress_pushed_at_ns_.store(0, std::memory_order_relaxed);
     playing_.store(true, std::memory_order_relaxed);
     clear_cover_requested_.store(true, std::memory_order_relaxed);
+    // Reset the per-session stats so the status bar starts fresh on
+    // the next paired device — "how much did this session use?" is
+    // way more useful than "lifetime since app start".
+    frames_total_.store(0, std::memory_order_relaxed);
+    video_fps_ema_.store(0.0f, std::memory_order_relaxed);
+    last_push_ns_.store(0, std::memory_order_relaxed);
+    payload_bytes_total_.store(0, std::memory_order_relaxed);
+    payload_mbps_ema_.store(0.0f, std::memory_order_relaxed);
+    last_payload_ns_.store(0, std::memory_order_relaxed);
     cv_.notify_one();
+}
+
+void VideoRenderer::record_payload_bytes(std::size_t n) {
+    payload_bytes_total_.fetch_add(static_cast<uint64_t>(n),
+                                   std::memory_order_relaxed);
+
+    // Instantaneous bytes/sec → Mbps via EMA. Same approach as the
+    // FPS EMA in push_frame: cheap, smooth, no buffer.
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t prev_ns = last_payload_ns_.exchange(now_ns,
+                                                      std::memory_order_relaxed);
+    if (prev_ns > 0) {
+        const double dt_s = (now_ns - prev_ns) / 1e9;
+        if (dt_s > 0.001 && dt_s < 1.0) {
+            // bytes/s × 8 bits/byte ÷ 1e6 → Mbps
+            const float inst_mbps =
+                static_cast<float>((static_cast<double>(n) * 8.0) /
+                                   (dt_s * 1e6));
+            const float prev_ema =
+                payload_mbps_ema_.load(std::memory_order_relaxed);
+            const float ema = (prev_ema <= 0.0f)
+                                  ? inst_mbps
+                                  : prev_ema * 0.85f + inst_mbps * 0.15f;
+            payload_mbps_ema_.store(ema, std::memory_order_relaxed);
+        }
+    }
 }
 
 void VideoRenderer::set_active_device(DeviceInfo info) {
@@ -1137,6 +1174,32 @@ void VideoRenderer::run(const std::string& title) {
             ImGui::Text("Stage: %dx%d", stage_w, stage_h);
             sep();
             ImGui::Text("Renderer: %.0f fps", io_ui.Framerate);
+            sep();
+            const float    mbps  =
+                payload_mbps_ema_.load(std::memory_order_relaxed);
+            const uint64_t total_b =
+                payload_bytes_total_.load(std::memory_order_relaxed);
+            // Render the cumulative size in whichever unit reads
+            // best for the magnitude (KB up to 10 MB, then MB, then
+            // GB) so the eye sees a tidy "82.3 MB" instead of
+            // "85786 KB".
+            const auto fmt_total = [&](uint64_t bytes) {
+                char buf[32];
+                if (bytes < (10ull << 20)) {
+                    std::snprintf(buf, sizeof(buf), "%.1f KB",
+                                  bytes / 1024.0);
+                } else if (bytes < (10ull << 30)) {
+                    std::snprintf(buf, sizeof(buf), "%.1f MB",
+                                  bytes / (1024.0 * 1024.0));
+                } else {
+                    std::snprintf(buf, sizeof(buf), "%.2f GB",
+                                  bytes / (1024.0 * 1024.0 * 1024.0));
+                }
+                return std::string(buf);
+            };
+            ImGui::Text("BW: %.1f Mbps", has_video ? mbps : 0.0f);
+            sep();
+            ImGui::Text("Total: %s", fmt_total(total_b).c_str());
             sep();
             ImGui::TextDisabled("HLS backend: %s", kHlsBackend);
         }

@@ -399,6 +399,14 @@ void MirrorListener::reader_loop(socket_t client) {
         counts[ftype]++;
         bytes_by_type[ftype] += payload_size;
 
+        // Surface the encrypted-frame body byte count to the renderer
+        // so the status bar can report a live mirror bandwidth without
+        // the renderer needing to peek into us.
+        if (renderer_) {
+            renderer_->record_payload_bytes(
+                kHeaderSize + static_cast<std::size_t>(payload_size));
+        }
+
         // Verbose: first 5 frames regardless of type, plus every IDR/SPS_PPS.
         const bool verbose = (frames <= 5)
                           || (ftype == kFrameVideoIdr)

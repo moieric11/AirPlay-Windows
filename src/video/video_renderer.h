@@ -44,6 +44,12 @@ public:
                     const uint8_t* v, int v_stride,
                     int width, int height);
 
+    // Account for one encrypted-mirror-frame body received. Updates
+    // total payload bytes + an EMA-smoothed Mbps so the status bar
+    // can show live bandwidth without the renderer having to peek
+    // into the mirror listener. Thread-safe.
+    void record_payload_bytes(std::size_t n);
+
     // Hand the renderer a JPEG blob (cover art from SET_PARAMETER with
     // Content-Type image/*). Decoded on the render thread; displayed
     // when no fresh mirror frame is arriving. Thread-safe.
@@ -179,6 +185,13 @@ private:
     std::atomic<int>           video_w_seen_{0};
     std::atomic<int>           video_h_seen_{0};
     std::atomic<uint64_t>      frames_total_{0};
+
+    // Bandwidth accounting for the mirror payload. Updated from
+    // record_payload_bytes() — the mirror listener calls it once
+    // per encrypted-frame body read.
+    std::atomic<uint64_t>      payload_bytes_total_{0};
+    std::atomic<float>         payload_mbps_ema_{0.0f};
+    std::atomic<int64_t>       last_payload_ns_{0};
 };
 
 } // namespace ap::video
