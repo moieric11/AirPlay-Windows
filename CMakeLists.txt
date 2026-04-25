@@ -90,10 +90,15 @@ endif()
 
 # ---- SDL2 (required for the video renderer window) ----------------------------
 # Used by video/VideoRenderer to create a real-time window displaying the
-# decoded iPhone screen. pkg-config on Linux, SDL2 CMake config on Windows
-# (installed by vcpkg).
+# decoded iPhone screen. On Windows we prefer the SDL2 CMake config that
+# vcpkg ships — it carries proper debug/release variants. pkg-config's
+# .pc files don't distinguish (vcpkg drops both debug and release into the
+# same PKG_CONFIG_PATH), so a Release build can pick up SDL2d.lib by
+# accident and the .exe ends up linked against the debug DLLs. Linux's
+# pkg-config has only one variant per system, so it stays the primary
+# search there.
 set(SDL2_TARGET "")
-if(PkgConfig_FOUND)
+if(NOT WIN32 AND PkgConfig_FOUND)
     pkg_check_modules(SDL2 IMPORTED_TARGET sdl2)
     if(SDL2_FOUND)
         set(SDL2_TARGET PkgConfig::SDL2)
@@ -107,6 +112,14 @@ if(NOT SDL2_TARGET)
         set(SDL2_TARGET SDL2::SDL2-static)
     endif()
 endif()
+if(NOT SDL2_TARGET AND PkgConfig_FOUND)
+    # Fallback: try pkg-config even on Windows if the CMake config
+    # is missing for some reason.
+    pkg_check_modules(SDL2 IMPORTED_TARGET sdl2)
+    if(SDL2_FOUND)
+        set(SDL2_TARGET PkgConfig::SDL2)
+    endif()
+endif()
 if(NOT SDL2_TARGET)
     message(FATAL_ERROR
         "SDL2 not found.\n"
@@ -115,8 +128,11 @@ if(NOT SDL2_TARGET)
 endif()
 
 # ---- SDL2_ttf (required for the metadata text overlay) ------------------------
+# Same debug/release trap as SDL2 above — prefer the vcpkg CMake config
+# on Windows so MSVC links against SDL2_ttf.lib (release) and not
+# SDL2_ttfd.lib (debug, the .pc-config-found-first failure mode).
 set(SDL2_TTF_TARGET "")
-if(PkgConfig_FOUND)
+if(NOT WIN32 AND PkgConfig_FOUND)
     pkg_check_modules(SDL2_TTF IMPORTED_TARGET SDL2_ttf)
     if(SDL2_TTF_FOUND)
         set(SDL2_TTF_TARGET PkgConfig::SDL2_TTF)
@@ -128,6 +144,12 @@ if(NOT SDL2_TTF_TARGET)
         set(SDL2_TTF_TARGET SDL2_ttf::SDL2_ttf)
     elseif(TARGET SDL2_ttf::SDL2_ttf-static)
         set(SDL2_TTF_TARGET SDL2_ttf::SDL2_ttf-static)
+    endif()
+endif()
+if(NOT SDL2_TTF_TARGET AND PkgConfig_FOUND)
+    pkg_check_modules(SDL2_TTF IMPORTED_TARGET SDL2_ttf)
+    if(SDL2_TTF_FOUND)
+        set(SDL2_TTF_TARGET PkgConfig::SDL2_TTF)
     endif()
 endif()
 if(NOT SDL2_TTF_TARGET)
