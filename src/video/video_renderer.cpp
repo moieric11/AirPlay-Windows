@@ -881,12 +881,12 @@ void VideoRenderer::run(const std::string& title) {
 
                 const int bar_h = 4;
                 const int bar_w = win_w - 2 * pad_x;
-                SDL_Rect bg{pad_x, y + 2, bar_w, bar_h};
+                SDL_Rect bg{pad_x, y_pos + 2, bar_w, bar_h};
                 SDL_SetRenderDrawColor(renderer, 80, 80, 80, 255);
                 SDL_RenderFillRect(renderer, &bg);
                 const double frac =
                     std::min(1.0, static_cast<double>(elapsed_ms) / total_ms);
-                SDL_Rect fg{pad_x, y + 2, static_cast<int>(bar_w * frac), bar_h};
+                SDL_Rect fg{pad_x, y_pos + 2, static_cast<int>(bar_w * frac), bar_h};
                 SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255);
                 SDL_RenderFillRect(renderer, &fg);
             }
