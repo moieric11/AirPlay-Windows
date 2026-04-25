@@ -44,7 +44,8 @@ void set_bool(plist_t d, const char* k, bool v) {
     plist_dict_set_item(d, k, plist_new_bool(v ? 1 : 0));
 }
 
-plist_t make_display(int width, int height) {
+plist_t make_display(int width, int height,
+                     int refresh_rate, int max_fps) {
     plist_t d = plist_new_dict();
     set_uint(d, "features",      14);           // see UxPlay: display feature bits
     set_uint(d, "width",         static_cast<uint64_t>(width));
@@ -53,8 +54,8 @@ plist_t make_display(int width, int height) {
     set_uint(d, "heightPixels",  static_cast<uint64_t>(height));
     set_uint(d, "widthPhysical",  0);
     set_uint(d, "heightPhysical", 0);
-    set_uint(d, "refreshRate",   60);
-    set_uint(d, "maxFPS",        60);
+    set_uint(d, "refreshRate",   static_cast<uint64_t>(refresh_rate));
+    set_uint(d, "maxFPS",        static_cast<uint64_t>(max_fps));
     set_uint(d, "rotation",      0);
     set_bool(d, "overscanned",   false);
     set_str (d, "uuid", "e5f7a168-f1f9-4f51-9f9e-6a9cc0c8cc9f");
@@ -95,13 +96,17 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
     // by the UI thread), fall back to the static DeviceContext
     // fields otherwise. iOS only consumes /info on connection, so
     // changes apply on the next handshake.
-    int mirror_w = ctx.mirror_width;
-    int mirror_h = ctx.mirror_height;
-    bool hevc    = true;
+    int mirror_w     = ctx.mirror_width;
+    int mirror_h     = ctx.mirror_height;
+    bool hevc        = true;
+    int max_fps      = 60;
+    int refresh_rate = 60;
     if (ctx.live) {
-        mirror_w = ctx.live->mirror_width.load(std::memory_order_relaxed);
-        mirror_h = ctx.live->mirror_height.load(std::memory_order_relaxed);
-        hevc     = ctx.live->hevc_enabled.load(std::memory_order_relaxed);
+        mirror_w     = ctx.live->mirror_width.load(std::memory_order_relaxed);
+        mirror_h     = ctx.live->mirror_height.load(std::memory_order_relaxed);
+        hevc         = ctx.live->hevc_enabled.load(std::memory_order_relaxed);
+        max_fps      = ctx.live->max_fps.load(std::memory_order_relaxed);
+        refresh_rate = ctx.live->refresh_rate.load(std::memory_order_relaxed);
     }
 
     set_str (root, "deviceid",      ctx.deviceid);
@@ -137,7 +142,8 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
     }
 
     plist_t displays = plist_new_array();
-    plist_array_append_item(displays, make_display(mirror_w, mirror_h));
+    plist_array_append_item(displays,
+        make_display(mirror_w, mirror_h, refresh_rate, max_fps));
     plist_dict_set_item(root, "displays", displays);
 
     plist_t formats = plist_new_array();

@@ -25,6 +25,15 @@ struct LiveSettings {
     // is more compatible with weaker decoders but uses ~50% more
     // bandwidth at the same visual quality.
     std::atomic<bool> hevc_enabled{true};
+
+    // Frame-rate hints sent in the displays plist. iOS uses these
+    // to cap the rate at which it emits encoded mirror frames —
+    // useful to push a 120 Hz iPhone into 120 fps for slow-mo
+    // playback, or to force a deterministic 30 fps. The encoder
+    // may still produce fewer frames if the ASIC can't keep up at
+    // the requested resolution+codec combo.
+    std::atomic<int>  max_fps{60};
+    std::atomic<int>  refresh_rate{60};
 };
 
 } // namespace ap::airplay
