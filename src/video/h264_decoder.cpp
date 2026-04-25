@@ -458,11 +458,15 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
              impl_->frame->format == AV_PIX_FMT_YUVJ420P);
     }
 
-    // iOS delivers full-range YUV as "YUVJ420P". That pixel format is
-    // deprecated in modern libswscale (prints a warning per frame) — remap
-    // to the regular YUV420P and tell sws the source range is full via
-    // sws_setColorspaceDetails so the colour conversion stays correct.
-    AVPixelFormat src_fmt = static_cast<AVPixelFormat>(impl_->frame->format);
+    // YUV→RGB conversion for the optional ppm debug dump. Source is
+    // the system-memory frame: in software-decode mode that's
+    // impl_->frame directly (YUV420P / YUVJ420P); in hwaccel mode
+    // it's the sw_frame we just transferred above (NV12 / P010).
+    // Feeding impl_->frame to swscale when hwaccel is on would
+    // hand it a D3D11 texture handle and produce
+    // "d3d11 is not supported as input pixel format" spam.
+    AVFrame* rgb_src = impl_->frame_is_hw ? impl_->sw_frame : impl_->frame;
+    AVPixelFormat src_fmt = static_cast<AVPixelFormat>(rgb_src->format);
     bool src_full_range = false;
     switch (src_fmt) {
         case AV_PIX_FMT_YUVJ420P: src_fmt = AV_PIX_FMT_YUV420P; src_full_range = true; break;
@@ -472,7 +476,7 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
     }
 
     impl_->sws = sws_getCachedContext(
-        impl_->sws, width, height, src_fmt,
+        impl_->sws, rgb_src->width, rgb_src->height, src_fmt,
         width, height, AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr);
     if (impl_->sws) {
         // Propagate the "source is full range" flag.
@@ -491,8 +495,8 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
         impl_->last_rgb.assign(static_cast<std::size_t>(width) * height * 3, 0);
         uint8_t* dst[1]        = { impl_->last_rgb.data() };
         int      dst_stride[1] = { width * 3 };
-        sws_scale(impl_->sws, impl_->frame->data, impl_->frame->linesize,
-                  0, height, dst, dst_stride);
+        sws_scale(impl_->sws, rgb_src->data, rgb_src->linesize,
+                  0, rgb_src->height, dst, dst_stride);
     }
 
     ++impl_->frames_out;
