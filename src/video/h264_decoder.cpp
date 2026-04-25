@@ -150,6 +150,13 @@ struct H264Decoder::Impl {
         ctx->thread_type  = FF_THREAD_SLICE;
         ctx->thread_count = 0;   // 0 = auto (one per CPU core)
 
+        // For HW decode: keep the decoder's frame pool as small as
+        // possible. The default lets libavcodec allocate 4-8 extra
+        // hardware frames for parallelism / pipelining, which adds
+        // 4-8 frame intervals of internal buffering (~70-130 ms at
+        // 60 fps). 1 forces serial decode-then-output behaviour.
+        ctx->extra_hw_frames = 1;
+
         if (avcodec_open2(ctx, c, nullptr) != 0) {
             LOG_ERROR << "decoder: avcodec_open2 failed for "
                       << avcodec_get_name(id);
