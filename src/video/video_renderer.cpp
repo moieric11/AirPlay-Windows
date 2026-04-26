@@ -45,8 +45,8 @@ namespace {
 // stage when the user shrinks the window.
 constexpr int kDefaultWinWidth  = 1280;
 constexpr int kDefaultWinHeight = 880;
-constexpr int kSidebarWidth     = 220;
-constexpr int kOptionsWidth     = 300;
+constexpr int kSidebarWidth     = 280;
+constexpr int kOptionsWidth     = 380;
 constexpr int kStatusBarHeight  = 28;
 constexpr int kToolbarHeight    = 40;
 
@@ -1005,12 +1005,19 @@ void VideoRenderer::run(const std::string& title) {
 
         // Layout: top toolbar, sidebar (left), options panel (right,
         // optional), status bar (bottom). The remainder is the video
-        // stage.
-        const int options_w = ui.show_options ? kOptionsWidth : 0;
-        const int stage_x = kSidebarWidth;
-        const int stage_y = kToolbarHeight;
-        const int stage_w = std::max(0, full_w - kSidebarWidth - options_w);
-        const int stage_h = std::max(0, full_h - kToolbarHeight - kStatusBarHeight);
+        // stage. In fullscreen mode the chrome is hidden entirely so
+        // the video occupies the whole window — same toggle that flips
+        // SDL_WINDOW_FULLSCREEN_DESKTOP also collapses the insets here
+        // and skips the ImGui panel block below.
+        const int options_w = (ui.show_options && !fullscreen)
+                                  ? kOptionsWidth : 0;
+        const int chrome_top    = fullscreen ? 0 : kToolbarHeight;
+        const int chrome_bottom = fullscreen ? 0 : kStatusBarHeight;
+        const int chrome_left   = fullscreen ? 0 : kSidebarWidth;
+        const int stage_x = chrome_left;
+        const int stage_y = chrome_top;
+        const int stage_w = std::max(0, full_w - chrome_left - options_w);
+        const int stage_h = std::max(0, full_h - chrome_top - chrome_bottom);
 
         // Override win_w/win_h locally so the existing video-fit and
         // idle-text centring math operates inside the stage rect
@@ -1186,6 +1193,12 @@ void VideoRenderer::run(const std::string& title) {
         const float fw           = static_cast<float>(full_w);
         const float fh           = static_cast<float>(full_h);
 
+        // Fullscreen mode hides the entire chrome (toolbar / sidebar /
+        // options / status bar) so the video occupies the whole screen
+        // like a real video player. F11/F/double-click toggles it; ESC
+        // exits. The pulsing "Waiting for AirPlay" ring below this block
+        // stays drawn — it's part of the stage, not the chrome.
+        if (!fullscreen) {
         // ---- Top toolbar (app title + active device + actions) ----
         ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(fw, toolbar_h));
@@ -1218,9 +1231,9 @@ void VideoRenderer::run(const std::string& title) {
                     !active_dev.name.empty()    ? active_dev.name.c_str()
                   : !active_dev.peer_ip.empty() ? active_dev.peer_ip.c_str()
                   : "iPhone";
-                ImGui::Text("%s — %s", active_dev.kind.c_str(), primary_tb);
+                ImGui::Text("%s - %s", active_dev.kind.c_str(), primary_tb);
             } else {
-                ImGui::TextDisabled("Idle — waiting for AirPlay");
+                ImGui::TextDisabled("Idle - waiting for AirPlay");
             }
             // Right-aligned quick toggles.
             const float btn_options_w = 110.0f;
@@ -1251,6 +1264,9 @@ void VideoRenderer::run(const std::string& title) {
             ImGui::TextUnformatted("DEVICES");
             ImGui::PopStyleColor();
             ImGui::Separator();
+            // Wrap to the panel width so long device names / model
+            // strings don't run off the right edge of the sidebar.
+            ImGui::PushTextWrapPos(0.0f);
             const bool video_streaming =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_video_frame_time).count() < 1500;
@@ -1300,10 +1316,11 @@ void VideoRenderer::run(const std::string& title) {
             } else {
                 ImGui::TextDisabled("No device connected");
                 ImGui::Spacing();
-                ImGui::TextDisabled("Open AirPlay on iOS and");
-                ImGui::TextDisabled("pick this receiver to start");
-                ImGui::TextDisabled("mirroring.");
+                ImGui::TextDisabled(
+                    "Open AirPlay on iOS and pick this "
+                    "receiver to start mirroring.");
             }
+            ImGui::PopTextWrapPos();
         }
         ImGui::End();
 
@@ -1317,6 +1334,10 @@ void VideoRenderer::run(const std::string& title) {
                 ImGui::TextUnformatted("OPTIONS");
                 ImGui::PopStyleColor();
                 ImGui::Separator();
+                // Wrap descriptive text to the panel width so long
+                // hint strings (VSYNC / GPU decoder explanations, etc.)
+                // stay inside the panel instead of running off-screen.
+                ImGui::PushTextWrapPos(0.0f);
                 if (ImGui::CollapsingHeader("Source",
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     ImGui::TextDisabled("iOS-driven (read-only)");
@@ -1444,7 +1465,7 @@ void VideoRenderer::run(const std::string& title) {
                                 " software on single-stream mirror"
                                 " (~30 ms vs 12 ms in tests) but offloads"
                                 " the CPU."
-                              : "Software libavcodec — fastest end-to-end"
+                              : "Software libavcodec - fastest end-to-end"
                                 " latency on single-stream mirror.");
                         ImGui::TextDisabled("Applies on next iPhone connection");
 
@@ -1477,9 +1498,11 @@ void VideoRenderer::run(const std::string& title) {
                 if (ImGui::CollapsingHeader("Hotkeys")) {
                     ImGui::BulletText("F      Toggle fullscreen");
                     ImGui::BulletText("F11    Toggle fullscreen");
+                    ImGui::BulletText("DblClk Toggle fullscreen");
                     ImGui::BulletText("F12    Toggle ImGui demo");
                     ImGui::BulletText("Esc    Exit fullscreen / quit");
                 }
+                ImGui::PopTextWrapPos();
             }
             ImGui::End();
         }
@@ -1523,7 +1546,7 @@ void VideoRenderer::run(const std::string& title) {
                 ImGui::Text("Video: %dx%d @ %.1f", vid_w, vid_h,
                             has_video ? vid_fps : 0.0f);
             } else {
-                ImGui::TextDisabled("Video: —");
+                ImGui::TextDisabled("Video: -");
             }
             sep();
             ImGui::Text("Frames: %llu", static_cast<unsigned long long>(total));
@@ -1568,6 +1591,7 @@ void VideoRenderer::run(const std::string& title) {
         }
         ImGui::End();
         ImGui::PopStyleVar();
+        } // !fullscreen
 
         // Pulsing "Waiting for AirPlay" ring centered in the stage when
         // no fresh video frame is on screen. Drawn to the background
