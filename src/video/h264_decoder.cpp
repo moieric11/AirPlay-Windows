@@ -264,10 +264,18 @@ struct H264Decoder::Impl {
             (backend == HwBackend::Cuvid)   ? "[NVDEC cuvid]" :
             (backend == HwBackend::D3D11VA) ? "[D3D11VA]"     :
                                               "[software]";
+        const char* tt =
+            (ctx->active_thread_type == FF_THREAD_SLICE) ? "slice" :
+            (ctx->active_thread_type == FF_THREAD_FRAME) ? "frame" :
+            (ctx->active_thread_type ==
+                (FF_THREAD_SLICE | FF_THREAD_FRAME))     ? "slice+frame" :
+                                                            "none";
         LOG_INFO << "decoder ready: " << avcodec_get_name(id)
                  << " via " << (c->name ? c->name : "?")
                  << " (libavcodec " << LIBAVCODEC_IDENT << ") "
-                 << tag << " [LOW_DELAY]";
+                 << tag << " [LOW_DELAY]"
+                 << " threads=" << ctx->thread_count
+                 << '/' << tt;
         return true;
     }
 };
