@@ -1,0 +1,87 @@
+name: Release
+
+# Builds the Windows binary on a GitHub-hosted Windows runner and
+# attaches a zipped Release/ folder to a draft GitHub Release.
+#
+# Triggers:
+#   - Push of a tag matching v* (e.g. v0.1.0, v0.2.1, v1.0.0):
+#     creates / updates the draft release for that tag with the
+#     artifact attached.
+#   - Manual workflow_dispatch from the Actions tab: builds the
+#     binary and uploads it as a workflow artifact only (no release).
+#
+# Runner: windows-latest (currently Windows Server with VS 2022 +
+# pre-installed vcpkg at $env:VCPKG_INSTALLATION_ROOT).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for softprops/action-gh-release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Cache the vcpkg manifest install so dependency rebuilds
+      # (libplist, openssl, ffmpeg, sdl2, sdl2-ttf) only happen when
+      # vcpkg.json actually changes.
+      - name: Cache vcpkg installed
+        uses: actions/cache@v4
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: Configure (CMake + vcpkg manifest mode)
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -G "Visual Studio 17 2022" -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ([string]::IsNullOrEmpty($tag) -or $tag -eq "main") {
+            $tag = "dev-$($env:GITHUB_SHA.Substring(0,7))"
+          }
+          $zipName = "airplay-windows-$tag-x64.zip"
+          Compress-Archive -Path build\Release\* -DestinationPath $zipName -Force
+          "ZIP_PATH=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-ChildItem $zipName | Format-List Name, Length
+
+      # Always upload as a workflow artifact (downloadable from the
+      # Actions run page) so manual dispatch builds are usable too.
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 30
+
+      # When triggered by a v* tag push, additionally create / update
+      # a DRAFT GitHub Release with the zip attached and auto-generated
+      # release notes (commits since the previous tag). The maintainer
+      # then edits the draft to add a hand-written description and
+      # hits Publish.
+      - name: Create / update draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
+          draft: true
+          generate_release_notes: true
+          name: ${{ github.ref_name }}
