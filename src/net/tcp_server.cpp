@@ -125,10 +125,34 @@ void TcpServer::accept_loop() {
             : std::string(ip) + ":" + std::to_string(peer_port);
 
         LOG_INFO << "accepted " << client.peer;
-        workers_.emplace_back([h = handler_, c = std::move(client)]() mutable {
+        const socket_t track_fd = client.fd;
+        {
+            std::lock_guard<std::mutex> lock(clients_mtx_);
+            active_clients_.insert(track_fd);
+        }
+        workers_.emplace_back([this, h = handler_, c = std::move(client),
+                               track_fd]() mutable {
             h(std::move(c));
+            std::lock_guard<std::mutex> lock(clients_mtx_);
+            active_clients_.erase(track_fd);
         });
     }
+}
+
+void TcpServer::close_all_clients() {
+    std::lock_guard<std::mutex> lock(clients_mtx_);
+    for (socket_t fd : active_clients_) {
+#if defined(_WIN32)
+        ::shutdown(fd, SD_BOTH);
+#else
+        ::shutdown(fd, SHUT_RDWR);
+#endif
+    }
+    LOG_INFO << "TCP server: shutdown " << active_clients_.size()
+             << " active client(s) on user request";
+    // Don't erase entries here - the workers do it themselves once
+    // they exit, so we don't double-erase or race with concurrent
+    // cleanup paths.
 }
 
 } // namespace ap::net

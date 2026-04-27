@@ -9,6 +9,12 @@ enum class LogLevel { Debug, Info, Warn, Error };
 
 void log_write(LogLevel level, const std::string& msg);
 
+// Master gate. Off by default so the published binary stays quiet
+// when launched without flags. main() flips this on when the user
+// passes --log (or --verbose) on the command line.
+void set_log_enabled(bool on);
+bool is_log_enabled();
+
 class LogStream {
 public:
     explicit LogStream(LogLevel level) : level_(level) {}

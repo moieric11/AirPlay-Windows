@@ -330,6 +330,8 @@ add_executable(airplay-windows
     src/audio/audio_receiver.cpp
     src/audio/aac_decoder.cpp
     src/audio/audio_output.cpp
+    src/usb/pair_record.cpp
+    src/usb/usb_supervisor.cpp
 )
 
 target_include_directories(airplay-windows PRIVATE src)
@@ -408,7 +410,17 @@ if(WIN32)
     # ws2_32: Winsock; iphlpapi: GetAdaptersAddresses; dnsapi: native mDNS;
     # dwmapi: DwmSetWindowAttribute for the Win11 Mica backdrop on the
     # VideoRenderer window.
-    target_link_libraries(airplay-windows PRIVATE ws2_32 iphlpapi dnsapi dwmapi)
+    target_link_libraries(airplay-windows PRIVATE
+        ws2_32 iphlpapi dnsapi dwmapi
+        setupapi shell32 ole32)   # USB enumeration + Lockdown directory lookup
+
+    # Released as a GUI app so no empty console window pops up when
+    # launched from File Explorer. main() stays the entry point — the
+    # /ENTRY override avoids having to add a WinMain stub.
+    set_target_properties(airplay-windows PROPERTIES WIN32_EXECUTABLE TRUE)
+    if(MSVC)
+        target_link_options(airplay-windows PRIVATE "/ENTRY:mainCRTStartup")
+    endif()
 endif()
 
 # ---- Runtime DLL deployment (Windows) ----------------------------------------

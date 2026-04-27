@@ -113,6 +113,56 @@ Puis sur iPhone / iPad / Mac du même Wi-Fi → Centre de contrôle →
 Recopie d'écran → `AirPlay-Windows`. Au tap, les logs montrent tout le
 handshake + la réception du flux H.264.
 
+## AirPlay via câble USB-C (sans Wi-Fi)
+
+L'iPhone branché en USB peut router AirPlay via le câble — utile en
+mode avion, sur un PC sans Wi-Fi, ou pour éviter la latence/jitter
+d'un Wi-Fi chargé. **Aucune modif du code n'est nécessaire**, juste un
+réglage côté iOS et un driver Apple sur Windows.
+
+### Prérequis
+
+- **iTunes** ou **Apple Devices** (Microsoft Store) installé sur Windows
+  → fournit `Apple Mobile Device USB Driver` qui permet à iOS et Windows
+  de monter une interface ethernet virtuelle via le câble.
+- L'iPhone doit avoir fait confiance à ce PC une fois (popup "Faire
+  confiance à cet ordinateur ?" → Oui, code de l'iPhone).
+
+### Procédure
+
+1. **Branche l'iPhone** au PC en USB-C / Lightning.
+2. Sur l'iPhone : **Réglages → Partage de connexion → Autoriser
+   d'autres utilisateurs** → ON. (Le réglage "USB uniquement" suffit
+   si proposé.)
+3. Sur Windows, dans le menu réseau, une nouvelle connexion
+   **`Apple Mobile Device Ethernet`** apparaît avec une IP du subnet
+   `172.20.10.0/24`.
+4. Lance `airplay-windows.exe` — au démarrage les logs annoncent
+   `mDNS registered: ... 172.20.10.x`.
+5. Sur l'iPhone : Centre de contrôle → Recopie d'écran →
+   `AirPlay-Windows` apparaît même **sans Wi-Fi commun**.
+
+L'AirPlay route alors sur le subnet ethernet du Personal Hotspot, qui
+existe seulement le long du câble. Pas de consommation cellulaire (la
+connexion AirPlay reste locale entre l'iPhone et le PC), pas besoin de
+Wi-Fi du tout.
+
+### Notes techniques
+
+- **QuickTime sur USB est mort sur iOS 17/18.** Apple a réaffecté
+  l'ancienne interface QT (composite child `MI_02`, classe historique
+  `0xFF/0x2A`) à de l'USB Ethernet (classe `0xFF/0xFD`). Les vieilles
+  recettes "QuickTime Video Hack" + Zadig ne marchent plus sur les
+  iPhones modernes.
+- **Le supervisor USB du binaire** (`usb_supervisor.cpp`) détecte
+  l'arrivée d'un iPhone branché et logue un rappel pour activer
+  Personal Hotspot — c'est purement informatif, aucune ouverture de
+  driver n'est faite.
+- Le subnet `172.20.10.0/24` est arbitré par iOS ; la passerelle
+  est l'iPhone, le PC obtient `172.20.10.2` par DHCP. mDNS
+  `_airplay._tcp` s'annonce dessus naturellement parce qu'on bind sur
+  `0.0.0.0` (toutes interfaces).
+
 ## Tests
 
 Suite Python qui joue le rôle d'iOS pour 6 scénarios (pair-verify

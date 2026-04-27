@@ -1,5 +1,6 @@
 #include "log.h"
 
+#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <cstdio>
@@ -15,6 +16,9 @@ std::mutex& log_mutex() {
     static std::mutex m;
     return m;
 }
+
+// Off by default. The CLI (--log / --verbose) flips this on.
+std::atomic<bool> g_log_enabled{false};
 
 const char* level_tag(LogLevel lvl) {
     switch (lvl) {
@@ -46,10 +50,19 @@ std::string timestamp() {
 } // namespace
 
 void log_write(LogLevel level, const std::string& msg) {
+    if (!g_log_enabled.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lock(log_mutex());
     std::fprintf(stderr, "[%s] %s  %s\n",
                  timestamp().c_str(), level_tag(level), msg.c_str());
     std::fflush(stderr);
+}
+
+void set_log_enabled(bool on) {
+    g_log_enabled.store(on, std::memory_order_relaxed);
+}
+
+bool is_log_enabled() {
+    return g_log_enabled.load(std::memory_order_relaxed);
 }
 
 } // namespace ap

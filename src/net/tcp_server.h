@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <functional>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,6 +30,13 @@ public:
     bool start(uint16_t port, Handler handler);
     void stop();
 
+    // Forcibly shutdown every currently-connected client socket. The
+    // handler thread sees recv() return 0 / error and tears down its
+    // session naturally. Listener stays up — new connections still
+    // accepted. Used by the "Disconnect" button to drop an active
+    // AirPlay session on demand.
+    void close_all_clients();
+
     uint16_t port() const { return port_; }
 
 private:
@@ -39,6 +48,11 @@ private:
     std::atomic<bool> running_{false};
     std::vector<std::thread> workers_;
     Handler handler_;
+
+    // Tracked here so we can close() them on demand from another
+    // thread. Erased by the worker on exit.
+    std::mutex          clients_mtx_;
+    std::set<socket_t>  active_clients_;
 };
 
 } // namespace ap::net

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -161,6 +162,11 @@ public:
     // /info request without a process restart.
     void set_live_settings(ap::airplay::LiveSettings* live);
 
+    // Wire the toolbar "Disconnect" button. Invoked from the render
+    // thread when the user clicks; should drop every connected
+    // AirPlay client (typically Server::disconnect_clients).
+    void set_disconnect_handler(std::function<void()> h);
+
     // Set true when the user closes the window (SDL_QUIT). main() polls
     // this to fold the window close into its Ctrl-C stop path.
     bool user_closed() const { return closed_.load(); }
@@ -271,6 +277,11 @@ private:
     // runs), but the underlying fields are atomic so the RTSP
     // server thread reads cleanly from /info handlers.
     ap::airplay::LiveSettings* live_settings_ = nullptr;
+
+    // Set from main(); invoked from the render thread on toolbar
+    // "Disconnect" click. Empty by default so missing wiring is
+    // a silent no-op rather than a crash.
+    std::function<void()>      disconnect_handler_;
 };
 
 } // namespace ap::video

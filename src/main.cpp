@@ -15,6 +15,7 @@
 #include "log.h"
 #include "mdns/mdns_service.h"
 #include "net/socket.h"
+#include "usb/usb_supervisor.h"
 #include "video/video_renderer.h"
 
 #include <atomic>
@@ -69,6 +70,30 @@ ap::airplay::DeviceContext build_device_context(bool hls_playback) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // Logs are off by default in the published binary. Scan for the
+    // toggle BEFORE anything else so even the very first init message
+    // honours the flag.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--log" ||
+            std::string(argv[i]) == "--verbose") {
+            ap::set_log_enabled(true);
+            break;
+        }
+    }
+
+#if defined(_WIN32)
+    // We're a /SUBSYSTEM:WINDOWS binary so no console pops up by
+    // default. With --log, attach to the parent terminal if we were
+    // launched from one (cmd, powershell, terminal); otherwise spawn
+    // a fresh console window so the user sees the stderr stream.
+    if (ap::is_log_enabled()) {
+        if (!AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
+        FILE* dummy = nullptr;
+        freopen_s(&dummy, "CONOUT$", "w", stdout);
+        freopen_s(&dummy, "CONOUT$", "w", stderr);
+    }
+#endif
+
     if (!ap::net::global_init()) {
         return 1;
     }
@@ -118,10 +143,16 @@ int main(int argc, char** argv) {
                              << "), keeping default";
                 }
             }
+        } else if (arg == "--log" || arg == "--verbose") {
+            // Already handled in the pre-init scan above; consume so
+            // future unknown-arg paths don't trip on it.
         } else if (arg == "--help" || arg == "-h") {
             std::puts(
-                "AirPlay-Windows [--hls-proxy-playback] [--mirror-res WxH]\n"
-                "                [--mirror-hwaccel]\n"
+                "AirPlay-Windows [--log] [--hls-proxy-playback]\n"
+                "                [--mirror-res WxH] [--mirror-hwaccel]\n"
+                "  --log / --verbose     print init/runtime logs to stderr\n"
+                "                        (off by default in the released\n"
+                "                        binary)\n"
                 "  --hls-proxy-playback  advertise HLS capability so iOS\n"
                 "                        hands video URLs to our proxy\n"
                 "                        (experimental, VOD-style latency)\n"
@@ -131,7 +162,7 @@ int main(int argc, char** argv) {
                 "                        of bandwidth, common: 1920x1080,\n"
                 "                        2560x1440, 3840x2160)\n"
                 "  --mirror-hwaccel      decode mirror H.264/HEVC on the GPU\n"
-                "                        (NVDEC cuvid → D3D11VA cascade).\n"
+                "                        (NVDEC cuvid -> D3D11VA cascade).\n"
                 "                        Off by default: benchmarks show\n"
                 "                        software libavcodec is faster\n"
                 "                        end-to-end on single-stream mirror\n"
@@ -150,7 +181,7 @@ int main(int argc, char** argv) {
     LOG_INFO << "Mirror display advertised: " << mirror_w << 'x' << mirror_h;
     LOG_INFO << "Mirror decoder default: "
              << (mirror_hwaccel
-                   ? "GPU hwaccel (--mirror-hwaccel; cuvid → D3D11VA cascade)"
+                   ? "GPU hwaccel (--mirror-hwaccel; cuvid -> D3D11VA cascade)"
                    : "software libavcodec (toggle GPU in OPTIONS panel)");
 
     // Live-mutable settings exposed to the overlay UI. Seed from the
@@ -215,6 +246,16 @@ int main(int argc, char** argv) {
         ap::net::global_shutdown();
         return 1;
     }
+    // Wire the toolbar "Disconnect" button. Closing the RTSP TCP
+    // sockets cascades into the per-session cleanup that tears down
+    // mirror + audio without a process restart. We also wipe the
+    // renderer's session state directly because a forced TCP close
+    // doesn't go through the normal TEARDOWN path that would do it.
+    renderer.set_disconnect_handler([&server, &renderer]() {
+        server.disconnect_clients();
+        renderer.clear_session();
+        renderer.clear_active_device();
+    });
 
     // Local HTTP proxy + libavformat player only when the HLS path is
     // opted into. In the default (mirror + RAOP) mode nothing connects
@@ -234,6 +275,14 @@ int main(int argc, char** argv) {
         LOG_WARN << "mDNS not available — receiver won't auto-appear on iOS";
     }
 
+    // Watch for USB-connected iPhones in parallel with the Wi-Fi mDNS
+    // path. Phase 1: just logs arrivals + paired/not-paired. The full
+    // QuickTime mirror session is layered on top in later phases —
+    // when ready, the supervisor will hand a connected device off to
+    // the same VideoRenderer / AudioOutput that mirror_listener uses.
+    ap::usb::UsbSupervisor usb_supervisor;
+    usb_supervisor.start();
+
     LOG_INFO << "Ready. Close the window or press Ctrl-C to exit.";
     while (!g_stop && !renderer.user_closed()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -241,6 +290,7 @@ int main(int argc, char** argv) {
 
     LOG_INFO << "Shutting down... (g_stop=" << g_stop.load()
              << " user_closed=" << renderer.user_closed() << ")";
+    usb_supervisor.stop();
     mdns.stop();
     hls_player.stop();
     hls_server.stop();

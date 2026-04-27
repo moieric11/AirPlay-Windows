@@ -112,6 +112,43 @@ void copy_plane(std::vector<unsigned char>& dst,
 
 namespace {
 
+// Lifted out of run() so the SDL hit-test callback (a C function
+// pointer with no captures) can read `chromeless` via callback_data.
+// All fields are touched only on the render thread — no atomic
+// needed; the callback runs synchronously on the same thread that
+// owns SDL events.
+struct UiState {
+    bool chromeless = false;
+    bool show_demo  = false; // F12 toggles ImGui demo, dev only
+};
+
+// Hit-test for the borderless chromeless window: edges are resize
+// handles, the rest is draggable. When chrome is visible (normal
+// mode) the SDL window has its own title bar so we fall through to
+// HITTEST_NORMAL and let ImGui see the events.
+SDL_HitTestResult SDLCALL hit_test_cb(SDL_Window* w,
+                                      const SDL_Point* p,
+                                      void* data) {
+    auto* ui = reinterpret_cast<UiState*>(data);
+    int win_w = 0, win_h = 0;
+    SDL_GetWindowSize(w, &win_w, &win_h);
+    constexpr int B = 6;        // edge thickness (in window pixels)
+    const bool top    = p->y < B;
+    const bool bottom = p->y > win_h - B;
+    const bool left   = p->x < B;
+    const bool right  = p->x > win_w - B;
+    if (top    && left)  return SDL_HITTEST_RESIZE_TOPLEFT;
+    if (top    && right) return SDL_HITTEST_RESIZE_TOPRIGHT;
+    if (bottom && left)  return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+    if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+    if (top)             return SDL_HITTEST_RESIZE_TOP;
+    if (bottom)          return SDL_HITTEST_RESIZE_BOTTOM;
+    if (left)            return SDL_HITTEST_RESIZE_LEFT;
+    if (right)           return SDL_HITTEST_RESIZE_RIGHT;
+    if (ui && ui->chromeless) return SDL_HITTEST_DRAGGABLE;
+    return SDL_HITTEST_NORMAL;
+}
+
 // Decode a JPEG blob via libavcodec's MJPEG decoder and repack as
 // tightly-packed RGB24. Returns width/height through output params.
 // `out_rgb` is sized w*h*3 on success.
@@ -374,7 +411,20 @@ bool VideoRenderer::in_flush_grace() const {
 }
 
 void VideoRenderer::clear_session() {
-    LOG_INFO << "VideoRenderer clear_session: reset cover / metadata / progress";
+    LOG_INFO << "VideoRenderer clear_session: reset cover / metadata / progress / video frame";
+    // Drop the last decoded frame so the stage falls back to the
+    // idle "Waiting for AirPlay" screen instead of freezing on the
+    // last picture from the disconnected device. Both producer slots
+    // (plane-buffer and refcounted AVFrame) are cleared.
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        has_frame_      = false;
+        frame_is_nv12_  = false;
+        frame_w_        = 0;
+        frame_h_        = 0;
+        slot_avframe_   = DecodedFrame();   // releases the AVFrame ref
+        has_avframe_    = false;
+    }
     // Clear metadata on the next render tick by pushing empties (the
     // renderer re-generates textures from empty strings, which produces
     // no visible text).
@@ -502,6 +552,10 @@ void VideoRenderer::clear_active_device() {
     std::lock_guard<std::mutex> lock(device_mtx_);
     has_device_ = false;
     device_     = {};
+}
+
+void VideoRenderer::set_disconnect_handler(std::function<void()> h) {
+    disconnect_handler_ = std::move(h);
 }
 
 bool VideoRenderer::active_device_snapshot(DeviceInfo& out) const {
@@ -720,12 +774,15 @@ void VideoRenderer::run(const std::string& title) {
     auto last_video_frame_time = std::chrono::steady_clock::now()
                                  - std::chrono::seconds(10);
 
-    // Persistent UI toggles. Survive across frames; mutated from ImGui
-    // buttons. Defaults match the design mockup (right panel visible).
-    struct UiState {
-        bool show_options = true;
-        bool show_demo    = false; // F12 toggles ImGui demo, dev only
-    } ui;
+    // Persistent UI toggles (struct lifted to file scope above so
+    // the SDL hit-test callback can access it). Defaults match the
+    // design mockup (chrome visible). Chromeless mode hides toolbar
+    // + sidebar + options + status bar so the AirPlay video fills
+    // the whole window; unlike fullscreen this stays a regular
+    // resizable window. F11 / double-click toggle real fullscreen,
+    // H toggles chromeless, ESC peels back layers.
+    UiState ui;
+    SDL_SetWindowHitTest(window, hit_test_cb, &ui);
 
     bool fullscreen = false;
     auto toggle_fullscreen = [&]() {
@@ -735,7 +792,132 @@ void VideoRenderer::run(const std::string& title) {
         SDL_ShowCursor(fullscreen ? SDL_DISABLE : SDL_ENABLE);
     };
 
+    // Track the SDL-side window border state so we only call the
+    // SDL_SetWindowBordered API on actual transitions. In chromeless
+    // mode the OS title bar is hidden too — otherwise the user's
+    // "vierge" expectation isn't met. The window stays resizable
+    // via the SDL hit-test callback (edges = resize handles, video
+    // area = drag handle).
+    bool sdl_bordered = true;
+
+    // Chromeless aspect-lock state. Triggers a re-snap on:
+    //   - chromeless toggled on
+    //   - video frame dimensions change (iPhone rotation, e.g.
+    //     portrait <-> landscape mid-mirror)
+    //   - user resize via the hit-test edges
+    // The ignore-next-resize flag breaks the feedback loop our own
+    // SDL_SetWindowSize would otherwise cause. saved_w/h capture the
+    // chrome-mode window size before entering chromeless so we can
+    // restore it on exit (otherwise the menus get crushed against a
+    // tall narrow video-aspect window).
+    bool prev_chromeless    = false;
+    int  prev_video_w       = 0;
+    int  prev_video_h       = 0;
+    int  saved_window_w     = 0;
+    int  saved_window_h     = 0;
+    bool ignore_next_resize = false;
+
+    // "Shrink to fit" snap: collapse the dimension that exceeds the
+    // target aspect, leave the other one alone. Used on chromeless
+    // entry (so the new window fits inside the previous chrome
+    // window's bounds) and on user edge-drag (so the user's drag is
+    // mostly preserved). Tolerates +-1 px to dodge OS rounding loops.
+    auto snap_to_video_aspect = [&]() {
+        if (!ui.chromeless || fullscreen) return;
+        if (video_tex_w <= 0 || video_tex_h <= 0) return;
+        int wnow = 0, hnow = 0;
+        SDL_GetWindowSize(window, &wnow, &hnow);
+        if (wnow <= 0 || hnow <= 0) return;
+        const float vid_a = float(video_tex_w) / float(video_tex_h);
+        const float win_a = float(wnow) / float(hnow);
+        int snap_w = wnow, snap_h = hnow;
+        if (win_a > vid_a) {
+            snap_w = static_cast<int>(hnow * vid_a + 0.5f);
+        } else {
+            snap_h = static_cast<int>(wnow / vid_a + 0.5f);
+        }
+        if (std::abs(snap_w - wnow) > 1 || std::abs(snap_h - hnow) > 1) {
+            ignore_next_resize = true;
+            SDL_SetWindowSize(window, snap_w, snap_h);
+        }
+    };
+
+    // "Preserve area" snap: keep the longer current dimension as the
+    // new long axis of the target aspect. Used on iPhone rotation —
+    // the naive shrink-to-fit halves the visible area each rotation
+    // because portrait/landscape inverts the aspect, and the dim
+    // that was just snapped becomes the one to shrink again. Long-
+    // axis preservation effectively swaps width/height across the
+    // rotation so screen real estate stays roughly constant.
+    auto snap_preserving_area = [&]() {
+        if (!ui.chromeless || fullscreen) return;
+        if (video_tex_w <= 0 || video_tex_h <= 0) return;
+        int wnow = 0, hnow = 0;
+        SDL_GetWindowSize(window, &wnow, &hnow);
+        if (wnow <= 0 || hnow <= 0) return;
+        const float vid_a = float(video_tex_w) / float(video_tex_h);
+        const int long_dim = std::max(wnow, hnow);
+        int new_w, new_h;
+        if (vid_a >= 1.0f) {        // landscape video
+            new_w = long_dim;
+            new_h = static_cast<int>(long_dim / vid_a + 0.5f);
+        } else {                     // portrait video
+            new_h = long_dim;
+            new_w = static_cast<int>(long_dim * vid_a + 0.5f);
+        }
+        if (std::abs(new_w - wnow) > 1 || std::abs(new_h - hnow) > 1) {
+            ignore_next_resize = true;
+            SDL_SetWindowSize(window, new_w, new_h);
+        }
+    };
+
     while (running_.load()) {
+        // Sync the SDL window border to the chromeless toggle. In
+        // fullscreen the border is irrelevant (SDL handles it via
+        // the fullscreen flag). Otherwise: borderless when the user
+        // wants a clean "video only" look, bordered the rest of the
+        // time so they can drag/close via the title bar.
+        const bool want_bordered = !(ui.chromeless && !fullscreen);
+        if (want_bordered != sdl_bordered) {
+            SDL_SetWindowBordered(window,
+                                  want_bordered ? SDL_TRUE : SDL_FALSE);
+            sdl_bordered = want_bordered;
+        }
+
+        // Re-snap the window aspect on either of:
+        //   - chromeless flipping on (snap once on entry)
+        //   - video dimensions changing while chromeless (iPhone
+        //     rotation between portrait/landscape, resolution change
+        //     on next mirror connect, etc.)
+        // On the way OUT of chromeless, restore the chrome-mode size
+        // we captured on entry — otherwise the panels render into a
+        // window the size of the video, which crushes the layout.
+        const bool video_changed =
+            ui.chromeless &&
+            (video_tex_w != prev_video_w || video_tex_h != prev_video_h);
+        if (ui.chromeless != prev_chromeless) {
+            if (ui.chromeless && !fullscreen) {
+                SDL_GetWindowSize(window,
+                                  &saved_window_w, &saved_window_h);
+                snap_to_video_aspect();
+            } else if (!ui.chromeless &&
+                       saved_window_w > 0 && saved_window_h > 0) {
+                ignore_next_resize = true;
+                SDL_SetWindowSize(window,
+                                  saved_window_w, saved_window_h);
+            }
+            prev_chromeless = ui.chromeless;
+            prev_video_w    = video_tex_w;
+            prev_video_h    = video_tex_h;
+        } else if (video_changed) {
+            // iPhone rotation flips portrait <-> landscape: use the
+            // area-preserving snap so the window swaps dims rather
+            // than shrinking by half each rotation.
+            snap_preserving_area();
+            prev_video_w = video_tex_w;
+            prev_video_h = video_tex_h;
+        }
+
         // Honor live VSYNC toggle: SDL 2.0.18+ supports flipping
         // VSYNC at runtime without rebuilding the renderer. The
         // call is cheap enough to issue every frame; we still
@@ -768,12 +950,18 @@ void VideoRenderer::run(const std::string& title) {
             if (e.type == SDL_KEYDOWN && !io_poll.WantCaptureKeyboard) {
                 switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE:
-                        if (fullscreen) toggle_fullscreen();
+                        // ESC peels back layers in order:
+                        // fullscreen first, then chromeless, then quit.
+                        if (fullscreen)         toggle_fullscreen();
+                        else if (ui.chromeless) ui.chromeless = false;
                         else { closed_ = true; running_ = false; }
                         break;
                     case SDLK_f:
                     case SDLK_F11:
                         toggle_fullscreen();
+                        break;
+                    case SDLK_h:
+                        ui.chromeless = !ui.chromeless;
                         break;
                     case SDLK_F12:
                         ui.show_demo = !ui.show_demo;
@@ -786,6 +974,17 @@ void VideoRenderer::run(const std::string& title) {
                 e.button.clicks == 2 &&
                 !io_poll.WantCaptureMouse) {
                 toggle_fullscreen();
+            }
+            // Aspect-lock on user resize while chromeless. The flag
+            // dodges the feedback loop our own SDL_SetWindowSize call
+            // inside snap_to_video_aspect would cause.
+            if (e.type == SDL_WINDOWEVENT &&
+                e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                if (ignore_next_resize) {
+                    ignore_next_resize = false;
+                } else {
+                    snap_to_video_aspect();
+                }
             }
         }
         if (!running_.load()) break;
@@ -1003,17 +1202,17 @@ void VideoRenderer::run(const std::string& title) {
         const int full_w = win_w;
         const int full_h = win_h;
 
-        // Layout: top toolbar, sidebar (left), options panel (right,
-        // optional), status bar (bottom). The remainder is the video
-        // stage. In fullscreen mode the chrome is hidden entirely so
-        // the video occupies the whole window — same toggle that flips
-        // SDL_WINDOW_FULLSCREEN_DESKTOP also collapses the insets here
-        // and skips the ImGui panel block below.
-        const int options_w = (ui.show_options && !fullscreen)
-                                  ? kOptionsWidth : 0;
-        const int chrome_top    = fullscreen ? 0 : kToolbarHeight;
-        const int chrome_bottom = fullscreen ? 0 : kStatusBarHeight;
-        const int chrome_left   = fullscreen ? 0 : kSidebarWidth;
+        // Layout: top toolbar, sidebar (left), options panel (right),
+        // status bar (bottom). Two ways to drop the chrome:
+        //   - fullscreen: SDL_WINDOW_FULLSCREEN_DESKTOP, no chrome
+        //   - chromeless: regular resizable window, no chrome
+        // Both collapse all insets to 0 so the video stage covers the
+        // whole window, and both skip the ImGui panel block below.
+        const bool no_chrome = fullscreen || ui.chromeless;
+        const int options_w     = no_chrome ? 0 : kOptionsWidth;
+        const int chrome_top    = no_chrome ? 0 : kToolbarHeight;
+        const int chrome_bottom = no_chrome ? 0 : kStatusBarHeight;
+        const int chrome_left   = no_chrome ? 0 : kSidebarWidth;
         const int stage_x = chrome_left;
         const int stage_y = chrome_top;
         const int stage_w = std::max(0, full_w - chrome_left - options_w);
@@ -1193,12 +1392,14 @@ void VideoRenderer::run(const std::string& title) {
         const float fw           = static_cast<float>(full_w);
         const float fh           = static_cast<float>(full_h);
 
-        // Fullscreen mode hides the entire chrome (toolbar / sidebar /
-        // options / status bar) so the video occupies the whole screen
-        // like a real video player. F11/F/double-click toggles it; ESC
-        // exits. The pulsing "Waiting for AirPlay" ring below this block
-        // stays drawn — it's part of the stage, not the chrome.
-        if (!fullscreen) {
+        // Fullscreen and chromeless both hide the entire chrome
+        // (toolbar / sidebar / options / status bar). Fullscreen also
+        // takes the whole screen via SDL_WINDOW_FULLSCREEN_DESKTOP;
+        // chromeless keeps a regular resizable window with just the
+        // video. F11/F/double-click toggles fullscreen, H toggles
+        // chromeless, ESC peels back layers. The pulsing "Waiting
+        // for AirPlay" ring stays drawn — it's part of the stage.
+        if (!fullscreen && !ui.chromeless) {
         // ---- Top toolbar (app title + active device + actions) ----
         ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(fw, toolbar_h));
@@ -1235,16 +1436,37 @@ void VideoRenderer::run(const std::string& title) {
             } else {
                 ImGui::TextDisabled("Idle - waiting for AirPlay");
             }
-            // Right-aligned quick toggles.
-            const float btn_options_w = 110.0f;
-            const float btn_full_w    = 100.0f;
+            // Right-aligned quick toggles. "Disconnect" only when
+            // there is actually something to disconnect. "Hide UI"
+            // collapses the entire chrome (this toolbar included)
+            // - bring it back with the H hotkey or ESC.
+            const float btn_disc_w = 110.0f;
+            const float btn_hide_w = 110.0f;
+            const float btn_full_w = 100.0f;
             const float gap = 8.0f;
+            const bool  show_disc  = has_active_dev && disconnect_handler_;
+            const float row_w =
+                (show_disc ? btn_disc_w + gap : 0.0f) +
+                btn_hide_w + gap + btn_full_w;
             ImGui::SameLine();
-            ImGui::SetCursorPosX(fw - btn_options_w - btn_full_w - gap - 12.0f);
-            if (ImGui::Button(
-                    ui.show_options ? "Hide options" : "Show options",
-                    ImVec2(btn_options_w, 0))) {
-                ui.show_options = !ui.show_options;
+            ImGui::SetCursorPosX(fw - row_w - 12.0f);
+            if (show_disc) {
+                if (ImGui::Button("Disconnect",
+                                  ImVec2(btn_disc_w, 0))) {
+                    disconnect_handler_();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Drop the current AirPlay session "
+                        "(iPhone may re-mirror immediately)");
+                }
+                ImGui::SameLine();
+            }
+            if (ImGui::Button("Hide UI", ImVec2(btn_hide_w, 0))) {
+                ui.chromeless = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Hide all panels (H or ESC to restore)");
             }
             ImGui::SameLine();
             if (ImGui::Button(fullscreen ? "Exit fullscreen" : "Fullscreen",
@@ -1325,7 +1547,10 @@ void VideoRenderer::run(const std::string& title) {
         ImGui::End();
 
         // ---- Right options panel ----------------------------------
-        if (ui.show_options) {
+        // Always shown when chrome is on (chromeless / fullscreen
+        // already collapse the surrounding `if (!fullscreen ...)`
+        // block, so reaching here means the user wants chrome).
+        {
             ImGui::SetNextWindowPos(ImVec2(fw - opts_bar_w, toolbar_h));
             ImGui::SetNextWindowSize(ImVec2(opts_bar_w, fh - toolbar_h - status_bar_h));
             if (ImGui::Begin("##options_panel", nullptr, kPanelFlags)) {
@@ -1338,10 +1563,6 @@ void VideoRenderer::run(const std::string& title) {
                 // hint strings (VSYNC / GPU decoder explanations, etc.)
                 // stay inside the panel instead of running off-screen.
                 ImGui::PushTextWrapPos(0.0f);
-                if (ImGui::CollapsingHeader("Source",
-                        ImGuiTreeNodeFlags_DefaultOpen)) {
-                    ImGui::TextDisabled("iOS-driven (read-only)");
-                }
                 if (ImGui::CollapsingHeader("Mirror Resolution",
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     if (live_settings_) {
@@ -1354,58 +1575,85 @@ void VideoRenderer::run(const std::string& title) {
                         };
                         int cur_w = live_settings_->mirror_width.load();
                         int cur_h = live_settings_->mirror_height.load();
-                        // Find the preset that matches the current
-                        // values, or "Custom" if none does.
-                        int sel = -1;
+                        int sel = -1;   // -1 = none of the presets match
                         for (int i = 0; i < (int)IM_ARRAYSIZE(presets); ++i) {
                             if (presets[i].w == cur_w && presets[i].h == cur_h) {
                                 sel = i; break;
                             }
                         }
-                        const char* preview = sel >= 0
-                            ? presets[sel].label : "Custom";
+                        // Custom mode is sticky once chosen so the
+                        // inputs don't disappear the moment the user
+                        // pauses on a partial value that happens to
+                        // match a preset (eg typing 1920 then 1080).
+                        // Reset to false whenever a preset is chosen
+                        // explicitly, or auto-set when current values
+                        // don't match any preset (eg --mirror-res CLI).
+                        static bool custom_mode = false;
+                        if (sel < 0) custom_mode = true;
+
+                        char preview_buf[48];
+                        const char* preview;
+                        if (custom_mode) {
+                            std::snprintf(preview_buf, sizeof(preview_buf),
+                                          "Custom: %dx%d", cur_w, cur_h);
+                            preview = preview_buf;
+                        } else {
+                            preview = presets[sel].label;
+                        }
+
                         if (ImGui::BeginCombo("##mirror_res", preview)) {
                             for (int i = 0; i < (int)IM_ARRAYSIZE(presets); ++i) {
-                                const bool selected = (sel == i);
-                                if (ImGui::Selectable(presets[i].label, selected)) {
+                                const bool is_sel =
+                                    (!custom_mode && sel == i);
+                                if (ImGui::Selectable(presets[i].label,
+                                                      is_sel)) {
+                                    custom_mode = false;
                                     live_settings_->mirror_width.store(presets[i].w);
                                     live_settings_->mirror_height.store(presets[i].h);
                                 }
-                                if (selected) ImGui::SetItemDefaultFocus();
+                                if (is_sel) ImGui::SetItemDefaultFocus();
+                            }
+                            ImGui::Separator();
+                            if (ImGui::Selectable("Custom...", custom_mode)) {
+                                custom_mode = true;
                             }
                             ImGui::EndCombo();
                         }
-                        // Custom W / H input fields. Each tracks its own
-                        // active state — InputInt2's IsItemActive only
-                        // covers the last component (height), so editing
-                        // the width field would always be flagged "not
-                        // active" and clobbered on the next frame.
-                        static int  width_buf    = 2560;
-                        static int  height_buf   = 1440;
-                        static bool width_active = false;
-                        static bool height_active= false;
-                        if (!width_active)  width_buf  = cur_w;
-                        if (!height_active) height_buf = cur_h;
 
-                        ImGui::SetNextItemWidth(80);
-                        const bool w_commit = ImGui::InputInt(
-                            "Width##custom", &width_buf, 0, 0,
-                            ImGuiInputTextFlags_EnterReturnsTrue);
-                        width_active = ImGui::IsItemActive();
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(80);
-                        const bool h_commit = ImGui::InputInt(
-                            "Height##custom", &height_buf, 0, 0,
-                            ImGuiInputTextFlags_EnterReturnsTrue);
-                        height_active = ImGui::IsItemActive();
+                        if (custom_mode) {
+                            // Width / height inputs that commit live
+                            // (no Enter) as soon as the value falls in
+                            // the accepted range. While the user is
+                            // typing a partial number outside the
+                            // range nothing is written — so 2 / 25 /
+                            // 256 don't get applied on the way to 2560.
+                            static int  width_buf    = 0;
+                            static int  height_buf   = 0;
+                            static bool width_active = false;
+                            static bool height_active= false;
+                            if (!width_active)  width_buf  = cur_w;
+                            if (!height_active) height_buf = cur_h;
 
-                        if (w_commit && width_buf >= 320 &&
-                            width_buf <= 7680) {
-                            live_settings_->mirror_width.store(width_buf);
-                        }
-                        if (h_commit && height_buf >= 240 &&
-                            height_buf <= 4320) {
-                            live_settings_->mirror_height.store(height_buf);
+                            ImGui::SetNextItemWidth(80);
+                            ImGui::InputInt("Width##custom",
+                                            &width_buf, 0, 0);
+                            width_active = ImGui::IsItemActive();
+                            ImGui::SameLine();
+                            ImGui::SetNextItemWidth(80);
+                            ImGui::InputInt("Height##custom",
+                                            &height_buf, 0, 0);
+                            height_active = ImGui::IsItemActive();
+
+                            if (width_buf  >= 320 && width_buf  <= 7680 &&
+                                width_buf  != cur_w) {
+                                live_settings_->mirror_width.store(width_buf);
+                            }
+                            if (height_buf >= 240 && height_buf <= 4320 &&
+                                height_buf != cur_h) {
+                                live_settings_->mirror_height.store(height_buf);
+                            }
+                            ImGui::TextDisabled(
+                                "Range: 320-7680 x 240-4320");
                         }
                         ImGui::TextDisabled("Applies on next iPhone connection");
                     } else {
@@ -1460,11 +1708,8 @@ void VideoRenderer::run(const std::string& title) {
                         }
                         ImGui::TextDisabled(
                             hw
-                              ? "GPU pipeline: NVDEC cuvid (NVIDIA) →"
-                                " D3D11VA fallback. Higher latency than"
-                                " software on single-stream mirror"
-                                " (~30 ms vs 12 ms in tests) but offloads"
-                                " the CPU."
+                              ? "GPU pipeline: NVDEC cuvid (NVIDIA) ->"
+                                " D3D11VA fallback."
                               : "Software libavcodec - fastest end-to-end"
                                 " latency on single-stream mirror.");
                         ImGui::TextDisabled("Applies on next iPhone connection");
@@ -1477,8 +1722,7 @@ void VideoRenderer::run(const std::string& title) {
                         }
                         ImGui::TextDisabled(
                             vsync
-                              ? "Sync presents to monitor refresh"
-                                " (clean image, +0..16 ms latency)."
+                              ? "Sync presents to monitor refresh."
                               : "Present immediately (lower latency,"
                                 " visible tearing on fast pans).");
                         ImGui::TextDisabled("Applies live (no reconnect needed)");

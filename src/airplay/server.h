@@ -12,6 +12,11 @@ public:
     void stop();
     uint16_t port() const { return tcp_.port(); }
 
+    // Drop every currently-connected AirPlay client. Mirror, audio,
+    // RTSP — all unwound by the natural EOF cascade once the RTSP
+    // TCP closes. Listener stays up so iOS can re-pair / re-mirror.
+    void disconnect_clients() { tcp_.close_all_clients(); }
+
 private:
     void handle_client(ap::net::ClientSocket client);
 
