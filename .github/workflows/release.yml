@@ -4,14 +4,10 @@ name: Release
 # attaches a zipped Release/ folder to a draft GitHub Release.
 #
 # Triggers:
-#   - Push of a tag matching v* (e.g. v0.1.0, v0.2.1, v1.0.0):
-#     creates / updates the draft release for that tag with the
-#     artifact attached.
+#   - Push of a tag matching v* (e.g. v0.1.0): creates / updates the
+#     draft release for that tag with the artifact attached.
 #   - Manual workflow_dispatch from the Actions tab: builds the
-#     binary and uploads it as a workflow artifact only (no release).
-#
-# Runner: windows-latest (currently Windows Server with VS 2022 +
-# pre-installed vcpkg at $env:VCPKG_INSTALLATION_ROOT).
+#     binary and uploads it as a workflow artifact only.
 
 on:
   push:
@@ -29,39 +25,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Cache the vcpkg manifest install so dependency rebuilds
-      # (libplist, openssl, ffmpeg, sdl2, sdl2-ttf) only happen when
-      # vcpkg.json actually changes.
+      # The pre-installed vcpkg on windows-latest sits at a recent
+      # commit whose working tree carries port versions that aren't
+      # listed in our manifest's `builtin-baseline` versions/baseline.json.
+      # Clone a fresh vcpkg pinned at our baseline so port versions
+      # and baseline stay in sync. lukka/run-vcpkg caches the clone
+      # and bootstrap output keyed on the commit id.
+      - name: Read vcpkg baseline from manifest
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          "baseline=$baseline" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "vcpkg baseline = $baseline"
+
+      - name: Set up pinned vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+
+      # Cache the manifest install output (libplist + openssl + ffmpeg
+      # + sdl2 + sdl2-ttf compiled artifacts) keyed on vcpkg.json.
+      # Subsequent runs skip the ~10 min compile step.
       - name: Cache vcpkg installed
         uses: actions/cache@v4
         with:
           path: build/vcpkg_installed
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-installed-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: |
-            vcpkg-${{ runner.os }}-
-
-      # The runner's pre-installed vcpkg sits at some recent commit
-      # which may NOT include our manifest's `builtin-baseline`.
-      # Fetch that exact commit (depth 1) so vcpkg can resolve
-      # `versions/baseline.json` when it installs the manifest.
-      - name: Sync vcpkg baseline commit
-        shell: pwsh
-        run: |
-          $baseline = (Get-Content vcpkg.json | ConvertFrom-Json).'builtin-baseline'
-          if ([string]::IsNullOrEmpty($baseline)) {
-            Write-Host "vcpkg.json has no builtin-baseline - skipping fetch"
-            return
-          }
-          Write-Host "Fetching vcpkg baseline $baseline into $env:VCPKG_INSTALLATION_ROOT"
-          Push-Location $env:VCPKG_INSTALLATION_ROOT
-          git fetch --depth 1 origin $baseline
-          Pop-Location
+            vcpkg-installed-${{ runner.os }}-
 
       - name: Configure (CMake + vcpkg manifest mode)
         shell: pwsh
         run: |
           cmake -S . -B build `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -G "Visual Studio 17 2022" -A x64
 
       - name: Build Release
@@ -80,8 +78,6 @@ jobs:
           "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
           Get-ChildItem $zipName | Format-List Name, Length
 
-      # Always upload as a workflow artifact (downloadable from the
-      # Actions run page) so manual dispatch builds are usable too.
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -89,11 +85,6 @@ jobs:
           path: ${{ env.ZIP_PATH }}
           retention-days: 30
 
-      # When triggered by a v* tag push, additionally create / update
-      # a DRAFT GitHub Release with the zip attached and auto-generated
-      # release notes (commits since the previous tag). The maintainer
-      # then edits the draft to add a hand-written description and
-      # hits Publish.
       - name: Create / update draft release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
