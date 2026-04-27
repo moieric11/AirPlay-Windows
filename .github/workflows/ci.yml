@@ -66,5 +66,53 @@ jobs:
       - name: Install Python deps
         run: pip install cryptography
 
+      # Integration test: the Python harness expects a live AirPlay
+      # server on 127.0.0.1:7000. Start the binary in the background,
+      # poll for the listener, run the test, then teardown. SDL's
+      # dummy drivers keep video / audio init happy on a runner that
+      # has no interactive desktop / audio device.
       - name: Run pair-verify protocol tests
-        run: python tools/test_pair_verify.py
+        shell: pwsh
+        run: |
+          $env:SDL_VIDEODRIVER = "dummy"
+          $env:SDL_AUDIODRIVER = "dummy"
+          $proc = Start-Process `
+            -FilePath "build\Release\airplay-windows.exe" `
+            -ArgumentList "--log" `
+            -PassThru `
+            -RedirectStandardOutput "airplay.stdout.log" `
+            -RedirectStandardError "airplay.stderr.log"
+
+          # Poll the listener for up to 15 s rather than a blind sleep:
+          # vcpkg-built FFmpeg cold-init + SDL sometimes takes 2-3 s
+          # extra on a fresh runner.
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $c = New-Object System.Net.Sockets.TcpClient
+              $c.Connect("127.0.0.1", 7000)
+              $c.Close()
+              $ready = $true
+              break
+            } catch {
+              Start-Sleep -Milliseconds 500
+            }
+          }
+          if (-not $ready) {
+            Write-Host "::error::AirPlay server never bound :7000 within 15 s"
+          }
+
+          $testCode = 1
+          try {
+            python tools/test_pair_verify.py
+            $testCode = $LASTEXITCODE
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "--- airplay stdout (last 80 lines) ---"
+          if (Test-Path airplay.stdout.log) { Get-Content airplay.stdout.log -Tail 80 }
+          Write-Host "--- airplay stderr (last 80 lines) ---"
+          if (Test-Path airplay.stderr.log) { Get-Content airplay.stderr.log -Tail 80 }
+
+          exit $testCode
