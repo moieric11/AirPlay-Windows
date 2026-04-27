@@ -1,0 +1,71 @@
+name: CI
+
+# Continuous integration build + test. Fires on:
+#   - every push to main (catches breakage in your own commits)
+#   - every pull request (gives reviewers a green/red signal)
+# Releases live in release.yml (separate workflow, fires on tag push)
+# so the CI run stays fast and never produces release artifacts.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Auto-cancel an in-progress CI run if a newer commit lands on the
+# same branch / PR - no point burning runner minutes on stale code.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read vcpkg baseline from manifest
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          "baseline=$baseline" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Set up pinned vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+
+      - name: Cache vcpkg installed
+        uses: actions/cache@v4
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-installed-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-installed-${{ runner.os }}-
+
+      - name: Configure (CMake + vcpkg manifest mode)
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -G "Visual Studio 17 2022" -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      # Python role-plays an iOS client for 6 scenarios (pair-verify
+      # round-trip, real iOS headers, signature corruption, concurrent
+      # sessions, fp-setup framing, legacy ANNOUNCE/SETUP/RECORD/
+      # TEARDOWN). Catches handshake regressions without an iPhone.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          cache: pip
+
+      - name: Install Python deps
+        run: pip install cryptography
+
+      - name: Run pair-verify protocol tests
+        run: python tools/test_pair_verify.py
