@@ -83,16 +83,23 @@ cmake --build build --config Debug
 Première config : vcpkg télécharge et compile `libplist` + `openssl`
 (~5 min). Ensuite c'est caché.
 
-## FairPlay — provisioning local
+## FairPlay
 
 Le handshake `/fp-setup` utilise 4 réponses pré-enregistrées d'Apple TV
-(568 bytes au total), embarquées dans UxPlay sous licence GPL-3.0. Elles
-ne sont pas commitées dans ce repo. Procédure de provisioning locale
-dans `docs/FAIRPLAY.md` — il suffit de créer un fichier
-`third_party/fairplay_blobs_real.cpp` (gitignored) avec les bytes
-correspondants, CMake le détecte automatiquement.
+(568 octets au total) + une routine de décryptage (`playfair`). Les deux
+sont **bundlés dans ce repo** sous `third_party/` — `cmake --build` les
+détecte et les linke automatiquement. Pas de provisioning manuel.
 
-Sans ces blobs, iOS décroche à `/fp-setup`. Avec, la session s'ouvre.
+Origine et statut légal de ces ressources : voir
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). En résumé : les
+sources `playfair` sont sous GPL-3.0 ; les 568 octets de réponses
+FairPlay sont produits par Apple, redistribués ici sous le même
+précédent qu'UxPlay / RPiPlay / shairport-sync (publication ouverte
+depuis plusieurs années sans contestation). Si Apple en demande le
+retrait, on s'exécute.
+
+Procédure pour re-dériver ces octets depuis un Apple TV (transparence
++ vérification) : [`docs/FAIRPLAY.md`](docs/FAIRPLAY.md).
 
 ## Lancement
 
@@ -203,4 +210,12 @@ chantier lourd :
 
 ## Licence
 
-Porté depuis UxPlay (GPL-3.0) — le binaire final est GPL-3.0.
+Code de ce projet : **GPL-3.0** (voir [`LICENSE`](LICENSE)). Porté
+depuis UxPlay, lui-même GPL-3.0.
+
+**Composants tiers bundlés ou liés** (FairPlay reply blobs, playfair,
+libplist, OpenSSL, FFmpeg, SDL2, Dear ImGui, etc.) : voir
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) pour l'origine, la
+licence et le statut légal de chaque composant — en particulier les
+568 octets FairPlay qui sont produits par Apple (Apple en garde la
+propriété ; redistribution sous précédent UxPlay/RPiPlay).

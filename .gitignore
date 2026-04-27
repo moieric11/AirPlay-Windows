@@ -19,7 +19,6 @@ vcpkg_installed/
 # something to ship.
 identity.key
 
-# FairPlay blobs are Apple-copyrighted; provision locally per docs/FAIRPLAY.md
-# but never commit.
-third_party/fairplay_blobs_real.cpp
-third_party/playfair/
+# (FairPlay reply blobs + playfair source are now bundled by default
+#  for an out-of-the-box build experience. See THIRD_PARTY_NOTICES.md
+#  for licensing and Apple-ownership disclaimers.)
