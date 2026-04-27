@@ -40,6 +40,23 @@ jobs:
           restore-keys: |
             vcpkg-${{ runner.os }}-
 
+      # The runner's pre-installed vcpkg sits at some recent commit
+      # which may NOT include our manifest's `builtin-baseline`.
+      # Fetch that exact commit (depth 1) so vcpkg can resolve
+      # `versions/baseline.json` when it installs the manifest.
+      - name: Sync vcpkg baseline commit
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          if ([string]::IsNullOrEmpty($baseline)) {
+            Write-Host "vcpkg.json has no builtin-baseline - skipping fetch"
+            return
+          }
+          Write-Host "Fetching vcpkg baseline $baseline into $env:VCPKG_INSTALLATION_ROOT"
+          Push-Location $env:VCPKG_INSTALLATION_ROOT
+          git fetch --depth 1 origin $baseline
+          Pop-Location
+
       - name: Configure (CMake + vcpkg manifest mode)
         shell: pwsh
         run: |
