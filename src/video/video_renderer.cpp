@@ -1142,7 +1142,7 @@ void VideoRenderer::run(const std::string& title) {
             make_text(fonts_small, t_idle_ip,
                       SDL_Color{180, 180, 180, 255},
                       idle_ip_tex,   idle_ip_w,   idle_ip_h);
-            make_text(fonts_small, "En attente d'AirPlay",
+            make_text(fonts_small, "Waiting for AirPlay",
                       SDL_Color{150, 150, 150, 255},
                       idle_msg_tex,  idle_msg_w,  idle_msg_h);
         }

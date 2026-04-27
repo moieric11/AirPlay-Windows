@@ -1,181 +1,203 @@
 # AirPlay Windows Receiver
 
-Récepteur AirPlay 2 (mirroring) pour Windows, porté depuis
-[UxPlay](https://github.com/FDH2/UxPlay) (GPL-3.0) avec un stack 100 %
-natif Windows (pas de Bonjour SDK ni de dépendance Apple au runtime).
+Native AirPlay 2 receiver (mirror + RAOP audio) for Windows, ported
+from [UxPlay](https://github.com/FDH2/UxPlay) (GPL-3.0). 100 %
+native Windows stack — no Bonjour SDK, no Apple runtime dependency.
 
-> **État actuel — récepteur AirPlay 2 fonctionnel sur Windows.**
+> **Status — working AirPlay 2 receiver on Windows.**
 >
-> Un iPhone / iPad / Mac du même Wi-Fi voit `AirPlay-Windows` dans son
-> Centre de contrôle. La recopie d'écran s'affiche **en temps réel dans
-> une fenêtre SDL2** (498×1080 pour un iPhone 16 portrait, resizable,
-> conserve l'aspect). L'audio d'Apple Music, des vidéos natives et des
-> notifications iOS **sort du périphérique audio Windows par défaut**
-> via WASAPI/SDL.
+> An iPhone / iPad / Mac on the same Wi-Fi sees `AirPlay-Windows`
+> in its Control Center. Screen mirroring shows up **in real time
+> in an SDL2 window** (498x1080 for an iPhone 16 in portrait,
+> resizable, aspect-preserving). Apple Music, native videos and
+> iOS notification audio **come out of the default Windows audio
+> device** via WASAPI/SDL.
 >
-> Ce qui ne marche pas : les apps qui forcent l'**AirPlay Streaming
-> mode** avec FairPlay DRM (YouTube / Netflix / Apple TV+) restent
-> hors scope — elles demandent un protocole et une DRM distincts, à
-> plusieurs jours de travail.
+> What does NOT work: apps that force the **AirPlay Streaming**
+> mode with FairPlay DRM (YouTube / Netflix / Apple TV+) are out
+> of scope — they need a separate protocol and a separate DRM,
+> several days of work.
 
-## Ce qui fonctionne
+## What works
 
-| Étape                                       | État | Source UxPlay portée                         |
-|---------------------------------------------|------|----------------------------------------------|
-| mDNS `_airplay._tcp` + `_raop._tcp`         | ✅   | Windows `dnsapi.dll` (natif, zéro SDK Apple) |
-| `GET /info` — bplist00 complet              | ✅   | `plist/info.plist` (via libplist)            |
-| `POST /pair-setup` (no-SRP)                 | ✅   | `lib/pairing.c`                              |
-| `POST /pair-verify` (X25519+AES-CTR+Ed25519)| ✅   | `lib/pairing.c`                              |
-| `POST /fp-setup` (4×142 replay)             | ✅   | `lib/fairplay_playfair.c` (blobs isolés)     |
-| AirPlay 2 `SETUP` (session + streams plist) | ✅   | `raop_handler_setup`                         |
-| `GET_PARAMETER volume`                      | ✅   | `raop_handler_get_parameter`                 |
-| `RECORD`, `TEARDOWN` partiel + session      | ✅   | `raop_handler_teardown`                      |
-| Client NTP (poll iOS timing server)         | ✅   | `lib/raop_ntp.c`                             |
-| Mirror TCP listener + frame parser          | ✅   | `lib/raop_rtp_mirror.c`                      |
-| Parse SPS (profile/level/résolution)        | ✅   | H.264 spec, standalone                       |
-| **FairPlay decrypt (ekey → AES key)**       | ✅   | `lib/playfair/*` (provisioned locally)       |
-| **AES post-hash avec ECDH secret**          | ✅   | `raop_handler_setup` (modern-client path)    |
-| **AES-CTR des NAL H.264 (in-place decrypt)**| ✅   | `lib/mirror_buffer.c`                        |
-| **Split NAL + conversion Annex-B**          | ✅   | `raop_rtp_mirror_thread` (port-by-port)      |
-| **Décodeur H.264 (libavcodec)**             | ✅   | FFmpeg — SPS/PPS extraits de l'avcC          |
-| **Renderer vidéo temps réel (SDL2)**        | ✅   | SDL2 IYUV texture, GPU YUV→RGB               |
-| **Audio UDP RTP + AES-CBC decrypt**         | ✅   | `lib/raop_buffer.c`                          |
-| **RAOP RTP seq dedup**                      | ✅   | bitset 65k, sliding window                   |
-| **Décodeur AAC-ELD (libavcodec)**           | ✅   | ASC `F8 E8 50 00` construit from-scratch     |
-| **Sortie audio SDL2 / WASAPI**              | ✅   | int16 stéréo 44.1 kHz, push mode             |
-| **Volume control (SET_PARAMETER → gain)**   | ✅   | dB → linéaire, atomique, fast-path unity     |
-| **Cover art (image/jpeg → disk)**           | ✅   | dump `cover.jpg` à chaque changement de piste |
-| **DAAP metadata (mlit/minm/asar/asal/astm)**| ✅   | parser DMAP standalone, `metadata: "Titre" — Artiste (Album, 234s)` |
-| **ALAC fallback (ct=2)**                    | ✅   | magic cookie 36 B + dispatch AV_CODEC_ID_ALAC |
-| AirPlay streaming mode (FairPlay Streaming) | ❌   | YouTube / Netflix / ATV+ — hors scope        |
-| Affichage cover/metadata dans la fenêtre    | ❌   | overlay SDL (SDL_ttf à intégrer)             |
-| Seek / pause / progress playback            | ❌   | position loggée, UI à construire             |
+| Step                                         | State | UxPlay source ported                          |
+|----------------------------------------------|-------|-----------------------------------------------|
+| mDNS `_airplay._tcp` + `_raop._tcp`          | OK    | Windows `dnsapi.dll` (native, no Apple SDK)   |
+| `GET /info` — full bplist00                  | OK    | `plist/info.plist` (via libplist)             |
+| `POST /pair-setup` (no-SRP)                  | OK    | `lib/pairing.c`                               |
+| `POST /pair-verify` (X25519+AES-CTR+Ed25519) | OK    | `lib/pairing.c`                               |
+| `POST /fp-setup` (4x142 replay)              | OK    | `lib/fairplay_playfair.c` (blobs isolated)    |
+| AirPlay 2 `SETUP` (session + streams plist)  | OK    | `raop_handler_setup`                          |
+| `GET_PARAMETER volume`                       | OK    | `raop_handler_get_parameter`                  |
+| `RECORD`, partial `TEARDOWN` + session       | OK    | `raop_handler_teardown`                       |
+| NTP client (poll iOS timing server)          | OK    | `lib/raop_ntp.c`                              |
+| Mirror TCP listener + frame parser           | OK    | `lib/raop_rtp_mirror.c`                       |
+| SPS parse (profile/level/resolution)         | OK    | H.264 spec, standalone                        |
+| **FairPlay decrypt (ekey -> AES key)**       | OK    | `lib/playfair/*` (bundled in `third_party/`)  |
+| **AES post-hash with ECDH secret**           | OK    | `raop_handler_setup` (modern-client path)     |
+| **AES-CTR on H.264 NALs (in-place decrypt)** | OK    | `lib/mirror_buffer.c`                         |
+| **Split NAL + Annex-B conversion**           | OK    | `raop_rtp_mirror_thread` (port-by-port)       |
+| **H.264 decoder (libavcodec)**               | OK    | FFmpeg — SPS/PPS extracted from avcC          |
+| **Real-time video renderer (SDL2)**          | OK    | SDL2 IYUV texture, GPU YUV->RGB               |
+| **Audio UDP RTP + AES-CBC decrypt**          | OK    | `lib/raop_buffer.c`                           |
+| **RAOP RTP seq dedup**                       | OK    | 65k bitset, sliding window                    |
+| **AAC-ELD decoder (libavcodec)**             | OK    | ASC `F8 E8 50 00` built from scratch          |
+| **SDL2 / WASAPI audio output**               | OK    | int16 stereo 44.1 kHz, push mode              |
+| **Volume control (`SET_PARAMETER` -> gain)** | OK    | dB -> linear, atomic, fast-path unity         |
+| **Cover art (image/jpeg -> disk)**           | OK    | dump `cover.jpg` on every track change        |
+| **DAAP metadata (mlit/minm/asar/asal/astm)** | OK    | standalone DMAP parser, `metadata: "Title" - Artist (Album, 234s)` |
+| **ALAC fallback (ct=2)**                     | OK    | 36 B magic cookie + dispatch `AV_CODEC_ID_ALAC` |
+| **Cover + metadata overlay (SDL_ttf)**       | OK    | rendered on the idle stage when audio-only    |
+| **In-app overlay (Dear ImGui)**              | OK    | toolbar / sidebar / options / status bar      |
+| **Hide UI mode (borderless, draggable)**     | OK    | SDL hit-test edges = resize, video = drag     |
+| **USB Personal Hotspot path**                | OK    | works over the cable subnet, no Wi-Fi needed  |
+| AirPlay Streaming mode (FairPlay Streaming)  | NO    | YouTube / Netflix / ATV+ — out of scope       |
 
-## Stratégie
+## Strategy
 
-Copier UxPlay au plus près ligne par ligne, valider à chaque étape
-contre un iPhone réel. Pas d'improvisation : chaque fichier cite sa
-source dans UxPlay et conserve la licence GPL-3.0 compatible.
+Mirror UxPlay as closely as possible, line by line, validating each
+step against a real iPhone. No improvisation: every file cites its
+UxPlay source and keeps a GPL-3.0 compatible license.
 
-## Prérequis (Windows)
+## Requirements (Windows)
 
-- **Visual Studio 2022** (ou Build Tools) avec composants C++
-- **CMake 3.20+**
-- **vcpkg** (pour OpenSSL + libplist, déclarés dans `vcpkg.json`)
-- **Windows 10 1809+ ou Windows 11** (API mDNS native `DnsServiceRegister`)
+- **Visual Studio 2022** (or Build Tools) with C++ workload
+- **CMake 3.21+**
+- **vcpkg** (for OpenSSL, libplist, FFmpeg, SDL2, SDL2_ttf — declared
+  in `vcpkg.json`)
+- **Windows 10 1809+ or Windows 11** (native mDNS API
+  `DnsServiceRegister`)
 
-Aucune dépendance Apple requise : le récepteur s'annonce via `dnsapi.dll`
-de Windows, pas via Bonjour SDK.
+No Apple dependency required: the receiver advertises itself through
+Windows' `dnsapi.dll`, not through Bonjour SDK.
 
 ## Build
 
 ```powershell
-git clone <url-du-repo>
-cd airplay-windows
+git clone https://github.com/moieric11/AirPlay-Windows.git
+cd AirPlay-Windows
 
-# Si ton VS embarque vcpkg (typique 2022+) :
+# If your VS bundles vcpkg (typical 2022+ install):
 cmake -S . -B build `
   -DCMAKE_TOOLCHAIN_FILE="C:\Program Files (x86)\Microsoft Visual Studio\17\BuildTools\VC\vcpkg\scripts\buildsystems\vcpkg.cmake" `
   -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Debug
+cmake --build build --config Release
 ```
 
-Première config : vcpkg télécharge et compile `libplist` + `openssl`
-(~5 min). Ensuite c'est caché.
+First configure: vcpkg downloads and compiles `libplist`, `openssl`,
+`ffmpeg`, `sdl2`, `sdl2-ttf` (~5 min). Then it stays cached.
 
 ## FairPlay
 
-Le handshake `/fp-setup` utilise 4 réponses pré-enregistrées d'Apple TV
-(568 octets au total) + une routine de décryptage (`playfair`). Les deux
-sont **bundlés dans ce repo** sous `third_party/` — `cmake --build` les
-détecte et les linke automatiquement. Pas de provisioning manuel.
+The `/fp-setup` handshake uses 4 pre-recorded Apple TV responses
+(568 bytes total) plus a decryption routine (`playfair`). Both are
+**bundled in this repo** under `third_party/` — `cmake --build`
+detects them and links them in automatically. No manual provisioning.
 
-Origine et statut légal de ces ressources : voir
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). En résumé : les
-sources `playfair` sont sous GPL-3.0 ; les 568 octets de réponses
-FairPlay sont produits par Apple, redistribués ici sous le même
-précédent qu'UxPlay / RPiPlay / shairport-sync (publication ouverte
-depuis plusieurs années sans contestation). Si Apple en demande le
-retrait, on s'exécute.
+Origin and legal status of these assets: see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Short version:
+the `playfair` sources are GPL-3.0; the 568 FairPlay bytes are
+produced by Apple's FairPlay implementation, redistributed here on
+the same precedent as UxPlay / RPiPlay / shairport-sync (openly
+published for several years without enforcement). If Apple requests
+removal we'll comply.
 
-Procédure pour re-dériver ces octets depuis un Apple TV (transparence
-+ vérification) : [`docs/FAIRPLAY.md`](docs/FAIRPLAY.md).
+How to re-derive those bytes from a real Apple TV (transparency +
+verification): [`docs/FAIRPLAY.md`](docs/FAIRPLAY.md).
 
-## Lancement
+## Run
 
 ```powershell
-build\Debug\airplay-windows.exe
+build\Release\airplay-windows.exe
 ```
 
-Logs attendus au démarrage :
+The released binary is silent by default (no console pops up). For
+init / runtime logs, pass `--log` (or `--verbose`):
+
+```powershell
+build\Release\airplay-windows.exe --log
+```
+
+Expected log lines at startup with `--log`:
 
 ```
 ip=192.168.x.x
-TCP server listening on 0.0.0.0:7000
+TCP server listening on [::]:7000 (IPv4+IPv6)
 mDNS registered: AirPlay-Windows._airplay._tcp.local
 mDNS registered: XXXXXXXXXXXX@AirPlay-Windows._raop._tcp.local
 ```
 
-Puis sur iPhone / iPad / Mac du même Wi-Fi → Centre de contrôle →
-Recopie d'écran → `AirPlay-Windows`. Au tap, les logs montrent tout le
-handshake + la réception du flux H.264.
+Then on iPhone / iPad / Mac on the same Wi-Fi: Control Center ->
+Screen Mirroring -> `AirPlay-Windows`. On tap, the logs show the
+full handshake + the H.264 stream coming in.
 
-## AirPlay via câble USB-C (sans Wi-Fi)
+### In-app shortcuts
 
-L'iPhone branché en USB peut router AirPlay via le câble — utile en
-mode avion, sur un PC sans Wi-Fi, ou pour éviter la latence/jitter
-d'un Wi-Fi chargé. **Aucune modif du code n'est nécessaire**, juste un
-réglage côté iOS et un driver Apple sur Windows.
+| Key                | Action                                          |
+|--------------------|-------------------------------------------------|
+| `H`                | Toggle "Hide UI" — hides every panel + the SDL window border, snaps the window to the video aspect ratio |
+| `F` / `F11` / dbl-click | Toggle real OS fullscreen                  |
+| `ESC`              | Peels back: exits fullscreen, then Hide UI, then quits |
 
-### Prérequis
+The toolbar also exposes a **Disconnect** button (only visible when a
+session is active) that drops the current AirPlay client and returns
+the renderer to the idle "Waiting for AirPlay" screen.
 
-- **iTunes** ou **Apple Devices** (Microsoft Store) installé sur Windows
-  → fournit `Apple Mobile Device USB Driver` qui permet à iOS et Windows
-  de monter une interface ethernet virtuelle via le câble.
-- L'iPhone doit avoir fait confiance à ce PC une fois (popup "Faire
-  confiance à cet ordinateur ?" → Oui, code de l'iPhone).
+## AirPlay over USB-C cable (no Wi-Fi)
 
-### Procédure
+An iPhone plugged in via USB can route AirPlay through the cable —
+useful in airplane mode, on a PC without Wi-Fi, or to avoid the
+latency / jitter of a busy Wi-Fi. **No code changes needed**, just
+an iOS toggle and an Apple driver on Windows.
 
-1. **Branche l'iPhone** au PC en USB-C / Lightning.
-2. Sur l'iPhone : **Réglages → Partage de connexion → Autoriser
-   d'autres utilisateurs** → ON. (Le réglage "USB uniquement" suffit
-   si proposé.)
-3. Sur Windows, dans le menu réseau, une nouvelle connexion
-   **`Apple Mobile Device Ethernet`** apparaît avec une IP du subnet
-   `172.20.10.0/24`.
-4. Lance `airplay-windows.exe` — au démarrage les logs annoncent
+### Requirements
+
+- **iTunes** or **Apple Devices** (Microsoft Store) installed on
+  Windows -> provides `Apple Mobile Device USB Driver` which lets
+  iOS and Windows bring up a virtual ethernet interface over the
+  cable.
+- The iPhone must have trusted this PC at least once (the "Trust
+  this computer?" prompt -> Yes, iPhone passcode).
+
+### Procedure
+
+1. **Plug the iPhone** into the PC via USB-C / Lightning.
+2. On the iPhone: **Settings -> Personal Hotspot -> Allow Others
+   to Join** -> ON. (The "USB only" option is enough if offered.)
+3. On Windows, in the network menu, a new **`Apple Mobile Device
+   Ethernet`** connection appears with an IP on the
+   `172.20.10.0/24` subnet.
+4. Run `airplay-windows.exe --log` — at startup the logs announce
    `mDNS registered: ... 172.20.10.x`.
-5. Sur l'iPhone : Centre de contrôle → Recopie d'écran →
-   `AirPlay-Windows` apparaît même **sans Wi-Fi commun**.
+5. On the iPhone: Control Center -> Screen Mirroring ->
+   `AirPlay-Windows` shows up **even with no shared Wi-Fi**.
 
-L'AirPlay route alors sur le subnet ethernet du Personal Hotspot, qui
-existe seulement le long du câble. Pas de consommation cellulaire (la
-connexion AirPlay reste locale entre l'iPhone et le PC), pas besoin de
-Wi-Fi du tout.
+AirPlay then routes over the Personal Hotspot ethernet subnet, which
+exists only along the cable. No cellular data is consumed (the
+AirPlay session stays local between the iPhone and the PC), no Wi-Fi
+needed at all.
 
-### Notes techniques
+### Technical notes
 
-- **QuickTime sur USB est mort sur iOS 17/18.** Apple a réaffecté
-  l'ancienne interface QT (composite child `MI_02`, classe historique
-  `0xFF/0x2A`) à de l'USB Ethernet (classe `0xFF/0xFD`). Les vieilles
-  recettes "QuickTime Video Hack" + Zadig ne marchent plus sur les
-  iPhones modernes.
-- **Le supervisor USB du binaire** (`usb_supervisor.cpp`) détecte
-  l'arrivée d'un iPhone branché et logue un rappel pour activer
-  Personal Hotspot — c'est purement informatif, aucune ouverture de
-  driver n'est faite.
-- Le subnet `172.20.10.0/24` est arbitré par iOS ; la passerelle
-  est l'iPhone, le PC obtient `172.20.10.2` par DHCP. mDNS
-  `_airplay._tcp` s'annonce dessus naturellement parce qu'on bind sur
-  `0.0.0.0` (toutes interfaces).
+- **Direct QuickTime over USB is dead on iOS 17/18.** Apple
+  repurposed the legacy QT interface (composite child `MI_02`,
+  historical class `0xFF/0x2A`) to USB Ethernet (class `0xFF/0xFD`).
+  The old "QuickTime Video Hack" + Zadig recipes no longer work on
+  modern iPhones.
+- The binary's **USB supervisor** (`src/usb/usb_supervisor.cpp`)
+  detects an iPhone being plugged in and logs a Personal Hotspot
+  reminder — purely informational, no driver claim is performed.
+- The `172.20.10.0/24` subnet is arbitrated by iOS; the gateway is
+  the iPhone, the PC gets `172.20.10.2` over DHCP. `_airplay._tcp`
+  mDNS advertises naturally on this interface because we bind on
+  `0.0.0.0` (all interfaces).
 
 ## Tests
 
-Suite Python qui joue le rôle d'iOS pour 6 scénarios (pair-verify
-aller-retour, URI absolue + headers iOS réels, signature corrompue,
-sessions concurrentes, fp-setup framing, ANNOUNCE/SETUP/RECORD/TEARDOWN
-legacy) :
+A Python suite that role-plays an iOS client for 6 scenarios
+(pair-verify round-trip, absolute URI + real iOS headers, corrupted
+signature, concurrent sessions, fp-setup framing, legacy
+ANNOUNCE/SETUP/RECORD/TEARDOWN):
 
 ```bash
 pip install cryptography
@@ -183,39 +205,44 @@ python3 tools/test_pair_verify.py
 # === 26/26 checks passed ===
 ```
 
-## Prochaines étapes
+## What's next
 
-Le cœur fonctionnel est couvert : mirror vidéo + audio RAOP dans
-les deux modes (AAC-ELD + ALAC), volume réactif, cover art et DAAP
-métadonnées extraites. Ce qui reste est de la polish UI ou du
-chantier lourd :
+The functional core is in place: video mirror + RAOP audio in both
+modes (AAC-ELD + ALAC), reactive volume, cover art and DAAP
+metadata extracted, in-app overlay UI. What remains is either UI
+polish or significant chunks of work:
 
-1. **Overlay fenêtre SDL** — afficher `cover.jpg` + titre/artiste
-   dans le VideoRenderer quand un stream audio-only est actif (pas
-   de mirror). Nécessite SDL_ttf ou un petit moteur de bitmap-text.
-2. **Playback UI** — l'iPhone envoie `progress: start/cur/end` et
-   on le logge déjà ; un bandeau de progression dans la fenêtre
-   serait naturel.
-3. **AirPlay Streaming mode** pour YouTube / Netflix / Apple TV+.
-   Protocole distinct (`/reverse`, `/play` avec URL, FairPlay
-   Streaming DRM). Plusieurs jours de travail, licence DRM sensible.
+1. **Playback UI** — iOS sends `progress: start/cur/end` which we
+   already log; a progress bar in the window would be a natural
+   next step.
+2. **AirPlay Streaming mode** for YouTube / Netflix / Apple TV+.
+   Distinct protocol (`/reverse`, `/play` with URL, FairPlay
+   Streaming DRM). Several days of work, sensitive DRM license.
+3. **Multi-session** — currently single-iPhone assumption. Sidebar
+   already has the data model for multiple devices, the RTSP layer
+   would need session-id-based routing.
 
-## Références
+## References
 
-- **[UxPlay](https://github.com/FDH2/UxPlay)** — référence primaire, fork actif de RPiPlay, maintenu iOS 17/18 (GPL-3.0)
-- [RPiPlay](https://github.com/FD-/RPiPlay) — ancêtre, non maintenu depuis 2021 (GPL-3.0)
-- [OpenAirplay](https://openairplay.github.io/airplay-spec/) — notes de protocole
-- [playfair](https://github.com/EstebanKubata/playfair) — décrypteur FairPlay
-- [shairport-sync](https://github.com/mikebrady/shairport-sync) — pour l'audio RAOP
+- **[UxPlay](https://github.com/FDH2/UxPlay)** — primary reference,
+  active fork of RPiPlay, maintained for iOS 17/18 (GPL-3.0)
+- [RPiPlay](https://github.com/FD-/RPiPlay) — ancestor, unmaintained
+  since 2021 (GPL-3.0)
+- [OpenAirplay](https://openairplay.github.io/airplay-spec/) —
+  protocol notes
+- [playfair](https://github.com/EstebanKubata/playfair) — FairPlay
+  decryptor
+- [shairport-sync](https://github.com/mikebrady/shairport-sync) —
+  for the RAOP audio path
 
-## Licence
+## License
 
-Code de ce projet : **GPL-3.0** (voir [`LICENSE`](LICENSE)). Porté
-depuis UxPlay, lui-même GPL-3.0.
+Project code: **GPL-3.0** (see [`LICENSE`](LICENSE)). Ported from
+UxPlay, itself GPL-3.0.
 
-**Composants tiers bundlés ou liés** (FairPlay reply blobs, playfair,
-libplist, OpenSSL, FFmpeg, SDL2, Dear ImGui, etc.) : voir
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) pour l'origine, la
-licence et le statut légal de chaque composant — en particulier les
-568 octets FairPlay qui sont produits par Apple (Apple en garde la
-propriété ; redistribution sous précédent UxPlay/RPiPlay).
+**Bundled or linked third-party components** (FairPlay reply blobs,
+playfair, libplist, OpenSSL, FFmpeg, SDL2, Dear ImGui, etc.): see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the origin,
+license and legal status of each component — in particular the 568
+FairPlay bytes which are produced by Apple (Apple keeps ownership;
+redistribution under the UxPlay/RPiPlay precedent).
