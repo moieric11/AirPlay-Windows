@@ -10,7 +10,7 @@ class DacpRemote {
 public:
     explicit DacpRemote(std::string peer_ip);
     ~DacpRemote();
-    void update(const std::string& dacp_id, const std::string& active_remote, bool audio_only, const std::string& session_id = {});
+    void update(const std::string& dacp_id, const std::string& active_remote, bool session_active, const std::string& session_id = {});
     bool available(const std::string& session_id = {});
     bool send(MediaCommand command, uint32_t position_ms = 0, const std::string& session_id = {});
 private:
@@ -18,7 +18,7 @@ private:
     std::string peer_ip_;
     std::mutex mutex_;
     std::string dacp_id_, active_remote_, session_id_;
-    bool audio_only_{false};
+    bool session_active_{false};
     std::shared_ptr<ResolveState> resolve_;
 };
 }

@@ -304,3 +304,16 @@ including the bundled FairPlay reply data, are documented in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). No Apple runtime is needed for
 normal network mirroring; the Apple USB driver requirement applies only to the
 optional Personal Hotspot route.
+
+## Windows desktop integration
+
+Closing the receiver hides it to the notification area. Right-click its icon
+for Show, Hide or Exit; double-click to show the window. `--start-hidden`
+starts in the notification area and does not activate an existing instance.
+
+Windows media controls publish track metadata, artwork and progress. Their
+play/pause, previous and next buttons use the same DACP transport as the
+receiver UI, including during screen mirroring, and are enabled when the
+sender exposes usable DACP credentials.
+The audio duplicate filter retains sequence-based history across RTP wrap.
+Receiver naming remains available through the settings interface.

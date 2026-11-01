@@ -258,6 +258,7 @@ void AudioReceiver::thread_fn() {
     // only sees each audio frame once. seq is 16-bit — we use a 65 536-bit
     // bitset via a boolean vector (8 KB).
     std::vector<bool> seen_seq(65536, false);
+    std::optional<uint16_t> newest_sequence;
 
     // Silence watchdog: any valid RTP packet pushes the renderer to
     // "playing"; going idle for more than kSilencePauseMs pushes it to
@@ -410,22 +411,23 @@ void AudioReceiver::thread_fn() {
         const bool real_audio = (payload_len >= 100);
         bool is_duplicate     = false;
         if (real_audio) {
-            if (seen_seq[seq]) {
-                is_duplicate = true;
-                ++dedup_dropped;
-            } else {
-                seen_seq[seq] = true;
-                // Clear a sliding 8k-wide window behind the new seq so the
-                // bitset doesn't stay full forever once we wrap past 65k.
-                const uint16_t erase_from = static_cast<uint16_t>(seq - 8192);
-                // erase a small contiguous region every 1024 packets to cap
-                // the work per packet.
-                if ((pkts & 0x3ff) == 0) {
-                    for (int k = 0; k < 1024; ++k) {
-                        seen_seq[static_cast<uint16_t>(erase_from + k)] = false;
-                    }
+            // Age history by sequence progress, including across 16-bit wrap.
+            // Packet-count cleanup can be skipped by duplicate arrivals.
+            constexpr uint16_t history = 8192;
+            if (newest_sequence) {
+                const uint16_t distance = static_cast<uint16_t>(seq - *newest_sequence);
+                if (distance && distance < 32768) {
+                    if (distance >= history) std::fill(seen_seq.begin(), seen_seq.end(), false);
+                    else for (uint16_t step = 1; step <= distance; ++step)
+                        seen_seq[static_cast<uint16_t>(*newest_sequence + step - history)] = false;
+                    newest_sequence = seq;
+                } else if (static_cast<uint16_t>(*newest_sequence - seq) >= history) {
+                    is_duplicate = true;
                 }
-            }
+            } else newest_sequence = seq;
+            is_duplicate = is_duplicate || seen_seq[seq];
+            if (is_duplicate) ++dedup_dropped;
+            else seen_seq[seq] = true;
         }
 
         // Feed the real-audio (non-duplicate) frames to the AAC decoder,

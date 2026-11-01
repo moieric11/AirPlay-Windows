@@ -78,6 +78,8 @@ ap::airplay::DeviceContext build_device_context(bool hls_playback) {
 } // namespace
 
 int main(int argc, char** argv) {
+    bool start_hidden = false;
+    for (int i = 1; i < argc; ++i) start_hidden |= std::string(argv[i]) == "--start-hidden";
 #if defined(_WIN32)
     for (int i=1; i<argc; ++i)
         if (std::string(argv[i])=="--configure-firewall") return ap::platform::configure_firewall();
@@ -87,7 +89,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i)
         help_only |= std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h";
     if (!help_only) {
-        const auto result = instance.acquire();
+        const auto result = instance.acquire(!start_hidden);
         if (result == ap::platform::SingleInstance::Result::Secondary) return 0;
         if (result == ap::platform::SingleInstance::Result::Error) {
             MessageBoxW(nullptr, L"Unable to initialize the single application instance.",
@@ -187,13 +189,16 @@ int main(int argc, char** argv) {
                              << "), keeping default";
                 }
             }
+        } else if (arg == "--start-hidden") {
+            // Parsed before single-instance activation.
         } else if (arg == "--log" || arg == "--verbose") {
             // Already handled in the pre-init scan above; consume so
             // future unknown-arg paths don't trip on it.
         } else if (arg == "--help" || arg == "-h") {
             std::puts(
                 "AirPlay-Windows [--log] [--hls-proxy-playback]\n"
-                "                [--mirror-res WxH] [--mirror-hwaccel]\n"
+                "                [--mirror-res WxH] [--mirror-hwaccel] [--start-hidden]\n"
+                "  --start-hidden        start in the Windows notification area\n"
                 "  --log / --verbose     print init/runtime logs to stderr\n"
                 "                        (off by default in the released\n"
                 "                        binary)\n"
@@ -274,7 +279,7 @@ int main(int argc, char** argv) {
     // frames once an iPhone connects.
     ap::video::VideoRenderer renderer;
     renderer.set_live_settings(&live_settings);
-    if (!renderer.start("AirPlay-Windows")) {
+    if (!renderer.start("AirPlay-Windows", start_hidden)) {
         LOG_WARN << "VideoRenderer could not start — running headless";
     }
     // Prefer the v4 address on the idle screen (shorter, more familiar),
