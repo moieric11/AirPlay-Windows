@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <optional>
 #include <mutex>
 #include <csignal>
@@ -309,12 +310,12 @@ int main(int argc, char** argv) {
 
     struct AudioRequest { ap::airplay::MediaCommand command; uint32_t position; std::string session_id; };
     std::mutex audio_request_mutex;
-    std::optional<AudioRequest> audio_request;
+    std::deque<AudioRequest> audio_requests;
     renderer.set_audio_control_handler([&](ap::airplay::MediaCommand command, uint32_t position) {
         ap::video::VideoRenderer::DeviceInfo device;
         renderer.active_device_snapshot(device);
         std::lock_guard<std::mutex> lock(audio_request_mutex);
-        audio_request = AudioRequest{command, position, device.session_id};
+        audio_requests.push_back({command, position, device.session_id});
     });
 
     // Local HTTP proxy + libavformat player only when the HLS path is
@@ -367,7 +368,10 @@ int main(int argc, char** argv) {
         std::optional<AudioRequest> request;
         {
             std::lock_guard<std::mutex> lock(audio_request_mutex);
-            request.swap(audio_request);
+            if (!audio_requests.empty()) {
+                request = std::move(audio_requests.front());
+                audio_requests.pop_front();
+            }
         }
         if (request) {
             const bool success = server.control_audio(request->command, request->position, request->session_id);
