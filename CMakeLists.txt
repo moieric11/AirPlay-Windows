@@ -426,6 +426,8 @@ if(WIN32)
     # /ENTRY override avoids having to add a WinMain stub.
     set_target_properties(airplay-windows PROPERTIES WIN32_EXECUTABLE TRUE)
     if(MSVC)
+        set_source_files_properties(src/platform/desktop_controls.cpp PROPERTIES
+            COMPILE_OPTIONS "/std:c++20")
         target_link_options(airplay-windows PRIVATE "/ENTRY:mainCRTStartup")
     endif()
 endif()
