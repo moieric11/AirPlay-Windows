@@ -151,9 +151,9 @@ struct DacpRemote::ResolveState {
 
 DacpRemote::DacpRemote(std::string peer_ip) : peer_ip_(std::move(peer_ip)) {}
 DacpRemote::~DacpRemote() { if (resolve_) resolve_->cancel_query(); }
-void DacpRemote::update(const std::string& id, const std::string& token, bool audio_only, const std::string& session_id) {
+void DacpRemote::update(const std::string& id, const std::string& token, bool session_active, const std::string& session_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    audio_only_ = audio_only;
+    session_active_ = session_active;
     session_id_ = session_id;
     if (!token.empty()) active_remote_ = remote_token(token) ? token : std::string{};
     if (!id.empty() && id != dacp_id_) {
@@ -165,7 +165,7 @@ void DacpRemote::update(const std::string& id, const std::string& token, bool au
 }
 bool DacpRemote::available(const std::string& session_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!audio_only_ || active_remote_.empty() || !resolve_ ||
+    if (!session_active_ || active_remote_.empty() || !resolve_ ||
         (!session_id.empty() && session_id != session_id_)) return false;
     std::lock_guard<std::mutex> resolve_lock(resolve_->mutex);
     return resolve_->port != 0;
@@ -175,7 +175,7 @@ bool DacpRemote::send(MediaCommand command, uint32_t position_ms, const std::str
     std::string token;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!audio_only_ || (!session_id.empty() && session_id != session_id_)) return false;
+        if (!session_active_ || (!session_id.empty() && session_id != session_id_)) return false;
         state = resolve_;
         token = active_remote_;
     }

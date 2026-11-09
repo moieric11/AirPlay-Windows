@@ -60,7 +60,7 @@ public:
 
     // Initialise SDL, create the window at a default size, start the
     // rendering thread. Returns false on SDL failure.
-    bool start(const std::string& title = "AirPlay-Windows");
+    bool start(const std::string& title = "AirPlay-Windows", bool start_hidden = false);
 
     // Tell the thread to exit, join it, tear down SDL.
     void stop();
@@ -197,7 +197,7 @@ public:
     bool user_closed() const { return closed_.load(); }
 
 private:
-    void run(const std::string& title);
+    void run(const std::string& title, bool start_hidden);
 
     std::atomic<bool> running_{false};
     std::atomic<bool> show_requested_{false};

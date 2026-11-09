@@ -14,7 +14,7 @@ class SingleInstance {
 public:
     enum class Result { Primary, Secondary, Error };
 
-    Result acquire() {
+    Result acquire(bool activate = true) {
         event_ = CreateEventW(nullptr, FALSE, FALSE,
                               L"Local\\AirPlay-Windows.Activate.v1");
         if (!event_) return Result::Error;
@@ -24,6 +24,7 @@ public:
         if (!mutex_) return Result::Error;
         if (error != ERROR_ALREADY_EXISTS) return Result::Primary;
 
+        if (!activate) return Result::Secondary;
         // Give only this application's window permission to take foreground.
         EnumWindows([](HWND window, LPARAM) -> BOOL {
             if (!GetPropW(window, kInstanceWindowProperty)) return TRUE;

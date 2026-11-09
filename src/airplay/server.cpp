@@ -92,7 +92,7 @@ void Server::handle_client(ap::net::ClientSocket client) {
         }
         Response res = dispatch(ctx_, session, req);
         remote->update(req.header("dacp-id"), req.header("active-remote"),
-                       session.streams && session.streams->audio_only(),
+                       session.streams && session.streams->media_control_active(),
                        session.streams ? session.streams->session_id() : std::string{});
         if (client.cancelled->load()) break;
         if (res.silent) continue;

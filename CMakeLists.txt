@@ -301,6 +301,7 @@ add_executable(airplay-windows
     src/main.cpp
     src/log.cpp
     src/settings.cpp
+    src/platform/desktop_controls.cpp
     src/net/socket.cpp
     src/net/tcp_server.cpp
     src/mdns/mdns_service.cpp
@@ -418,13 +419,15 @@ if(WIN32)
     # VideoRenderer window.
     target_link_libraries(airplay-windows PRIVATE
         ws2_32 iphlpapi dnsapi dwmapi d3d11
-        setupapi shell32 ole32 oleaut32)   # USB, Lockdown lookup and firewall COM API
+        setupapi shell32 ole32 oleaut32 windowsapp)   # USB, Lockdown lookup and firewall COM API
 
     # Released as a GUI app so no empty console window pops up when
     # launched from File Explorer. main() stays the entry point — the
     # /ENTRY override avoids having to add a WinMain stub.
     set_target_properties(airplay-windows PROPERTIES WIN32_EXECUTABLE TRUE)
     if(MSVC)
+        set_source_files_properties(src/platform/desktop_controls.cpp PROPERTIES
+            COMPILE_OPTIONS "/std:c++20")
         target_link_options(airplay-windows PRIVATE "/ENTRY:mainCRTStartup")
     endif()
 endif()

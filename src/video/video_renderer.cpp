@@ -1,4 +1,5 @@
 #include "video/video_renderer.h"
+#include "platform/desktop_controls.h"
 #include "video/video_recorder.h"
 #include "video/gpu_video.h"
 #include "video/cover_art.h"
@@ -397,9 +398,9 @@ AVBufferRef* VideoRenderer::gpu_device_ref() {
     return running_.load() && gpu_device_ ? av_buffer_ref(gpu_device_) : nullptr;
 }
 
-bool VideoRenderer::start(const std::string& title) {
+bool VideoRenderer::start(const std::string& title, bool start_hidden) {
     running_ = true;
-    thread_  = std::thread(&VideoRenderer::run, this, title);
+    thread_  = std::thread(&VideoRenderer::run, this, title, start_hidden);
     return true;
 }
 
@@ -742,7 +743,9 @@ void VideoRenderer::push_frame_nv12(const uint8_t* y,  int y_stride,
     cv_.notify_one();
 }
 
-void VideoRenderer::run(const std::string& title) {
+void VideoRenderer::run(const std::string& title, bool start_hidden) {
+    ap::platform::DesktopControls desktop;
+    bool tray_available = false;
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         LOG_ERROR << "SDL_Init failed: " << SDL_GetError();
         running_ = false;
@@ -788,7 +791,8 @@ void VideoRenderer::run(const std::string& title) {
     }
     SDL_Window*   window   = SDL_CreateWindow(
         title.c_str(), initial_x, initial_y, initial_w, initial_h,
-        SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS);
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS
+            | (start_hidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN));
     // Read the initial vsync preference from LiveSettings (default
     // true). Toggling at runtime is handled by SDL_RenderSetVSync
     // below in the render loop.
@@ -816,13 +820,35 @@ void VideoRenderer::run(const std::string& title) {
              << 'x' << kDefaultWinHeight << ", resizable)";
     SDL_SetWindowMinimumSize(window, 960, 720);
 
+    bool presentation_pending = start_hidden;
+    auto reveal_window = [&]() {
+        if (presentation_pending) {
+            if (live_settings_ && live_settings_->fullscreen.load())
+                SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+            else if ((!live_settings_ || !live_settings_->chromeless.load()) && preferences.window_maximized)
+                SDL_MaximizeWindow(window);
+            presentation_pending = false;
+        }
+        SDL_ShowWindow(window);
+        if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) SDL_RestoreWindow(window);
+        SDL_RaiseWindow(window);
+    };
     GpuVideo gpu_video;
 #if defined(_WIN32)
     SDL_SysWMinfo instance_window_info{};
     SDL_VERSION(&instance_window_info.version);
-    if (SDL_GetWindowWMInfo(window, &instance_window_info))
+    if (SDL_GetWindowWMInfo(window, &instance_window_info)) {
         SetPropW(instance_window_info.info.win.window,
                  ap::platform::kInstanceWindowProperty, reinterpret_cast<HANDLE>(1));
+        tray_available = desktop.start(instance_window_info.info.win.window,
+            [&](bool show) {
+                if (show) reveal_window();
+                else SDL_HideWindow(window);
+            }, [this] { closed_ = true; running_ = false; },
+            [this](ap::airplay::MediaCommand command) {
+                if (audio_control_handler_) audio_control_handler_(command, 0);
+            });
+    }
 #endif
     gpu_video.init(renderer);
     {
@@ -963,10 +989,10 @@ void VideoRenderer::run(const std::string& title) {
         if (live_settings_)
             live_settings_->fullscreen.store(fullscreen, std::memory_order_relaxed);
     };
-    if (fullscreen) {
+    if (fullscreen && !start_hidden) {
         SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
         SDL_ShowCursor(SDL_DISABLE);
-    } else if (!ui.chromeless && preferences.window_maximized) {
+    } else if (!start_hidden && !ui.chromeless && preferences.window_maximized) {
         SDL_MaximizeWindow(window);
     }
 
@@ -978,7 +1004,7 @@ void VideoRenderer::run(const std::string& title) {
         current.recording_encoder = static_cast<int>(recording_options.encoder);
         current.recording_bitrate = recording_options.bitrate_mbps;
         const Uint32 flags = SDL_GetWindowFlags(window);
-        if (!fullscreen && !ui.chromeless && !(flags & SDL_WINDOW_MINIMIZED)) {
+        if (!presentation_pending && !fullscreen && !ui.chromeless && !(flags & SDL_WINDOW_MINIMIZED)) {
             current.window_maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
             if (!current.window_maximized) {
                 SDL_GetWindowPosition(window, &current.window_x, &current.window_y);
@@ -1116,13 +1142,14 @@ void VideoRenderer::run(const std::string& title) {
         }
     };
 
+    if (start_hidden) {
+        if (tray_available) SDL_HideWindow(window);
+        else reveal_window();
+    }
     ap::platform::FirewallMonitor firewall_monitor;
     while (running_.load()) {
         if (show_requested_.exchange(false)) {
-            SDL_ShowWindow(window);
-            if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)
-                SDL_RestoreWindow(window);
-            SDL_RaiseWindow(window);
+            reveal_window();
 #if defined(_WIN32)
             if (instance_window_info.info.win.window)
                 SetForegroundWindow(instance_window_info.info.win.window);
@@ -1188,6 +1215,7 @@ void VideoRenderer::run(const std::string& title) {
             // Always feed ImGui first so focus / hover / capture work.
             ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) {
+                if (tray_available) { SDL_HideWindow(window); continue; }
                 LOG_INFO << "VideoRenderer received SDL_QUIT";
                 closed_  = true;
                 running_ = false;
@@ -1212,6 +1240,7 @@ void VideoRenderer::run(const std::string& title) {
                         if (fullscreen)         toggle_fullscreen();
                         else if (ui.chromeless) ui.chromeless = false;
                         else if (ui.settings_open) ui.settings_open = false;
+                        else if (tray_available) SDL_HideWindow(window);
                         else { closed_ = true; running_ = false; }
                         break;
                     case SDLK_f:
@@ -1359,6 +1388,7 @@ void VideoRenderer::run(const std::string& title) {
 
         // --- Drop the cover if clear_session was called --------------
         if (clear_cover_requested_.exchange(false, std::memory_order_relaxed)) {
+            desktop.artwork(nullptr, 0);
             if (cover_tex) {
                 SDL_DestroyTexture(cover_tex);
                 cover_tex   = nullptr;
@@ -1399,6 +1429,8 @@ void VideoRenderer::run(const std::string& title) {
                 idle_changed = true;
             }
         }
+        if (!pending_cover.empty()) desktop.artwork(pending_cover.data(), pending_cover.size());
+        if (meta_changed) desktop.metadata(t_title, t_artist, t_album);
         if (idle_changed) {
             make_text(fonts_big,   t_idle_name,
                       SDL_Color{255, 255, 255, 255},
@@ -1458,6 +1490,14 @@ void VideoRenderer::run(const std::string& title) {
         const bool playing_now = playing_.load(std::memory_order_relaxed);
         DeviceInfo active_dev;
         const bool has_active_dev = active_device_snapshot(active_dev);
+        const uint32_t media_total = progress_total_ms_.load();
+        uint64_t media_elapsed = progress_elapsed_ms_.load();
+        const int64_t media_pushed = progress_pushed_at_ns_.load();
+        const auto media_now = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        if (playing_now && media_pushed > 0 && media_now > media_pushed)
+            media_elapsed += (media_now - media_pushed) / 1000000;
+        desktop.publish(has_active_dev, playing_now, audio_control_available_.load(),
+            static_cast<uint32_t>(std::min<uint64_t>(media_elapsed, media_total)), media_total);
         const bool show_video =
             video_tex && active_dev.kind != "Audio" && (video_fresh || has_active_dev || !playing_now);
 
@@ -2500,6 +2540,7 @@ void VideoRenderer::run(const std::string& title) {
     ImGui_ImplSDLRenderer2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
+    desktop.stop();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
