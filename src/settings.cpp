@@ -1,4 +1,5 @@
 #include "settings.h"
+#include "ui/i18n.h"
 #include "airplay/live_settings.h"
 #include "airplay/receiver_name.h"
 #include "log.h"
@@ -58,6 +59,9 @@ PersistentSettings load_settings(const std::filesystem::path& path) {
                 if (n >= 240 && n <= 4320) s.mirror_height = n;
             }
             else if (key == "hevc_enabled")   s.hevc_enabled   = std::stoi(val) != 0;
+            else if (key == "hls_playback") {
+                if (val == "0" || val == "1") s.hls_playback = val == "1";
+            }
             else if (key == "max_fps") {
                 const int n = std::stoi(val);
                 if (n >= 1 && n <= 60) s.max_fps = n;
@@ -73,6 +77,12 @@ PersistentSettings load_settings(const std::filesystem::path& path) {
             else if (key == "video_rotation") {
                 const int n = std::stoi(val);
                 if (n >= -1 && n <= 3) s.video_rotation = n;
+            }
+            else if (key == "language") {
+                if (ap::i18n::supported(val)) s.ui.language = val;
+            }
+            else if (key == "dark_theme") {
+                if (val == "0" || val == "1") s.ui.dark_theme = val == "1";
             }
             else if (key == "diagnostics") s.ui.diagnostics = std::stoi(val) != 0;
             else if (key == "window_placement_valid") s.ui.window_placement_valid = std::stoi(val) != 0;
@@ -92,6 +102,50 @@ PersistentSettings load_settings(const std::filesystem::path& path) {
                 }
             }
             else if (key == "recording_directory") s.ui.recording_directory = val;
+            else if (key == "face_swap_source") s.ui.face_swap_source = val;
+            else if (key == "face_swap_models") s.ui.face_swap_models = val;
+            else if (key == "face_swap_cpu_python") s.ui.face_swap_cpu_python = val;
+            else if (key == "face_swap_python") s.ui.face_swap_python = val;
+            else if (key == "face_swap_cpu" && (val == "0" || val == "1")) s.ui.face_swap_backend = val == "1" ? 2 : 0;
+            else if (key == "face_swap_backend") { int n = std::stoi(val); if (n >= 0 && n <= 2) s.ui.face_swap_backend = n; }
+            else if (key == "face_swap_directml_device") { int n = std::stoi(val); if (n >= 0 && n <= 63) s.ui.face_swap_directml_device = n; }
+            else if (key == "face_swap_directml_python") s.ui.face_swap_directml_python = val;
+            else if (key == "face_swap_gpu_resident" && (val == "0" || val == "1")) s.ui.face_swap_gpu_resident = val == "1";
+            else if (key == "face_swap_tensorrt" && (val == "0" || val == "1")) s.ui.face_swap_tensorrt = val == "1";
+            else if (key == "face_swap_swapper_tensorrt" && (val == "0" || val == "1")) s.ui.face_swap_swapper_tensorrt = val == "1";
+            else if (key == "face_swap_mask_shape") {int n=std::stoi(val);if(n>=0 && n<=1)s.ui.face_swap_mask_shape=n;}
+            else if (key == "face_swap_shape_transfer") {int n=std::stoi(val);if(n>=0 && n<=100)s.ui.face_swap_shape_transfer=n;}
+            else if (key == "face_swap_animation") {int n=std::stoi(val);if(n>=0 && n<=1)s.ui.face_swap_animation=n;}
+            else if (key == "face_swap_animation_strength") {int n=std::stoi(val);if(n>=0 && n<=100)s.ui.face_swap_animation_strength=n;}
+            else if (key == "face_swap_landmarker") {int n=std::stoi(val);if(n>=0 && n<=1)s.ui.face_swap_landmarker=n;}
+            else if (key == "face_swap_alignment") {int n=std::stoi(val);if(n>=0 && n<=1)s.ui.face_swap_alignment=n;}
+            else if (key == "face_swap_face_size") {int n=std::stoi(val);if(n>=80 && n<=120)s.ui.face_swap_face_size=n;}
+            else if (key == "face_swap_face_scale") {int n=std::stoi(val);if(n>=80 && n<=120)s.ui.face_swap_face_scale=n;}
+            else if (key == "face_swap_mask_expansion") {int n=std::stoi(val);if(n>=0 && n<=12)s.ui.face_swap_mask_expansion=n;}
+            else if (key == "face_swap_mask_blur") {int n=std::stoi(val);if(n>=0 && n<=50)s.ui.face_swap_mask_blur=n;}
+            else if (key == "face_swap_mask_preview") {int n=std::stoi(val);if(n>=0 && n<=2)s.ui.face_swap_mask_preview=n;}
+            else if (key == "face_swap_mask_top" || key == "face_swap_mask_right" || key == "face_swap_mask_bottom" || key == "face_swap_mask_left") {
+                int n=std::stoi(val);if(n>=0 && n<=45) {
+                    int i=key=="face_swap_mask_top" ? 0 : key=="face_swap_mask_right" ? 1 : key=="face_swap_mask_bottom" ? 2 : 3;
+                    s.ui.face_swap_mask_padding[i]=n;
+                }
+            }
+            else if (key == "face_swap_detector") {int n=std::stoi(val);if(n>=0 && n<=3)s.ui.face_swap_detector=n;}
+            else if (key == "face_swap_parser") {int n=std::stoi(val);if(n>=0 && n<=4)s.ui.face_swap_parser=n;}
+            else if (key == "face_swap_occlusion" && (val=="0" || val=="1")) s.ui.face_swap_occlusion=val=="1";
+            else if (key == "face_swap_swapper_builder") { int n=std::stoi(val); if (n==0 || n==3 || n==5) s.ui.face_swap_swapper_builder=n==3 ? 3 : 5; }
+            else if (key == "face_swap_model") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 4) s.ui.face_swap_model = n;
+            }
+            else if (key == "face_swap_quality") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 2) s.ui.face_swap_quality = n;
+            }
+            else if (key == "face_swap_restoration") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 100) s.ui.face_swap_restoration = n;
+            }
             else if (key == "recording_codec") {
                 const int n = std::stoi(val);
                 if (n >= 0 && n <= 1) s.ui.recording_codec = n;
@@ -134,6 +188,7 @@ bool save_settings(const PersistentSettings& s, const std::filesystem::path& pat
         << "mirror_width="   << s.mirror_width   << '\n'
         << "mirror_height="  << s.mirror_height  << '\n'
         << "hevc_enabled="   << s.hevc_enabled   << '\n'
+        << "hls_playback="   << s.hls_playback   << '\n'
         << "max_fps="        << s.max_fps        << '\n'
         << "refresh_rate="   << s.refresh_rate   << '\n'
         << "mirror_hwaccel=" << s.mirror_hwaccel << '\n'
@@ -141,6 +196,8 @@ bool save_settings(const PersistentSettings& s, const std::filesystem::path& pat
         << "fullscreen="     << s.fullscreen     << '\n'
         << "chromeless="     << s.chromeless     << '\n'
         << "video_rotation=" << s.video_rotation << '\n'
+        << "language=" << (ap::i18n::supported(s.ui.language) ? s.ui.language : "en") << '\n'
+        << "dark_theme=" << s.ui.dark_theme << '\n'
         << "diagnostics=" << s.ui.diagnostics << '\n'
         << "window_placement_valid=" << s.ui.window_placement_valid << '\n'
         << "window_x=" << s.ui.window_x << '\n'
@@ -151,7 +208,39 @@ bool save_settings(const PersistentSettings& s, const std::filesystem::path& pat
         << "recording_directory=" << s.ui.recording_directory << '\n'
         << "recording_codec=" << s.ui.recording_codec << '\n'
         << "recording_encoder=" << s.ui.recording_encoder << '\n'
-        << "recording_bitrate=" << s.ui.recording_bitrate << '\n';
+        << "recording_bitrate=" << s.ui.recording_bitrate << '\n'
+        << "face_swap_source=" << s.ui.face_swap_source << '\n'
+        << "face_swap_models=" << s.ui.face_swap_models << '\n'
+        << "face_swap_cpu_python=" << s.ui.face_swap_cpu_python << '\n'
+        << "face_swap_python=" << s.ui.face_swap_python << '\n'
+        << "face_swap_quality=" << s.ui.face_swap_quality << '\n'
+        << "face_swap_restoration=" << s.ui.face_swap_restoration << '\n'
+        << "face_swap_backend=" << s.ui.face_swap_backend << '\n'
+        << "face_swap_directml_device=" << s.ui.face_swap_directml_device << '\n'
+        << "face_swap_directml_python=" << s.ui.face_swap_directml_python << '\n'
+        << "face_swap_gpu_resident=" << s.ui.face_swap_gpu_resident << '\n'
+        << "face_swap_tensorrt=" << s.ui.face_swap_tensorrt << '\n'
+        << "face_swap_model=" << s.ui.face_swap_model << '\n'
+        << "face_swap_swapper_tensorrt=" << s.ui.face_swap_swapper_tensorrt << '\n'
+        << "face_swap_mask_shape=" << s.ui.face_swap_mask_shape << '\n'
+        << "face_swap_shape_transfer=" << s.ui.face_swap_shape_transfer << '\n'
+        << "face_swap_animation=" << s.ui.face_swap_animation << '\n'
+        << "face_swap_animation_strength=" << s.ui.face_swap_animation_strength << '\n'
+        << "face_swap_landmarker=" << s.ui.face_swap_landmarker << '\n'
+        << "face_swap_alignment=" << s.ui.face_swap_alignment << '\n'
+        << "face_swap_face_size=" << s.ui.face_swap_face_size << '\n'
+        << "face_swap_face_scale=" << s.ui.face_swap_face_scale << '\n'
+        << "face_swap_mask_expansion=" << s.ui.face_swap_mask_expansion << '\n'
+        << "face_swap_mask_blur=" << s.ui.face_swap_mask_blur << '\n'
+        << "face_swap_mask_preview=" << s.ui.face_swap_mask_preview << '\n'
+        << "face_swap_mask_top=" << s.ui.face_swap_mask_padding[0] << '\n'
+        << "face_swap_mask_right=" << s.ui.face_swap_mask_padding[1] << '\n'
+        << "face_swap_mask_bottom=" << s.ui.face_swap_mask_padding[2] << '\n'
+        << "face_swap_mask_left=" << s.ui.face_swap_mask_padding[3] << '\n'
+        << "face_swap_detector=" << s.ui.face_swap_detector << '\n'
+        << "face_swap_parser=" << s.ui.face_swap_parser << '\n'
+        << "face_swap_occlusion=" << s.ui.face_swap_occlusion << '\n'
+        << "face_swap_swapper_builder=" << s.ui.face_swap_swapper_builder << '\n';
     out.close();
     if (!out) {
         LOG_WARN << "settings: could not finish writing " << temporary.u8string();
@@ -177,6 +266,7 @@ PersistentSettings snapshot(const ap::airplay::LiveSettings& live) {
     s.mirror_width   = live.mirror_width.load(std::memory_order_relaxed);
     s.mirror_height  = live.mirror_height.load(std::memory_order_relaxed);
     s.hevc_enabled   = live.hevc_enabled.load(std::memory_order_relaxed);
+    s.hls_playback   = live.hls_playback.load(std::memory_order_relaxed);
     s.max_fps        = live.max_fps.load(std::memory_order_relaxed);
     s.refresh_rate   = live.refresh_rate.load(std::memory_order_relaxed);
     s.mirror_hwaccel = live.mirror_hwaccel.load(std::memory_order_relaxed);

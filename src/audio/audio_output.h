@@ -40,6 +40,7 @@ public:
     uint32_t queued_bytes() const;
     int64_t pending_ns() const;
     void clear();
+    void pause(bool paused);
 
 private:
     unsigned int       device_{0};   // SDL_AudioDeviceID is uint32_t

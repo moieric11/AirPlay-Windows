@@ -1,0 +1,11 @@
+# Optional worker only; use a separate Python 3.11 x64 environment.
+# Install InsightFace separately with --no-deps after this file, to avoid
+# installing CPU onnxruntime over the GPU package (see docs/FACE_SWAP.md).
+onnxruntime-gpu[cuda,cudnn]==1.23.2
+numpy>=1.26,<3
+opencv-python>=4.9,<5
+onnx
+scipy
+scikit-image
+tqdm
+requests

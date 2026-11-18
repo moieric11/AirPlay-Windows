@@ -1,0 +1,124 @@
+{
+  "alphaface_256": {
+    "url": "https://huggingface.co/facefusion/models-3.9.0/resolve/d7d7b8ae2d3dda1ac514df46c01881f0f220b192/alphaface_256.onnx",
+    "sha256": "efcca3ffa1c28b75a007f689b39f7d4716c02810e7fa72d892e175f0b058a2e2",
+    "publisher_crc32": "e73fddf3",
+    "size": 555624110,
+    "license": "Non-Commercial (FaceFusion ONNX export)",
+    "license_url": "https://docs.facefusion.io/introduction/licenses"
+  },
+  "hyperswap_1a_256": {
+    "url": "https://huggingface.co/facefusion/models-3.3.0/resolve/6271ab1c4619ceb2e534d65e0ec973f22a9aec38/hyperswap_1a_256.onnx",
+    "sha256": "c0e98a8a03a238f461ed3d2570e426b49f46745ee400854a60dceeb70c246add",
+    "publisher_crc32": "79e50d4b",
+    "size": 402742682,
+    "license": "ResearchRAIL-MS",
+    "license_url": "https://github.com/facefusion/facefusion-labs/blob/master/hyperswap/LICENSE.md"
+  },
+  "hyperswap_1b_256": {
+    "url": "https://huggingface.co/facefusion/models-3.3.0/resolve/6271ab1c4619ceb2e534d65e0ec973f22a9aec38/hyperswap_1b_256.onnx",
+    "sha256": "5124031789c42f71b9558fb71954ef7aedb6da7ed9fac79293e23c61a792a73e",
+    "publisher_crc32": "36312901",
+    "size": 402742682,
+    "license": "ResearchRAIL-MS",
+    "license_url": "https://github.com/facefusion/facefusion-labs/blob/master/hyperswap/LICENSE.md"
+  },
+  "hyperswap_1c_256": {
+    "url": "https://huggingface.co/facefusion/models-3.3.0/resolve/6271ab1c4619ceb2e534d65e0ec973f22a9aec38/hyperswap_1c_256.onnx",
+    "sha256": "5528c2d76fe9986c99d829278987ef9f3a630cb606db7628d02b57b330f406a5",
+    "publisher_crc32": "83c5ce36",
+    "size": 402742682,
+    "license": "ResearchRAIL-MS",
+    "license_url": "https://github.com/facefusion/facefusion-labs/blob/master/hyperswap/LICENSE.md"
+  },
+  "xseg_1": {
+    "url": "https://huggingface.co/facefusion/models-3.1.0/resolve/c9e3a503d8e84e91c5cd89ee2d510fe5e793e570/xseg_1.onnx",
+    "sha256": "c4d1498b8a03b5fe2a3a5d2ef2a0402ab03bd51edaf5b2d8d5fb764702a97dd3",
+    "size": 70324286,
+    "license": "GPL-3.0 (publisher metadata)",
+    "license_url": "https://github.com/iperov/DeepFaceLab/blob/master/LICENSE"
+  },
+  "bisenet_resnet_18": {
+    "url": "https://huggingface.co/facefusion/models-3.1.0/resolve/c9e3a503d8e84e91c5cd89ee2d510fe5e793e570/bisenet_resnet_18.onnx",
+    "sha256": "2218b6183c26ca5c83303232d682a536c670c13ea9695f716c777d1f244eefe9",
+    "size": 53205356,
+    "license": "MIT (publisher metadata)",
+    "license_url": "https://github.com/yakhyo/face-parsing/blob/main/LICENSE"
+  },
+  "det_10g": {
+    "url": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip",
+    "size": 288621354,
+    "archive_sha256": "80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f",
+    "archive_member": "det_10g.onnx",
+    "member_size": 16923827,
+    "sha256": "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
+    "license": "Non-Commercial Research (InsightFace)",
+    "license_url": "https://github.com/deepinsight/insightface/tree/master/model_zoo#insightface-model-zoo"
+  },
+  "w600k_r50": {
+    "url": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip",
+    "size": 288621354,
+    "archive_sha256": "80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f",
+    "archive_member": "w600k_r50.onnx",
+    "member_size": 174383860,
+    "sha256": "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43",
+    "license": "Non-Commercial Research (InsightFace)",
+    "license_url": "https://github.com/deepinsight/insightface/tree/master/model_zoo#insightface-model-zoo"
+  },
+  "yoloface_8n": {
+    "url": "https://huggingface.co/facefusion/models-3.0.0/resolve/728b9659bd9691bf32cbf7f61af478d94b7ba81e/yoloface_8n.onnx",
+    "sha256": "821cdbb1e65fbbabdde7dd0933f754797a343e56fd962729c61ffcefcd135929",
+    "size": 12659761,
+    "license": "GPL-3.0 (publisher metadata)",
+    "license_url": "https://docs.facefusion.io/introduction/licenses"
+  },
+  "retinaface_10g": {
+    "url": "https://huggingface.co/facefusion/models-3.0.0/resolve/728b9659bd9691bf32cbf7f61af478d94b7ba81e/retinaface_10g.onnx",
+    "sha256": "808399c3d0b40ed340634ed590ae564a7caa09e5659916923a95d4470b54ff5a",
+    "size": 16926877,
+    "license": "Non-Commercial",
+    "license_url": "https://docs.facefusion.io/introduction/licenses"
+  },
+  "yunet_2023_mar": {
+    "url": "https://huggingface.co/facefusion/models-3.4.0/resolve/048c61c265ba4dc737b43856e007c97be330c621/yunet_2023_mar.onnx",
+    "sha256": "490d79bc15c0e958d91c999c566c6a338b310ead96e0274dd004e59dd6abecb9",
+    "size": 232475,
+    "license": "MIT (publisher metadata)",
+    "license_url": "https://docs.facefusion.io/introduction/licenses"
+  },
+  "hrffa": {
+    "url": "https://huggingface.co/facefusion/models-3.9.0/resolve/d7d7b8ae2d3dda1ac514df46c01881f0f220b192/hrffa.onnx",
+    "sha256": "a81fa38e0faeea8bfc623728d730cd26ce6f3381eb59bf2261e8121f0e936f16",
+    "size": 35786177,
+    "license": "MIT (FaceFusion publisher metadata)",
+    "license_url": "https://docs.facefusion.io/introduction/licenses"
+  },
+  "live_portrait_feature_extractor": {
+    "url": "https://huggingface.co/facefusion/models-3.0.0/resolve/728b9659bd9691bf32cbf7f61af478d94b7ba81e/live_portrait_feature_extractor.onnx",
+    "sha256": "980d26afc9af6d1b6c946329df08b89a4a8582c9bb668d9475f5254e69434d15",
+    "size": 3354251,
+    "license": "MIT (LivePortrait; FaceFusion publisher metadata)",
+    "license_url": "https://github.com/KwaiVGI/LivePortrait/blob/main/LICENSE"
+  },
+  "live_portrait_generator": {
+    "url": "https://huggingface.co/facefusion/models-3.0.0/resolve/728b9659bd9691bf32cbf7f61af478d94b7ba81e/live_portrait_generator.onnx",
+    "sha256": "db9274114fed504226c5921fc736b9558505e68682e7448631aea7b62cb3048a",
+    "size": 222263347,
+    "license": "MIT (LivePortrait; FaceFusion publisher metadata)",
+    "license_url": "https://github.com/KwaiVGI/LivePortrait/blob/main/LICENSE"
+  },
+  "live_portrait_motion_extractor": {
+    "url": "https://huggingface.co/facefusion/models-3.0.0/resolve/728b9659bd9691bf32cbf7f61af478d94b7ba81e/live_portrait_motion_extractor.onnx",
+    "sha256": "ef4a00ff50d5d864994eeecb226dc3b298e62afacec8fa4fc8b912835ec4b0ab",
+    "size": 112636642,
+    "license": "MIT (LivePortrait; FaceFusion publisher metadata)",
+    "license_url": "https://github.com/KwaiVGI/LivePortrait/blob/main/LICENSE"
+  },
+  "live_portrait_stitcher": {
+    "url": "https://huggingface.co/facefusion/models-3.0.0/resolve/728b9659bd9691bf32cbf7f61af478d94b7ba81e/live_portrait_stitcher.onnx",
+    "sha256": "c6683427edf3e0c3a86e61b1dea1e6dad56c557f5e711fec93966cfb34fd5f87",
+    "size": 193259,
+    "license": "MIT (LivePortrait; FaceFusion publisher metadata)",
+    "license_url": "https://github.com/KwaiVGI/LivePortrait/blob/main/LICENSE"
+  }
+}

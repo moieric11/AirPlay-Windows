@@ -2,8 +2,13 @@
 #include "platform/desktop_controls.h"
 #include "video/video_recorder.h"
 #include "video/gpu_video.h"
+#include "video/face_swap.h"
+#include "video/face_swap_settings_ui.h"
+#include "video/live_preview_window.h"
+#include "video/standard_settings_ui.h"
 #include "video/cover_art.h"
 #include "video/receiver_ui.h"
+#include "video/ui_fonts.h"
 #include "airplay/live_settings.h"
 #include "airplay/receiver_name.h"
 #include "log.h"
@@ -29,6 +34,7 @@
 #if defined(_WIN32)
     #include <dwmapi.h>
     #include <shobjidl.h>
+    #include <shellapi.h>
     // Duplicate the Win11 backdrop constants locally so we don't require
     // the very latest Windows SDK headers at build time. The DwmApi call
     // is still resolved at runtime against dwmapi.dll, which silently
@@ -50,17 +56,13 @@ extern "C" {
 namespace ap::video {
 namespace {
 
-// Keep the stage spacious; settings occupy a drawer only when requested.
+// Navigation pages share the full content stage.
 constexpr int kDefaultWinWidth  = 1220;
 constexpr int kDefaultWinHeight = 800;
 constexpr int kSidebarWidth     = 190;
-constexpr int kOptionsWidth     = 380;
 constexpr int kStatusLineHeight = 24;
 constexpr int kToolbarHeight    = 45;
-constexpr const char* kRotationModes[] = {
-    "Automatic (device)", "Manual: 0 degrees", "Manual: 90 degrees",
-    "Manual: 180 degrees", "Manual: 270 degrees"
-};
+constexpr const char* kRotationModes[]={"Automatic (device)","Manual: 0 degrees","Manual: 90 degrees","Manual: 180 degrees","Manual: 270 degrees"};
 
 #if defined(_WIN32)
 // Enable the Windows 11 Mica system backdrop on an SDL-owned window.
@@ -80,7 +82,7 @@ void enable_mica_backdrop(SDL_Window* w) {
 // Returns false for Cancel as well as dialog creation errors; in both cases
 // the current path remains untouched.
 bool browse_recording_folder(SDL_Window* w, const std::string& initial,
-                             std::string& selected) {
+                             std::string& selected, bool folder = true, const char* dialog_title = nullptr) {
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
     if (!SDL_GetWindowWMInfo(w, &info)) return false;
@@ -96,9 +98,24 @@ bool browse_recording_folder(SDL_Window* w, const std::string& initial,
     if (SUCCEEDED(hr) && dialog) {
         DWORD options = 0;
         dialog->GetOptions(&options);
-        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
-                           FOS_PATHMUSTEXIST);
-        dialog->SetTitle(L"Choose the recording folder");
+        dialog->SetOptions(options | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST) |
+                           FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        auto wide_text=[](const char* text) {
+            const int count=MultiByteToWideChar(CP_UTF8,0,text,-1,nullptr,0);
+            std::wstring value(static_cast<size_t>(count),L'\0');
+            if (count>0) {
+                MultiByteToWideChar(CP_UTF8,0,text,-1,value.data(),count);
+                value.resize(static_cast<size_t>(count)-1);
+            }
+            return value;
+        };
+        const auto title=wide_text(tr(dialog_title ? dialog_title : folder ? "Choose the recording folder" : "Choose a source face photo"));
+        dialog->SetTitle(title.c_str());
+        if (!folder) {
+            const auto photos=wide_text(tr("Photos"));
+            const COMDLG_FILTERSPEC filters[] = {{photos.c_str(), L"*.jpg;*.jpeg;*.png;*.bmp;*.webp"}};
+            dialog->SetFileTypes(1, filters);
+        }
 
         try {
             const std::wstring initial_w =
@@ -135,35 +152,8 @@ bool browse_recording_folder(SDL_Window* w, const std::string& initial,
 void enable_mica_backdrop(SDL_Window*) {}
 #endif
 
-// Calm, light palette shared by the receiver views and settings drawer.
-void apply_overlay_theme() {
-    ImGui::StyleColorsLight();
-    auto& s = ImGui::GetStyle();
-    s.WindowRounding = 0;
-    s.WindowBorderSize = 0;
-    s.FrameRounding = 8;
-    s.PopupRounding = 8;
-    s.GrabRounding = 8;
-    s.WindowPadding = ImVec2(20, 20);
-    s.FrameBorderSize = 1;
-    s.ScrollbarSize = 10;
-    s.FramePadding = ImVec2(12, 8);
-    s.ItemSpacing = ImVec2(10, 12);
-    auto* c = s.Colors;
-    c[ImGuiCol_WindowBg] = ImVec4(1, 1, 1, 1);
-    c[ImGuiCol_Text] = ImVec4(.125f, .149f, .161f, 1);
-    c[ImGuiCol_TextDisabled] = ImVec4(.45f, .48f, .50f, 1);
-    c[ImGuiCol_Border] = ImVec4(.90f, .91f, .90f, 1);
-    c[ImGuiCol_Separator] = c[ImGuiCol_Border];
-    c[ImGuiCol_FrameBg] = ImVec4(.988f, .992f, .984f, 1);
-    c[ImGuiCol_Button] = ImVec4(.988f, .992f, .984f, 1);
-    c[ImGuiCol_ButtonHovered] = ImVec4(.87f, .91f, .97f, 1);
-    c[ImGuiCol_ButtonActive] = ImVec4(.80f, .86f, .96f, 1);
-    c[ImGuiCol_Header] = ImVec4(1, 1, 1, 1);
-    c[ImGuiCol_HeaderHovered] = c[ImGuiCol_ButtonHovered];
-    c[ImGuiCol_HeaderActive] = c[ImGuiCol_ButtonActive];
-    c[ImGuiCol_PlotHistogram] = ImVec4(.14f, .40f, .92f, 1);
-}
+// Shared palette for receiver views and settings.
+void apply_overlay_theme(bool dark) { receiver_ui::apply_theme(dark); }
 
 void copy_plane(std::vector<unsigned char>& dst,
                 const uint8_t* src, int stride,
@@ -187,10 +177,10 @@ namespace {
 // owns SDL events.
 struct UiState {
     bool chromeless = false;
-    bool settings_open = false;
     bool diagnostics = false;
     int page = 0;
     bool was_connected = false;
+    int content_page = -1;
 };
 
 // Both layouts use a custom title bar. Keep native resize handles at
@@ -217,7 +207,7 @@ SDL_HitTestResult SDLCALL hit_test_cb(SDL_Window* w,
     if (bottom)          return SDL_HITTEST_RESIZE_BOTTOM;
     if (left)            return SDL_HITTEST_RESIZE_LEFT;
     if (right)           return SDL_HITTEST_RESIZE_RIGHT;
-    if (ui && (ui->chromeless || (p->y < kToolbarHeight && p->x < win_w - 144)))
+    if (ui && (ui->chromeless || (p->y < kToolbarHeight && p->x < win_w - 194)))
         return SDL_HITTEST_DRAGGABLE;
     return SDL_HITTEST_NORMAL;
 }
@@ -551,6 +541,7 @@ void VideoRenderer::push_avframe(const AVFrame* src, int64_t origin_ns) {
         std::lock_guard<std::mutex> lock(mtx_);
         // Move-assign: drops the previous frame's ref via
         // av_frame_free in DecodedFrame::operator=.
+        if (has_avframe_) avframes_replaced_.fetch_add(1,std::memory_order_relaxed);
         slot_avframe_   = DecodedFrame{clone};
         frame_w_        = clone->width;
         frame_h_        = clone->height;
@@ -834,6 +825,70 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         SDL_RaiseWindow(window);
     };
     GpuVideo gpu_video;
+    FaceSwap face_swap;
+    FaceSwapDownload face_swap_download;
+    FaceSwapPythonSetup python_setup;
+    bool python_setup_pending=false;
+    int python_setup_backend=-1;
+    face_swap.set_result_callback([this] {
+        // Pair notification with the renderer wait mutex, avoiding a lost
+        // wakeup between its ready-result predicate and wait_for().
+        std::lock_guard<std::mutex> lock(mtx_); cv_.notify_one();
+    });
+    FaceSwapSettingsUi face_swap_controls;
+    LivePreviewWindow live_preview;
+    auto& face_swap_enabled = face_swap_controls.enabled;
+    auto& face_swap_source = face_swap_controls.source;
+    auto& face_swap_models = face_swap_controls.models;
+    auto& face_swap_python = face_swap_controls.python;
+    const auto face_swap_runtime = FaceSwapRuntime::discover();
+    auto python_for_backend=[&](int backend) -> std::array<char,4096>& {
+        return backend==1 ? face_swap_controls.directml_python : backend==2 ? face_swap_controls.cpu_python : face_swap_controls.python;
+    };
+    std::snprintf(face_swap_controls.cpu_python.data(),face_swap_controls.cpu_python.size(),"%s",
+        !preferences.face_swap_cpu_python.empty() ? preferences.face_swap_cpu_python.c_str() :
+        preferences.face_swap_backend==2 && !preferences.face_swap_python.empty() ? preferences.face_swap_python.c_str() : face_swap_runtime.cpu_python.c_str());
+    auto& face_swap_quality = face_swap_controls.quality;
+    face_swap_quality = preferences.face_swap_quality;
+    auto& face_swap_restoration = face_swap_controls.restoration;
+    face_swap_restoration = preferences.face_swap_restoration;
+    auto& face_swap_gpu_resident = face_swap_controls.gpu_resident;
+    face_swap_gpu_resident = preferences.face_swap_gpu_resident;
+    face_swap_controls.backend = preferences.face_swap_backend;
+    face_swap_controls.directml_device = preferences.face_swap_directml_device;
+    face_swap_controls.adapters = FaceSwapRuntime::directml_adapters();
+    std::snprintf(face_swap_controls.directml_python.data(),face_swap_controls.directml_python.size(),"%s",
+        preferences.face_swap_directml_python.empty() ? face_swap_runtime.directml_python.c_str() : preferences.face_swap_directml_python.c_str());
+    auto& face_swap_tensorrt = face_swap_controls.tensorrt;
+    face_swap_tensorrt = preferences.face_swap_tensorrt;
+    auto& face_swap_model = face_swap_controls.model;
+    face_swap_model = preferences.face_swap_model;
+    auto& face_swap_swapper_tensorrt = face_swap_controls.swapper_tensorrt;
+    face_swap_swapper_tensorrt = preferences.face_swap_swapper_tensorrt;
+    face_swap_controls.swapper_builder = preferences.face_swap_swapper_builder;
+    face_swap_controls.occlusion = preferences.face_swap_occlusion;
+    face_swap_controls.mask_shape = preferences.face_swap_mask_shape;
+    face_swap_controls.mask_blur = preferences.face_swap_mask_blur;
+    face_swap_controls.mask_expansion = preferences.face_swap_mask_expansion;
+    face_swap_controls.face_scale = preferences.face_swap_face_scale;
+    face_swap_controls.face_size = preferences.face_swap_face_size;
+    face_swap_controls.alignment = preferences.face_swap_alignment;
+    face_swap_controls.landmarker = preferences.face_swap_landmarker;
+    face_swap_controls.animation = preferences.face_swap_animation;
+    face_swap_controls.animation_strength = preferences.face_swap_animation_strength;
+    face_swap_controls.shape_transfer = preferences.face_swap_shape_transfer;
+    face_swap_controls.mask_preview = preferences.face_swap_mask_preview;
+    face_swap_controls.mask_padding = preferences.face_swap_mask_padding;
+    face_swap_controls.parser = preferences.face_swap_parser;
+    face_swap_controls.detector = preferences.face_swap_detector;
+    std::snprintf(face_swap_source.data(), face_swap_source.size(), "%s", preferences.face_swap_source.c_str());
+    std::snprintf(face_swap_models.data(), face_swap_models.size(), "%s", preferences.face_swap_models.empty()
+        ? face_swap_runtime.models.c_str() : preferences.face_swap_models.c_str());
+    std::snprintf(face_swap_python.data(), face_swap_python.size(), "%s", preferences.face_swap_python.empty()
+        ? face_swap_runtime.python.c_str() : preferences.face_swap_python.c_str());
+    bool face_swap_has_output = false;
+    int face_swap_input_w = 0, face_swap_input_h = 0;
+    auto face_swap_last_output = std::chrono::steady_clock::now();
 #if defined(_WIN32)
     SDL_SysWMinfo instance_window_info{};
     SDL_VERSION(&instance_window_info.version);
@@ -871,7 +926,8 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
     (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
-    apply_overlay_theme();
+    ap::i18n::set_language(preferences.language);
+    apply_overlay_theme(preferences.dark_theme);
     ImFont* heading_font = nullptr;
     ImFont* bold_font = nullptr;
     ImFont* small_font = nullptr;
@@ -879,12 +935,12 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
     ImFont* receiver_font = nullptr;
 #if defined(_WIN32)
     if (std::filesystem::exists("C:/Windows/Fonts/segoeui.ttf")) {
-        io.FontDefault = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/segoeui.ttf", 18.0f);
-        heading_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/seguisb.ttf", 42.0f);
-        bold_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/seguisb.ttf", 18.0f);
-        page_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/seguisb.ttf", 28.0f);
-        small_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/segoeui.ttf", 16.0f);
-        receiver_font = io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/seguisb.ttf", 22.0f);
+        io.FontDefault = ui_fonts::add_font("C:/Windows/Fonts/segoeui.ttf", 18.0f);
+        heading_font = ui_fonts::add_font("C:/Windows/Fonts/seguisb.ttf", 42.0f, true);
+        bold_font = ui_fonts::add_font("C:/Windows/Fonts/seguisb.ttf", 18.0f, true);
+        page_font = ui_fonts::add_font("C:/Windows/Fonts/seguisb.ttf", 28.0f, true);
+        small_font = ui_fonts::add_font("C:/Windows/Fonts/segoeui.ttf", 16.0f);
+        receiver_font = ui_fonts::add_font("C:/Windows/Fonts/seguisb.ttf", 22.0f, true);
     }
 #endif
     if (!io.FontDefault) io.FontDefault = io.Fonts->AddFontDefault();
@@ -1003,6 +1059,35 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         current.recording_codec = static_cast<int>(recording_options.codec);
         current.recording_encoder = static_cast<int>(recording_options.encoder);
         current.recording_bitrate = recording_options.bitrate_mbps;
+        current.face_swap_source = face_swap_source.data();
+        current.face_swap_models = face_swap_models.data();
+        current.face_swap_python = face_swap_python.data();
+        current.face_swap_cpu_python = face_swap_controls.cpu_python.data();
+        current.face_swap_quality = face_swap_quality;
+        current.face_swap_restoration = face_swap_restoration;
+        current.face_swap_gpu_resident = face_swap_gpu_resident;
+        current.face_swap_backend = face_swap_controls.backend;
+        current.face_swap_directml_device = face_swap_controls.directml_device;
+        current.face_swap_directml_python = face_swap_controls.directml_python.data();
+        current.face_swap_tensorrt = face_swap_tensorrt;
+        current.face_swap_model = face_swap_model;
+        current.face_swap_swapper_tensorrt = face_swap_swapper_tensorrt;
+        current.face_swap_mask_shape = face_swap_controls.mask_shape;
+        current.face_swap_mask_blur = face_swap_controls.mask_blur;
+        current.face_swap_mask_expansion = face_swap_controls.mask_expansion;
+        current.face_swap_face_scale = face_swap_controls.face_scale;
+        current.face_swap_face_size = face_swap_controls.face_size;
+        current.face_swap_alignment = face_swap_controls.alignment;
+        current.face_swap_landmarker = face_swap_controls.landmarker;
+        current.face_swap_animation = face_swap_controls.animation;
+        current.face_swap_animation_strength = face_swap_controls.animation_strength;
+        current.face_swap_shape_transfer = face_swap_controls.shape_transfer;
+        current.face_swap_mask_preview = face_swap_controls.mask_preview;
+        current.face_swap_mask_padding = face_swap_controls.mask_padding;
+        current.face_swap_parser = face_swap_controls.parser;
+        current.face_swap_detector = face_swap_controls.detector;
+        current.face_swap_occlusion = face_swap_controls.occlusion;
+        current.face_swap_swapper_builder = face_swap_controls.swapper_builder;
         const Uint32 flags = SDL_GetWindowFlags(window);
         if (!presentation_pending && !fullscreen && !ui.chromeless && !(flags & SDL_WINDOW_MINIMIZED)) {
             current.window_maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
@@ -1049,6 +1134,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         live_settings_->mirror_width.store(mirror_w);
         live_settings_->mirror_height.store(mirror_h);
         live_settings_->hevc_enabled.store(defaults.hevc_enabled);
+        live_settings_->hls_playback.store(defaults.hls_playback);
         live_settings_->max_fps.store(defaults.max_fps);
         live_settings_->refresh_rate.store(defaults.refresh_rate);
         live_settings_->mirror_hwaccel.store(defaults.mirror_hwaccel);
@@ -1057,6 +1143,39 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         live_settings_->fullscreen.store(defaults.fullscreen);
         live_settings_->chromeless.store(defaults.chromeless);
         preferences = defaults.ui;
+        face_swap_download.cancel();
+        python_setup.cancel();python_setup_pending=false;python_setup_backend=-1;
+        face_swap.stop();
+        face_swap_enabled = face_swap_has_output = false;
+        face_swap_source.fill(0);
+        face_swap_quality = defaults.ui.face_swap_quality;
+        face_swap_restoration = defaults.ui.face_swap_restoration;
+        face_swap_gpu_resident = defaults.ui.face_swap_gpu_resident;
+        face_swap_controls.backend = defaults.ui.face_swap_backend;
+        face_swap_controls.directml_device = defaults.ui.face_swap_directml_device;
+        std::snprintf(face_swap_controls.directml_python.data(),face_swap_controls.directml_python.size(),"%s",face_swap_runtime.directml_python.c_str());
+        face_swap_tensorrt = defaults.ui.face_swap_tensorrt;
+        face_swap_model = defaults.ui.face_swap_model;
+        face_swap_swapper_tensorrt = defaults.ui.face_swap_swapper_tensorrt;
+        face_swap_controls.swapper_builder = defaults.ui.face_swap_swapper_builder;
+        face_swap_controls.occlusion = defaults.ui.face_swap_occlusion;
+        face_swap_controls.mask_shape = defaults.ui.face_swap_mask_shape;
+        face_swap_controls.mask_blur = defaults.ui.face_swap_mask_blur;
+        face_swap_controls.mask_expansion = defaults.ui.face_swap_mask_expansion;
+        face_swap_controls.face_scale = defaults.ui.face_swap_face_scale;
+        face_swap_controls.face_size = defaults.ui.face_swap_face_size;
+        face_swap_controls.alignment = defaults.ui.face_swap_alignment;
+        face_swap_controls.landmarker = defaults.ui.face_swap_landmarker;
+        face_swap_controls.animation = defaults.ui.face_swap_animation;
+        face_swap_controls.animation_strength = defaults.ui.face_swap_animation_strength;
+        face_swap_controls.shape_transfer = defaults.ui.face_swap_shape_transfer;
+        face_swap_controls.mask_preview = defaults.ui.face_swap_mask_preview;
+        face_swap_controls.mask_padding = defaults.ui.face_swap_mask_padding;
+        face_swap_controls.parser = defaults.ui.face_swap_parser;
+        face_swap_controls.detector = defaults.ui.face_swap_detector;
+        std::snprintf(face_swap_models.data(), face_swap_models.size(), "%s", face_swap_runtime.models.c_str());
+        std::snprintf(face_swap_python.data(), face_swap_python.size(), "%s", face_swap_runtime.python.c_str());
+        std::snprintf(face_swap_controls.cpu_python.data(),face_swap_controls.cpu_python.size(),"%s",face_swap_runtime.cpu_python.c_str());
         live_settings_->set_ui_preferences(preferences);
         std::snprintf(receiver_name_buf.data(),receiver_name_buf.size(),"%s",defaults.receiver_name.c_str());
         std::snprintf(recording_dir.data(),recording_dir.size(),"%s",default_recording_dir.c_str());
@@ -1148,6 +1267,17 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
     }
     ap::platform::FirewallMonitor firewall_monitor;
     while (running_.load()) {
+        const auto python_preparation=python_setup.status();
+        if(python_setup_pending && !python_preparation.active) {
+            python_setup_pending=false;
+            if(python_preparation.complete) {
+                auto& target=python_for_backend(python_setup_backend);
+                std::snprintf(target.data(),target.size(),"%s",python_preparation.python.c_str());
+            }
+        }
+        const auto previous_language = ap::i18n::current_language;
+        ap::i18n::set_language(preferences.language);
+        const bool language_changed = previous_language != ap::i18n::current_language;
         if (show_requested_.exchange(false)) {
             reveal_window();
 #if defined(_WIN32)
@@ -1212,6 +1342,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
 
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            if (live_preview.handle_event(e)) continue;
             // Always feed ImGui first so focus / hover / capture work.
             ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) {
@@ -1236,10 +1367,10 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                 switch (e.key.keysym.sym) {
                     case SDLK_ESCAPE:
                         // ESC peels back layers in order:
-                        // fullscreen first, then chromeless, then quit.
+                        // fullscreen, chromeless, settings, then hide or quit.
                         if (fullscreen)         toggle_fullscreen();
                         else if (ui.chromeless) ui.chromeless = false;
-                        else if (ui.settings_open) ui.settings_open = false;
+                        else if (ui.page==4) ui.page=2;
                         else if (tray_available) SDL_HideWindow(window);
                         else { closed_ = true; running_ = false; }
                         break;
@@ -1283,11 +1414,12 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         // Audio controls/progress need fewer redraws than mirrored video.
         // A newly queued video frame still wakes this wait immediately.
         const auto refresh_wait = std::chrono::milliseconds(audio_only ? 33 : 16);
+        const auto cadence_wait_start=std::chrono::steady_clock::now();
         {
             std::unique_lock<std::mutex> lock(mtx_);
             cv_.wait_for(lock, refresh_wait,
-                         [this] {
-                             return has_avframe_ || has_frame_ ||
+                         [this,&face_swap,&face_swap_enabled] {
+                             return (face_swap_enabled && face_swap.has_result()) || has_avframe_ || has_frame_ ||
                                     cover_dirty_ || !running_.load();
                          });
             if (has_avframe_) {
@@ -1312,6 +1444,47 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             }
         }
 
+        const double cadence_wait_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-cadence_wait_start).count();
+        const bool cadence_input=have_avf;
+        bool cadence_swapped=false,cadence_held=false;
+
+        const bool session_cleared=clear_cover_requested_.exchange(false,std::memory_order_relaxed);
+        if (session_cleared) {
+            // Model preparation belongs to the engine, not to an AirPlay session.
+            // Drop old video, but keep the worker and its in-flight build alive.
+            face_swap.detach_video();
+            face_swap_has_output=false;
+            face_swap_input_w=face_swap_input_h=0;
+            avf_local=DecodedFrame();
+            have_avf=have_frame=have_nv12=false;
+        }
+
+        // Submit newly decoded input independently of completed-result delivery.
+        // A completed swap wakes the renderer even if the source is currently
+        // idle; waiting for the next input otherwise loses finished outputs.
+        if (face_swap_enabled) {
+            if (have_avf && avf_local.frame) {
+                if (w != face_swap_input_w || h != face_swap_input_h) face_swap_has_output = false;
+                face_swap_input_w = w; face_swap_input_h = h;
+                face_swap.submit(avf_local.frame, frame_origin_ns_local);
+            }
+            if (face_swap_input_w>0 && face_swap_input_h>0) {
+                if (AVFrame* swapped = face_swap.take(face_swap_input_w, face_swap_input_h, frame_origin_ns_local)) {
+                    cadence_swapped=true;
+                    avf_local = DecodedFrame{swapped};
+                    have_avf=true; have_frame=false; have_nv12=false;
+                    w=swapped->width; h=swapped->height;
+                    face_swap_has_output=true;
+                    face_swap_last_output=std::chrono::steady_clock::now();
+                } else if (have_avf && face_swap_has_output && !face_swap.failed() &&
+                           std::chrono::steady_clock::now()-face_swap_last_output <
+                               std::chrono::milliseconds(face_swap_controls.backend==2 ? 60000 : face_swap_controls.backend==1 ? 5000 : 500)) {
+                    // Retain the last completed swap between results.
+                    cadence_held=true; have_avf=false;
+                } else if (have_avf) face_swap_has_output=false;
+            }
+        }
+
         // Decide the SDL pixel format to use; depends on which path
         // delivered the frame.
         Uint32 desired_fmt = SDL_PIXELFORMAT_IYUV;
@@ -1321,6 +1494,8 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                 desired_fmt = SDL_PIXELFORMAT_ARGB8888;
             } else if (af->format == AV_PIX_FMT_NV12) {
                 desired_fmt = SDL_PIXELFORMAT_NV12;
+            } else if (af->format == AV_PIX_FMT_BGR24) {
+                desired_fmt = SDL_PIXELFORMAT_BGR24;
             } else {
                 desired_fmt = SDL_PIXELFORMAT_IYUV;
             }
@@ -1343,6 +1518,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                 LOG_INFO << "VideoRenderer texture ("
                          << (desired_fmt == SDL_PIXELFORMAT_NV12 ? "NV12"
                              : desired_fmt == SDL_PIXELFORMAT_ARGB8888 ? "GPU BGRA"
+                             : desired_fmt == SDL_PIXELFORMAT_BGR24 ? "Face-swap RGB"
                                                                      : "IYUV")
                          << ") created " << w << 'x' << h;
             }
@@ -1358,6 +1534,8 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                             SDL_DestroyTexture(video_tex);
                             video_tex = nullptr;
                         }
+                    } else if (af->format == AV_PIX_FMT_BGR24) {
+                        SDL_UpdateTexture(video_tex, nullptr, af->data[0], af->linesize[0]);
                     } else if (af->format == AV_PIX_FMT_NV12) {
                         SDL_UpdateNVTexture(video_tex, nullptr,
                             af->data[0], af->linesize[0],
@@ -1387,7 +1565,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         // its CopySubresourceRegion to the GPU.
 
         // --- Drop the cover if clear_session was called --------------
-        if (clear_cover_requested_.exchange(false, std::memory_order_relaxed)) {
+        if (session_cleared) {
             desktop.artwork(nullptr, 0);
             if (cover_tex) {
                 SDL_DestroyTexture(cover_tex);
@@ -1412,7 +1590,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         // --- Consume pending metadata + idle info --------------------
         std::string t_title, t_artist, t_album, t_idle_name, t_idle_ip;
         bool meta_changed = false;
-        bool idle_changed = false;
+        bool idle_changed = language_changed;
         {
             std::lock_guard<std::mutex> lock(meta_mtx_);
             if (meta_dirty_) {
@@ -1438,7 +1616,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             make_text(fonts_small, t_idle_ip,
                       SDL_Color{180, 180, 180, 255},
                       idle_ip_tex,   idle_ip_w,   idle_ip_h);
-            make_text(fonts_small, "Waiting for AirPlay",
+            make_text(fonts_small, tr("Waiting for AirPlay"),
                       SDL_Color{150, 150, 150, 255},
                       idle_msg_tex,  idle_msg_w,  idle_msg_h);
         }
@@ -1517,7 +1695,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         const bool firewall_notice=firewall.state!=ap::platform::FirewallState::Checking &&
             firewall.state!=ap::platform::FirewallState::Allowed;
         const int firewall_offset=firewall_notice ? (firewall.message.empty()?124:150) : 0;
-        const int options_w     = 0; // Settings overlay the content, as in the approved design.
+        const int options_w     = 0; // Settings use the same content stage as other pages.
         const int chrome_top    = no_chrome ? 0 : kToolbarHeight;
         const int diagnostics_columns = std::clamp((full_w - 20) / 300, 1, 4);
         const int diagnostics_rows = (9 + diagnostics_columns - 1) / diagnostics_columns;
@@ -1540,7 +1718,9 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         // then clip subsequent SDL draws to the stage rect via
         // viewport — the ImGui panels will paint over the cleared
         // sides afterwards.
-        SDL_SetRenderDrawColor(renderer, no_chrome ? 0 : 245, no_chrome ? 0 : 246, no_chrome ? 0 : 244, 255);
+        const bool dark_background = preferences.dark_theme;
+        SDL_SetRenderDrawColor(renderer, no_chrome ? 0 : dark_background ? 22 : 245,
+            no_chrome ? 0 : dark_background ? 27 : 246, no_chrome ? 0 : dark_background ? 34 : 244, 255);
         SDL_RenderClear(renderer);
         const bool framed_video = !no_chrome && show_video;
         const SDL_Rect stage_rect{stage_x + (framed_video ? 42 : 0), stage_y + (framed_video ? 96 + firewall_offset : 0),
@@ -1660,6 +1840,8 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         // video / cover / idle texture is still visible.
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
+        if (receiver_ui::dark != preferences.dark_theme) apply_overlay_theme(preferences.dark_theme);
+        ap::i18n::set_language(preferences.language);
         ImGui::NewFrame();
 
         const ImGuiWindowFlags kPanelFlags =
@@ -1671,7 +1853,6 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         const float status_bar_h = static_cast<float>(chrome_bottom);
         const float toolbar_h    = static_cast<float>(kToolbarHeight);
         const float side_bar_w   = static_cast<float>(kSidebarWidth);
-        const float opts_bar_w   = static_cast<float>(std::min(kOptionsWidth, full_w / 2));
         const float fw           = static_cast<float>(full_w);
         const float fh           = static_cast<float>(full_h);
 
@@ -1694,7 +1875,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             draw->AddRectFilled(p,ImVec2(p.x+width,p.y+3),IM_COL32(225,229,223,255),2);
             if (progress > 0) draw->AddRectFilled(p,ImVec2(p.x+width*progress,p.y+3),IM_COL32(87,106,89,255),2);
             ImGui::Dummy(ImVec2(width,5));
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Playback position (read-only)");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Playback position (read-only)"));
             ImGui::PushFont(small_font);
             ImGui::TextDisabled("%u:%02u",static_cast<unsigned>(elapsed/60000),static_cast<unsigned>((elapsed/1000)%60));
             char duration[32]; std::snprintf(duration,sizeof(duration),"%u:%02u",total/60000,(total/1000)%60);
@@ -1708,17 +1889,17 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             const ImVec2 row = ImGui::GetCursorPos();
             ImGui::BeginDisabled(!ready || pending);
             ImGui::SetCursorPos(ImVec2(row.x,row.y+10.5f));
-            if (ui_draw::icon_button("##previous",ui_draw::Icon::Previous,"Previous track",32)) command(ap::airplay::MediaCommand::Previous);
+            if (ui_draw::icon_button("##previous",ui_draw::Icon::Previous,tr("Previous track"),32)) command(ap::airplay::MediaCommand::Previous);
             ImGui::SetCursorPos(ImVec2(row.x+51,row.y));
-            if (ui_draw::icon_button("##play",playing_now ? ui_draw::Icon::Pause : ui_draw::Icon::Play,playing_now ? "Pause" : "Play",53,true)) command(ap::airplay::MediaCommand::PlayPause);
+            if (ui_draw::icon_button("##play",playing_now ? ui_draw::Icon::Pause : ui_draw::Icon::Play,playing_now ? tr("Pause") : tr("Play"),53,true)) command(ap::airplay::MediaCommand::PlayPause);
             ImGui::SetCursorPos(ImVec2(row.x+123,row.y+10.5f));
-            if (ui_draw::icon_button("##next",ui_draw::Icon::Next,"Next track",32)) command(ap::airplay::MediaCommand::Next);
+            if (ui_draw::icon_button("##next",ui_draw::Icon::Next,tr("Next track"),32)) command(ap::airplay::MediaCommand::Next);
             ImGui::EndDisabled();
             ImGui::SetCursorPos(ImVec2(row.x,row.y+65));
             ImGui::PushFont(small_font);
-            if (pending) ImGui::TextDisabled("Sending command...");
-            else if (!ready) ImGui::TextDisabled("Remote control unavailable");
-            else if (audio_command_failed_.load()) ImGui::TextDisabled("Command failed or unsupported");
+            if (pending) ImGui::TextDisabled(tr("Sending command..."));
+            else if (!ready) ImGui::TextDisabled(tr("Remote control unavailable"));
+            else if (audio_command_failed_.load()) ImGui::TextDisabled(tr("Command failed or unsupported"));
             ImGui::PopFont();
         };
 
@@ -1730,8 +1911,8 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         // chromeless, ESC peels back layers. The pulsing "Waiting
         // for AirPlay" ring stays drawn — it's part of the stage.
         if (!no_chrome) {
-        if (has_active_dev && !ui.was_connected) ui.page = active_dev.kind == "Audio" ? 1 : 2;
-        if (!has_active_dev && ui.was_connected) ui.page = 0;
+        if (has_active_dev && !ui.was_connected && ui.page < 3) ui.page = active_dev.kind == "Audio" ? 1 : 2;
+        if (!has_active_dev && ui.was_connected && ui.page < 3) ui.page = 0;
         ui.was_connected = has_active_dev;
         const char* receiver = receiver_name_buf.data();
         const ImU32 ink = ui_draw::ink, muted = ui_draw::muted, line = ui_draw::line;
@@ -1743,11 +1924,20 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         ui_draw::icon(title_draw,ui_draw::Icon::Cast,ImVec2(20,12),20,ui_draw::blue);
         title_draw->AddText(bold_font,16,ImVec2(50,12),ink,"AirPlay Windows");
         title_draw->AddLine(ImVec2(0,44),ImVec2(fw,44),line);
+        ImGui::SetCursorPos(ImVec2(fw-190,4));
+        if (ui_draw::icon_button("##theme", ui_draw::dark ? ui_draw::Icon::Sun : ui_draw::Icon::Moon,
+                ui_draw::dark ? tr("Switch to light theme") : tr("Switch to dark theme"), 36))
+        {
+            auto current = preferences;
+            current.dark_theme = !current.dark_theme;
+            if (live_settings_) live_settings_->set_ui_preferences(current);
+            preferences = current;
+        }
         ImGui::SetCursorPos(ImVec2(fw-144,0));
         auto window_control = [&](const char* id, ui_draw::Icon kind) {
             const ImVec2 pos=ImGui::GetCursorScreenPos();
             const bool click=ui_draw::surface(id,ImVec2(48,44));
-            if (ImGui::IsItemHovered()) title_draw->AddRectFilled(pos,ImVec2(pos.x+48,pos.y+44),kind==ui_draw::Icon::Close ? IM_COL32(247,220,220,255) : IM_COL32(239,242,239,255));
+            if (ImGui::IsItemHovered()) title_draw->AddRectFilled(pos,ImVec2(pos.x+48,pos.y+44),kind==ui_draw::Icon::Close ? ui_draw::themed(IM_COL32(247,220,220,255),IM_COL32(100,40,48,255)) : ui_draw::themed(IM_COL32(239,242,239,255),IM_COL32(53,67,85,255)));
             ui_draw::icon(title_draw,kind,ImVec2(pos.x+14,pos.y+12),20,muted);
             return click;
         };
@@ -1766,26 +1956,31 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         ImGui::Begin("##navigation",nullptr,kPanelFlags|ImGuiWindowFlags_NoScrollbar);
         auto* rail=ImGui::GetWindowDrawList();
         rail->AddLine(ImVec2(side_bar_w-1,toolbar_h),ImVec2(side_bar_w-1,fh-status_bar_h),line);
-        ImGui::PushFont(small_font); ImGui::SetCursorPosX(26); ImGui::TextDisabled("YOUR SPACE"); ImGui::PopFont();
+        ImGui::PushFont(small_font); ImGui::SetCursorPosX(26); ImGui::TextDisabled(tr("YOUR SPACE")); ImGui::PopFont();
         ImGui::Dummy(ImVec2(0,5));
-        if (ui_draw::nav("##home","Home",ui_draw::Icon::Home,ui.page==0,162,ui.page==0?bold_font:io.FontDefault)) ui.page=0;
-        if (ui_draw::nav("##music","Music",ui_draw::Icon::Music,ui.page==1,162,ui.page==1?bold_font:io.FontDefault)) ui.page=1;
-        if (ui_draw::nav("##mirror","Screen mirroring",ui_draw::Icon::Screen,ui.page==2,162,ui.page==2?bold_font:io.FontDefault)) ui.page=2;
-        ImGui::SetCursorPosY(fh-toolbar_h-status_bar_h-150);
-        if (ui_draw::nav("##settings","Settings",ui_draw::Icon::Settings,ui.settings_open,162,io.FontDefault)) ui.settings_open=!ui.settings_open;
+        if (ui_draw::nav("##home",tr("Home"),ui_draw::Icon::Home,ui.page==0,162,ui.page==0?bold_font:io.FontDefault)) ui.page=0;
+        if (ui_draw::nav("##music",tr("Music"),ui_draw::Icon::Music,ui.page==1,162,ui.page==1?bold_font:io.FontDefault)) ui.page=1;
+        if (ui_draw::nav("##mirror",tr("Screen mirroring"),ui_draw::Icon::Screen,ui.page==2,162,ui.page==2?bold_font:io.FontDefault)) ui.page=2;
+        ImGui::SetCursorPosY(fh-toolbar_h-status_bar_h-202);
+        if (ui_draw::nav("##faceswap",tr("Faceswap Settings"),ui_draw::Icon::Face,ui.page==3,162,small_font)) {
+            ui.page=3;
+        }
+        if (ui_draw::nav("##settings",tr("Settings"),ui_draw::Icon::Settings,ui.page==4,162,io.FontDefault)) ui.page=4;
         ImGui::Separator(); ImGui::Dummy(ImVec2(0,3));
         ImGui::PushFont(small_font);
         ImVec2 p=ImGui::GetCursorScreenPos(); rail->AddCircleFilled(ImVec2(p.x+11,p.y+8),3.5f,IM_COL32(44,161,116,255));
-        ImGui::SetCursorPosX(36); ImGui::TextDisabled(has_active_dev ? "Device connected" : "Receiver available");
+        ImGui::SetCursorPosX(36); ImGui::TextDisabled(has_active_dev ? tr("Device connected") : tr("Receiver available"));
         ImGui::SetCursorPosX(25); ImGui::PushTextWrapPos(side_bar_w-15); ImGui::TextUnformatted(receiver); ImGui::PopTextWrapPos();
         ImGui::PopFont(); ImGui::End(); ImGui::PopStyleVar();
 
+        const bool faceswap_view=ui.page==3;
         const bool music_view=ui.page==1 && has_active_dev && active_dev.kind=="Audio";
         const bool video_view=ui.page==2 && show_video;
         ImGui::SetNextWindowPos(ImVec2(static_cast<float>(stage_x),toolbar_h));
         ImGui::SetNextWindowSize(ImVec2(static_cast<float>(stage_w)-14,static_cast<float>(stage_h)));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(42,0));
-        ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4(245/255.f,246/255.f,244/255.f,1));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg,ui_draw::rgba(ui_draw::paper));
+        if (ui.content_page!=ui.page) { ImGui::SetNextWindowScroll(ImVec2(0,0)); ui.content_page=ui.page; }
         ImGui::Begin("##content",nullptr,kPanelFlags|(video_view ? ImGuiWindowFlags_NoBackground : 0));
         auto* draw=ImGui::GetWindowDrawList();
         ImVec2 origin=ImGui::GetWindowPos();
@@ -1798,37 +1993,166 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         };
         auto decoding_note = [&](float bottom) {
             const bool gpu=live_settings_ && live_settings_->mirror_hwaccel.load();
-            const char* note=gpu ? "GPU acceleration enabled.\nPerformance issues? Try CPU decoding in Settings."
-                                 : "CPU decoding selected.\nGPU acceleration is available in Settings.";
+            const char* note=gpu ? tr("GPU acceleration enabled.\nPerformance issues? Try CPU decoding in Settings.")
+                                 : tr("CPU decoding selected.\nGPU acceleration is available in Settings.");
             const float wrap=std::max(180.f,width-(video_view?506.f:0.f));
             const ImVec2 size=small_font->CalcTextSizeA(14,10000,wrap,note);
             draw->AddText(small_font,14,ImVec2(origin.x+stage_w-42-size.x,origin.y+bottom-size.y),
                           IM_COL32(145,154,147,255),note,nullptr,wrap);
         };
+        if (ui.page==4) {
+            StandardSettingsContext context{live_settings_,receiver_name_buf,recording_dir,recording_options,
+                recorder_->status(),ui.diagnostics,custom_resolution,video_tex_w,video_tex_h,settings_reset_notice_until,
+                [&](std::string& selected) {
+#if defined(_WIN32)
+                    return browse_recording_folder(window,recording_dir.data(),selected);
+#else
+                    return false;
+#endif
+                },toggle_recording,reset_all_settings,[&](const char* language) {
+                    preferences.language = language;
+                    if (live_settings_) live_settings_->set_ui_preferences(preferences);
+                }};
+            if (draw_standard_settings(context,page_font,bold_font,small_font)) ui.page=2;
+        } else if (faceswap_view) {
+            FaceSwapSettingsStatus status;
+            status.message=face_swap.status(); status.log=face_swap.log_path();
+            const auto download=face_swap_download.status();
+            status.downloading=download.active;status.download_message=download.message;
+            status.download_fraction=download.phase=="downloading" && download.total>0 ?
+                static_cast<float>(download.received)/static_cast<float>(download.total) : -1.f;
+            const auto worker_directory=std::filesystem::u8path(face_swap_runtime.worker).parent_path();
+            status.download_directory=((worker_directory.filename()=="engine" ? worker_directory.parent_path() : worker_directory)/"swappers").u8string();
+            status.scrfd_directory=face_swap_models[0] ? face_swap_models.data() : face_swap_runtime.models;
+            const auto preparation=face_swap.preparation();
+            status.preparing=preparation.active; status.preparation_stage=preparation.stage;
+            status.preparation_seconds=preparation.elapsed_seconds;
+            status.failed=face_swap.failed(); status.has_output=face_swap_has_output;
+            std::error_code python_error;
+            status.python_missing=!std::filesystem::is_regular_file(std::filesystem::u8path(python_for_backend(face_swap_controls.backend).data()),python_error);
+            status.python_setup_active=python_preparation.active;
+            if(python_setup_backend==face_swap_controls.backend || python_preparation.active) {
+                status.python_setup_failed=python_preparation.failed;
+                status.python_setup_ready=python_preparation.complete && !status.python_missing;
+                status.python_setup_message=python_preparation.message;
+                status.python_setup_log=python_preparation.log;
+                status.python_setup_fraction=python_preparation.phase=="downloading" && python_preparation.total>0 ?
+                    static_cast<float>(python_preparation.received)/static_cast<float>(python_preparation.total) : -1.f;
+            }
+            status.mirror_connected=has_active_dev && active_dev.kind!="Audio";
+            status.gpu_decoding=live_settings_ && live_settings_->mirror_hwaccel.load();
+            const auto actions=draw_face_swap_settings(face_swap_controls,status,page_font,bold_font,small_font);
+            if (actions.show_preview && !live_preview.show(window,tr("Live video"))) {
+                LOG_WARN << "Cannot open live preview: " << SDL_GetError();
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,tr("Live video"),SDL_GetError(),window);
+            }
+            if(actions.mask_changed && face_swap_enabled && !status.failed)
+                face_swap.set_mask(face_swap_controls.mask_shape,face_swap_controls.mask_blur,
+                    face_swap_controls.mask_preview,face_swap_controls.mask_padding,face_swap_controls.face_scale,face_swap_controls.face_size,face_swap_controls.alignment,face_swap_controls.mask_expansion,face_swap_controls.shape_transfer,face_swap_controls.shape_reset,face_swap_controls.animation_strength);
+#if defined(_WIN32)
+            if (actions.detector_terms || actions.arcface_terms)
+                ShellExecuteW(nullptr,L"open",actions.arcface_terms || face_swap_controls.detector==0 ?
+                    L"https://github.com/deepinsight/insightface/tree/master/model_zoo#insightface-model-zoo" :
+                    L"https://docs.facefusion.io/introduction/licenses",nullptr,nullptr,SW_SHOWNORMAL);
+            if (actions.swapper_terms) {
+                const wchar_t* url=actions.swapper_terms==1 ? L"https://docs.facefusion.io/introduction/licenses" :
+                    L"https://github.com/facefusion/facefusion-labs/blob/master/hyperswap/LICENSE.md";
+                ShellExecuteW(nullptr,L"open",url,nullptr,nullptr,SW_SHOWNORMAL);
+            }
+            if (actions.choose_photo) {
+                std::string selected;
+                if (browse_recording_folder(window,"",selected,false))
+                    std::snprintf(face_swap_source.data(),face_swap_source.size(),"%s",selected.c_str());
+            }
+            if (actions.choose_models) {
+                std::string selected;
+                if (browse_recording_folder(window,face_swap_models.data(),selected,true,"Choose face swap models folder"))
+                    std::snprintf(face_swap_models.data(),face_swap_models.size(),"%s",selected.c_str());
+            }
+#endif
+            if(actions.prepare_python) {
+                face_swap_enabled=face_swap_has_output=false;face_swap.stop();
+                auto runtime=face_swap_runtime;
+                runtime.tensorrt=face_swap_tensorrt;runtime.swapper_tensorrt=face_swap_swapper_tensorrt;
+                python_setup_backend=face_swap_controls.backend;python_setup_pending=true;
+                python_setup.start(std::move(runtime),python_setup_backend);
+            }
+            if(actions.cancel_python)python_setup.cancel();
+#if defined(_WIN32)
+            if(actions.open_python_log && !python_preparation.log.empty()) {
+                const auto path=std::filesystem::u8path(python_preparation.log);
+                ShellExecuteW(nullptr,L"open",path.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+            }
+#endif
+            if (actions.cancel_download) face_swap_download.cancel();
+            if (!python_preparation.active && (actions.download_swapper || actions.download_occluder || actions.download_parser || actions.download_detector || actions.download_landmarker || actions.download_portrait || actions.download_arcface)) {
+                auto runtime=face_swap_runtime;
+                runtime.python=python_for_backend(face_swap_controls.backend).data();runtime.directml=face_swap_controls.backend==1;
+                runtime.directml_python=face_swap_controls.directml_python.data();
+                const int detector_download=face_swap_controls.detector==0 ? FaceSwapDownload::scrfd_model : 6+face_swap_controls.detector;
+                runtime.models=status.scrfd_directory;
+                const int model_to_download=actions.download_arcface ? FaceSwapDownload::arcface_model :
+                    actions.download_portrait ? 11 : actions.download_landmarker ? 10 :
+                    actions.download_detector ? detector_download : actions.download_parser ? 6 :
+                    actions.download_occluder ? 5 : actions.download_swapper;
+                face_swap_download.start(std::move(runtime),model_to_download);
+            }
+            if (actions.mirror) ui.page=2;
+            if (actions.stop) { face_swap_has_output=false; face_swap.stop(); }
+            else if (actions.start) {
+                auto runtime=face_swap_runtime;
+                runtime.models=status.scrfd_directory; runtime.python=python_for_backend(face_swap_controls.backend).data();
+                runtime.quality=face_swap_model==0 ? face_swap_quality : 0;
+                runtime.restoration=face_swap_restoration; runtime.cpu=face_swap_controls.backend==2;
+                runtime.directml=face_swap_controls.backend==1;
+                runtime.directml_python=face_swap_controls.directml_python.data();
+                runtime.directml_device=face_swap_controls.directml_device;
+                runtime.gpu_resident=face_swap_gpu_resident && !runtime.cpu && !runtime.directml;
+                runtime.tensorrt=face_swap_tensorrt; runtime.swapper_model=face_swap_model;
+                runtime.swapper_tensorrt=face_swap_swapper_tensorrt;
+                runtime.swapper_builder=face_swap_controls.swapper_builder;
+                runtime.occlusion=face_swap_controls.occlusion;
+                runtime.mask_shape=face_swap_controls.mask_shape;
+                runtime.mask_blur=face_swap_controls.mask_blur;
+                runtime.mask_expansion=face_swap_controls.mask_expansion;
+                runtime.face_scale=face_swap_controls.face_scale;
+                runtime.face_size=face_swap_controls.face_size;
+                runtime.alignment=face_swap_controls.alignment;
+                runtime.landmarker=face_swap_controls.landmarker;
+                runtime.animation=face_swap_controls.animation;runtime.animation_strength=face_swap_controls.animation_strength;
+                runtime.shape_transfer=face_swap_controls.shape_transfer;runtime.shape_reset=face_swap_controls.shape_reset;
+                runtime.mask_preview=face_swap_controls.mask_preview;
+                runtime.mask_padding=face_swap_controls.mask_padding;
+                runtime.parser=face_swap_controls.parser;
+                runtime.detector=face_swap_controls.detector;
+                face_swap_has_output=false;
+                face_swap.start(face_swap_source.data(),std::move(runtime));
+            }
+        } else {
         if (music_view || video_view) {
-            draw->AddRectFilled(ImVec2(origin.x+42,origin.y+30),ImVec2(origin.x+81,origin.y+69),IM_COL32(255,255,255,255),9);
+            draw->AddRectFilled(ImVec2(origin.x+42,origin.y+30),ImVec2(origin.x+81,origin.y+69),ui_draw::panel,9);
             draw->AddRect(ImVec2(origin.x+42,origin.y+30),ImVec2(origin.x+81,origin.y+69),line,9);
             ui_draw::icon(draw,ui_draw::Icon::Phone,ImVec2(origin.x+51,origin.y+39),21,muted);
-            text_at(bold_font,93,31,ink,active_dev.name.empty()?"Connected device":active_dev.name.c_str());
+            text_at(bold_font,93,31,ink,active_dev.name.empty()?tr("Connected device"):active_dev.name.c_str());
             draw->AddCircleFilled(ImVec2(origin.x+97,origin.y+60),3,IM_COL32(44,161,116,255));
-            text_at(small_font,107,51,muted,music_view ? "Connected · Audio" : "Connected · Screen mirroring");
+            text_at(small_font,107,51,muted,music_view ? tr("Connected · Audio") : tr("Connected · Screen mirroring"));
             if (firewall_notice) {
                 const float badge_x=stage_w-300.f;
                 draw->AddRectFilled(ImVec2(origin.x+badge_x,origin.y+36),ImVec2(origin.x+badge_x+125,origin.y+66),IM_COL32(255,247,227,255),15);
                 draw->AddRect(ImVec2(origin.x+badge_x,origin.y+36),ImVec2(origin.x+badge_x+125,origin.y+66),IM_COL32(235,216,167,255),15);
                 draw->AddCircleFilled(ImVec2(origin.x+badge_x+14,origin.y+51),3.5f,IM_COL32(183,135,41,255));
-                text_at(small_font,badge_x+26,43,IM_COL32(123,87,30,255),"Check firewall");
+                text_at(small_font,badge_x+26,43,IM_COL32(123,87,30,255),tr("Check firewall"));
             }
             ImGui::SetCursorPos(ImVec2(stage_w-150.f,32));
-            if (ui_draw::text_button("Disconnect",ImVec2(108,34)) && disconnect_handler_) disconnect_handler_();
+            if (ui_draw::text_button(tr("Disconnect"),ImVec2(108,34)) && disconnect_handler_) disconnect_handler_();
         } else {
-            text_at(page_font,42,36,ink,ui.page==0 ? "Welcome home." : ui.page==1 ? "Your music on this PC." : "Your screen, live.");
+            text_at(page_font,42,36,ink,ui.page==0 ? tr("Welcome home.") : ui.page==1 ? tr("Your music on this PC.") : tr("Your screen, live."));
             const float badge_x=stage_w-167.f;
             const bool firewall_attention=firewall_notice && !has_active_dev;
             draw->AddRectFilled(ImVec2(origin.x+badge_x,origin.y+36),ImVec2(origin.x+stage_w-42,origin.y+66),firewall_attention ? IM_COL32(255,247,227,255) : IM_COL32(233,243,236,255),15);
             draw->AddRect(ImVec2(origin.x+badge_x,origin.y+36),ImVec2(origin.x+stage_w-42,origin.y+66),firewall_attention ? IM_COL32(235,216,167,255) : IM_COL32(217,234,221,255),15);
             draw->AddCircleFilled(ImVec2(origin.x+badge_x+14,origin.y+51),3.5f,firewall_attention ? IM_COL32(183,135,41,255) : IM_COL32(44,161,116,255));
-            text_at(small_font,badge_x+26,43,firewall_attention ? IM_COL32(123,87,30,255) : IM_COL32(55,117,87,255),has_active_dev ? "Connected" : firewall_attention ? "Check firewall" : "Ready to receive");
+            text_at(small_font,badge_x+26,43,firewall_attention ? IM_COL32(123,87,30,255) : IM_COL32(55,117,87,255),has_active_dev ? tr("Connected") : firewall_attention ? tr("Check firewall") : tr("Ready to receive"));
         }
             if (firewall_notice) {
                 const bool can_allow=firewall.state==ap::platform::FirewallState::NeedsRule;
@@ -1836,16 +2160,16 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                 const ImVec2 a(origin.x+42,origin.y+banner_y), b(origin.x+stage_w-42,origin.y+banner_y+banner_h);
                 draw->AddRectFilled(a,b,IM_COL32(255,247,227,255),10);
                 draw->AddRect(a,b,IM_COL32(235,216,167,255),10);
-                const char* banner_title=can_allow ? "Allow AirPlay through Windows Firewall" :
-                    firewall.state==ap::platform::FirewallState::Managed ? "Windows Firewall blocks incoming connections" : "Firewall check unavailable";
+                const char* banner_title=can_allow ? tr("Allow AirPlay through Windows Firewall") :
+                    firewall.state==ap::platform::FirewallState::Managed ? tr("Windows Firewall blocks incoming connections") : tr("Firewall check unavailable");
                 text_at(bold_font,58,banner_y+14,IM_COL32(123,87,30,255),banner_title);
-                const char* detail=can_allow ? "Allow this app to receive connections from devices on your local network." : firewall.message.c_str();
+                const char* detail=can_allow ? tr("Allow this app to receive connections from devices on your local network.") : firewall.message.c_str();
                 draw->AddText(small_font,16,ImVec2(a.x+16,a.y+44),IM_COL32(131,105,62,255),detail,nullptr,width-210);
                 if (can_allow && !firewall.message.empty())
                     draw->AddText(small_font,16,ImVec2(a.x+16,a.y+82),IM_COL32(131,105,62,255),firewall.message.c_str(),nullptr,width-210);
                 ImGui::SetCursorPos(ImVec2(stage_w-222.f,banner_y+41));
                 ImGui::BeginDisabled(firewall.busy);
-                if (can_allow && ui_draw::text_button(firewall.busy ? "Waiting for Windows..." : "Allow on local network",ImVec2(164,34)))
+                if (can_allow && ui_draw::text_button(firewall.busy ? tr("Waiting for Windows...") : tr("Allow on local network"),ImVec2(164,34)))
                     firewall_monitor.allow_local_network();
                 ImGui::EndDisabled();
             }
@@ -1859,12 +2183,12 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             draw->AddRectFilled(ImVec2(tl.x,tl.y+9),ImVec2(br.x,br.y+9),IM_COL32(48,63,51,12),12);
             if (cover_tex) draw->AddImageRounded((ImTextureID)(intptr_t)cover_tex,tl,br,ImVec2(0,0),ImVec2(1,1),IM_COL32_WHITE,12);
             else {
-                draw->AddRectFilled(tl,br,IM_COL32(231,235,229,255),12);
+                draw->AddRectFilled(tl,br,ui_draw::themed(IM_COL32(231,235,229,255),IM_COL32(42,51,64,255)),12);
                 ui_draw::icon(draw,ui_draw::Icon::Music,ImVec2(tl.x+cover_size/2-25,tl.y+cover_size/2-25),50,IM_COL32(145,158,147,255));
             }
             const float tx=wide?cover_x+cover_size+43:42;
             float ty=wide?cover_y+20:cover_y+cover_size+22;
-            text_at(small_font,tx,ty,muted,playing_now ? "NOW PLAYING" : "PAUSED"); ty+=30;
+            text_at(small_font,tx,ty,muted,playing_now ? tr("NOW PLAYING") : tr("PAUSED")); ty+=30;
             auto track_line=[&](SDL_Texture* texture,int w,int h,float scale,ImU32 tint) {
                 if (!texture || w<=0 || h<=0) return;
                 const float fit=std::min(scale,(stage_w-tx-42)/w);
@@ -1882,18 +2206,18 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                 const float footer_y=std::max(stage_h-78.f,std::max(cover_y+cover_size,ty+188)+35);
                 draw->AddLine(ImVec2(origin.x+42,origin.y+footer_y),ImVec2(origin.x+stage_w-42,origin.y+footer_y),line);
                 ui_draw::icon(draw,ui_draw::Icon::Cast,ImVec2(origin.x+42,origin.y+footer_y+19),16,IM_COL32(114,145,123,255));
-                text_at(small_font,67,footer_y+19,muted,"Playing from your device on this PC");
+                text_at(small_font,67,footer_y+19,muted,tr("Playing from your device on this PC"));
                 ImGui::SetCursorPosY(footer_y+45); ImGui::Dummy(ImVec2(1,1));
             }
         } else if (video_view) {
             ImGui::SetCursorPos(ImVec2(42,stage_h-47.f));
             const bool recording=recorder_ && recorder_->status().recording;
-            if (ui_draw::text_button(recording ? "Stop recording" : "Record",ImVec2(125,34))) toggle_recording();
-            ImGui::SameLine(); if (ui_draw::text_button("Fullscreen",ImVec2(110,34))) toggle_fullscreen();
-            ImGui::SameLine(); if (ui_draw::text_button("Hide interface",ImVec2(120,34))) ui.chromeless=true;
+            if (ui_draw::text_button(recording ? tr("Stop recording") : tr("Record"),ImVec2(125,34))) toggle_recording();
+            ImGui::SameLine(); if (ui_draw::text_button(tr("Fullscreen"),ImVec2(110,34))) toggle_fullscreen();
+            ImGui::SameLine(); if (ui_draw::text_button(tr("Hide interface"),ImVec2(120,34))) ui.chromeless=true;
             ImGui::SameLine();
             ImGui::BeginDisabled(!live_settings_);
-            if (ui_draw::text_button("Rotation",ImVec2(98,34))) ImGui::OpenPopup("##quick_rotation");
+            if (ui_draw::text_button(tr("Rotation"),ImVec2(98,34))) ImGui::OpenPopup("##quick_rotation");
             const ImVec2 rotation_button=ImGui::GetItemRectMin();
             draw->AddTriangleFilled(ImVec2(rotation_button.x+82,rotation_button.y+15),
                                     ImVec2(rotation_button.x+90,rotation_button.y+15),
@@ -1904,7 +2228,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             if (ImGui::BeginPopup("##quick_rotation")) {
                 const int selected=live_settings_->video_rotation.load()+1;
                 for (int i=0;i<IM_ARRAYSIZE(kRotationModes);++i) {
-                    if (ImGui::MenuItem(kRotationModes[i],nullptr,selected==i))
+                    if (ImGui::MenuItem(tr(kRotationModes[i]),nullptr,selected==i))
                         live_settings_->video_rotation.store(i-1);
                 }
                 ImGui::EndPopup();
@@ -1915,40 +2239,40 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             const float cx=stage_w*.5f;
             const float hero_y=(stage_h < 720 ? 90.f : std::max(105.f,(stage_h-690.f)*.3f+120.f))+firewall_offset;
             const ImVec2 tile(origin.x+cx-38,origin.y+hero_y);
-            draw->AddRectFilled(tile,ImVec2(tile.x+76,tile.y+76),IM_COL32(233,239,253,255),22);
-            draw->AddRect(tile,ImVec2(tile.x+76,tile.y+76),IM_COL32(219,229,252,255),22);
+            draw->AddRectFilled(tile,ImVec2(tile.x+76,tile.y+76),ui_draw::themed(IM_COL32(233,239,253,255),IM_COL32(38,58,91,255)),22);
+            draw->AddRect(tile,ImVec2(tile.x+76,tile.y+76),ui_draw::line,22);
             ui_draw::icon(draw,ui_draw::Icon::Cast,ImVec2(tile.x+19,tile.y+19),38,ui_draw::blue);
-            center_text(heading_font,hero_y+99,ink,"Your device.");
-            center_text(heading_font,hero_y+143,ink,"A little bigger.");
-            center_text(io.FontDefault,hero_y+194,muted,"Your music and your screen, right here on this PC.");
-            center_text(io.FontDefault,hero_y+219,muted,"From your iPhone or iPad.");
+            center_text(heading_font,hero_y+99,ink,tr("Your device."));
+            center_text(heading_font,hero_y+143,ink,tr("A little bigger."));
+            center_text(io.FontDefault,hero_y+194,muted,tr("Your music and your screen, right here on this PC."));
+            center_text(io.FontDefault,hero_y+219,muted,tr("From your iPhone or iPad."));
             const float card_w=std::min(440.f,width),card_x=(stage_w-card_w)/2,card_y=hero_y+(stage_h<720?248:268);
             const ImVec2 cp(origin.x+card_x,origin.y+card_y);
-            draw->AddRectFilled(cp,ImVec2(cp.x+card_w,cp.y+78),IM_COL32_WHITE,12);
+            draw->AddRectFilled(cp,ImVec2(cp.x+card_w,cp.y+78),ui_draw::panel,12);
             draw->AddRect(cp,ImVec2(cp.x+card_w,cp.y+78),line,12);
-            text_at(small_font,card_x+20,card_y+15,muted,"SELECT ON YOUR DEVICE");
+            text_at(small_font,card_x+20,card_y+15,muted,tr("SELECT ON YOUR DEVICE"));
             draw->PushClipRect(cp,ImVec2(cp.x+card_w-56,cp.y+78),true);
             text_at(receiver_font,card_x+20,card_y+38,ink,receiver);
             draw->PopClipRect();
             ImGui::SetCursorPos(ImVec2(card_x+card_w-54,card_y+21));
-            if (ui_draw::icon_button("##rename",ui_draw::Icon::Settings,"Receiver settings")) ui.settings_open=true;
+            if (ui_draw::icon_button("##rename",ui_draw::Icon::Settings,tr("Receiver settings"))) ui.page=4;
             const float steps_y=card_y+(stage_h<720?105:121);
             draw->AddLine(ImVec2(origin.x+42,origin.y+steps_y),ImVec2(origin.x+stage_w-42,origin.y+steps_y),line);
-            const char* titles[]={"Same Wi-Fi network","Choose your mode","Select your PC"};
-            const char* descriptions[]={"Connect your device and this PC to the same network.","Use AirPlay for music, or Screen Mirroring from Control Center.","Choose this receiver. The connection starts automatically."};
+            const char* titles[]={tr("Same Wi-Fi network"),tr("Choose your mode"),tr("Select your PC")};
+            const char* descriptions[]={tr("Connect your device and this PC to the same network."),tr("Use AirPlay for music, or Screen Mirroring from Control Center."),tr("Choose this receiver. The connection starts automatically.")};
             for (int i=0;i<3;++i) {
                 const float x=42+i*(width+22)/3;
                 const ImVec2 circle(origin.x+x+12,origin.y+steps_y+40);
-                draw->AddCircleFilled(circle,12,IM_COL32_WHITE,24); draw->AddCircle(circle,12,line,24);
+                draw->AddCircleFilled(circle,12,ui_draw::panel,24); draw->AddCircle(circle,12,line,24);
                 char n[2]={static_cast<char>('1'+i),0};
                 text_at(small_font,x+9,steps_y+32,muted,n);
                 text_at(bold_font,x,steps_y+67,ink,titles[i]);
                 draw->AddText(small_font,16,ImVec2(origin.x+x,origin.y+steps_y+93),muted,descriptions[i],nullptr,(width-44)/3);
             }
-            const char* help="My PC isn't showing up";
+            const char* help=tr("My PC isn't showing up");
             const float help_w=small_font->CalcTextSizeA(16,10000,0,help).x;
             ImGui::SetCursorPos(ImVec2((stage_w-help_w)/2,steps_y+157));
-            if (ui_draw::surface("##connection_help",ImVec2(help_w,22))) ImGui::OpenPopup("Connection help");
+            if (ui_draw::surface("##connection_help",ImVec2(help_w,22))) ImGui::OpenPopup(tr("Connection help"));
             const ImVec2 hp=ImGui::GetItemRectMin();
             draw->AddText(small_font,16,hp,muted,help); draw->AddLine(ImVec2(hp.x,hp.y+17),ImVec2(hp.x+help_w,hp.y+17),muted);
             const float help_card_width=std::min(440.f,stage_w-64.f);
@@ -1958,14 +2282,14 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding,12);
             ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize,1);
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,ImVec2(10,8));
-            ImGui::PushStyleColor(ImGuiCol_PopupBg,ImVec4(1,1,1,1));
-            ImGui::PushStyleColor(ImGuiCol_Border,ImVec4(230/255.f,232/255.f,231/255.f,1));
-            if (ImGui::BeginPopup("Connection help",ImGuiWindowFlags_NoMove)) {
+            ImGui::PushStyleColor(ImGuiCol_PopupBg,ui_draw::rgba(ui_draw::panel));
+            ImGui::PushStyleColor(ImGuiCol_Border,ui_draw::rgba(ui_draw::line));
+            if (ImGui::BeginPopup(tr("Connection help"),ImGuiWindowFlags_NoMove)) {
                 ImGui::PushFont(page_font);
-                ImGui::TextUnformatted("Can't find your PC?");
+                ImGui::TextUnformatted(tr("Can't find your PC?"));
                 ImGui::PopFont();
                 ImGui::SameLine(help_card_width-59);
-                if (ui_draw::icon_button("##close_help",ui_draw::Icon::Close,"Close help")) ImGui::CloseCurrentPopup();
+                if (ui_draw::icon_button("##close_help",ui_draw::Icon::Close,tr("Close help"))) ImGui::CloseCurrentPopup();
                 ImGui::Spacing();
                 ImGui::PushTextWrapPos(help_card_width-24);
                 auto help_step=[&](const char* title,const char* description) {
@@ -1973,380 +2297,24 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                     ImGui::PushFont(small_font); ImGui::TextDisabled("%s",description); ImGui::PopFont();
                     ImGui::Dummy(ImVec2(0,8));
                 };
-                help_step("1. Use the same network", "Connect your iPhone or iPad and this PC to the same Wi-Fi network.");
-                help_step("2. Check your VPN", "A VPN can hide local devices. Check that it allows access to your local network.");
-                help_step("3. Check Windows Firewall", "If a firewall warning is shown, choose Allow on local network.");
+                help_step(tr("1. Use the same network"), tr("Connect your iPhone or iPad and this PC to the same Wi-Fi network."));
+                help_step(tr("2. Check your VPN"), tr("A VPN can hide local devices. Check that it allows access to your local network."));
+                help_step(tr("3. Check Windows Firewall"), tr("If a firewall warning is shown, choose Allow on local network."));
                 ImGui::Separator();
-                ImGui::PushFont(small_font); ImGui::TextDisabled("Then reopen AirPlay on your device."); ImGui::PopFont();
+                ImGui::PushFont(small_font); ImGui::TextDisabled(tr("Then reopen AirPlay on your device.")); ImGui::PopFont();
                 ImGui::PopTextWrapPos();
                 ImGui::EndPopup();
             }
             ImGui::PopStyleColor(2);
             ImGui::PopStyleVar(4);
             const float footer_y=std::max(steps_y+(stage_h<720?185:203),stage_h-34.f);
-            text_at(small_font,42,footer_y,IM_COL32(145,154,147,255),"Windows · Local network");
+            text_at(small_font,42,footer_y,IM_COL32(145,154,147,255),tr("Windows · Local network"));
             if (ui.page==2) decoding_note(footer_y+16);
             ImGui::SetCursorPosY(footer_y+16); ImGui::Dummy(ImVec2(1,1));
         }
+        } // Home, Music and Screen mirroring content.
         ImGui::End(); ImGui::PopStyleColor(); ImGui::PopStyleVar();
 
-        // Settings are a drawer above the current view, not a permanent sidebar.
-        if (ui.settings_open) {
-            ImGui::SetNextWindowPos(ImVec2(0,toolbar_h));
-            ImGui::SetNextWindowSize(ImVec2(fw-opts_bar_w,fh-toolbar_h-status_bar_h));
-            ImGui::PushStyleColor(ImGuiCol_WindowBg,ImVec4(.11f,.17f,.20f,.18f));
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
-            ImGui::Begin("##settings_shade",nullptr,kPanelFlags|ImGuiWindowFlags_NoScrollbar);
-            if (ui_draw::surface("##dismiss_settings",ImGui::GetContentRegionAvail())) ui.settings_open=false;
-            ImGui::End(); ImGui::PopStyleVar(); ImGui::PopStyleColor();
-            ImGui::SetNextWindowPos(ImVec2(fw - opts_bar_w, toolbar_h));
-            ImGui::SetNextWindowSize(ImVec2(opts_bar_w, fh - toolbar_h - status_bar_h));
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
-            ImGui::Begin("##settings_drawer",nullptr,kPanelFlags|ImGuiWindowFlags_NoScrollbar);
-            // Keep the entire scrollbar inside the client area, clear of
-            // the six-pixel native resize handles on the outer edge.
-            ImGui::SetCursorPos(ImVec2(0,8));
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(27,27));
-            ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize,14);
-            if (ImGui::BeginChild("##options_panel",ImVec2(opts_bar_w-14,fh-toolbar_h-status_bar_h-16),false,
-                                  kPanelFlags|ImGuiWindowFlags_AlwaysUseWindowPadding)) {
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                                      ImVec4(.125f,.149f,.161f,1));
-                ImGui::PushFont(page_font);
-                ImGui::TextUnformatted("Settings");
-                ImGui::PopFont();
-                ImGui::SameLine(opts_bar_w-65);
-                if (ui_draw::icon_button("##close_settings",ui_draw::Icon::Close,"Close settings")) ui.settings_open = false;
-                ImGui::PopStyleColor();
-                ImGui::Separator();
-                // Wrap descriptive text to the panel width so long
-                // hint strings (VSYNC / GPU decoder explanations, etc.)
-                // stay inside the panel instead of running off-screen.
-                ImGui::PushTextWrapPos(0.0f);
-                auto settings_section = [&](const char* label, ImGuiTreeNodeFlags flags = 0) {
-                    ImGui::PushFont(bold_font);
-                    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize,0);
-                    const bool open = ImGui::CollapsingHeader(label,flags);
-                    ImGui::PopStyleVar(); ImGui::PopFont();
-                    return open;
-                };
-                if (live_settings_ && settings_section("Receiver name",
-                        ImGuiTreeNodeFlags_DefaultOpen)) {
-                    ImGui::SetNextItemWidth(-1.0f);
-                    const bool enter = ImGui::InputText("##receiver_name",
-                        receiver_name_buf.data(), receiver_name_buf.size(),
-                        ImGuiInputTextFlags_EnterReturnsTrue);
-                    const auto name = ap::airplay::normalize_receiver_name(receiver_name_buf.data());
-                    const bool changed = name != live_settings_->receiver_name();
-                    ImGui::BeginDisabled(name.empty() || !changed);
-                    ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(.14f,.40f,.92f,1));
-                    ImGui::PushStyleColor(ImGuiCol_Text,ImVec4(1,1,1,1));
-                    const bool apply = ImGui::Button("Apply name");
-                    ImGui::PopStyleColor(2);
-                    ImGui::EndDisabled();
-                    if ((apply || enter) && !name.empty() && changed) {
-                        live_settings_->set_receiver_name(name);
-                        std::snprintf(receiver_name_buf.data(), receiver_name_buf.size(), "%s", name.c_str());
-                    }
-                    if (name.empty())
-                        ImGui::TextDisabled("Use a name without dots or backslashes (max. 50 UTF-8 bytes).");
-                    else
-                        ImGui::TextDisabled("Shown in AirPlay on your devices. Saved automatically.");
-                }
-                if (settings_section("Mirror resolution",
-                        ImGuiTreeNodeFlags_DefaultOpen)) {
-                    if (live_settings_) {
-                        struct Preset { const char* label; int w; int h; };
-                        static const Preset presets[] = {
-                            {"1920x1080  (Full HD)",      1920, 1080},
-                            {"2560x1440  (QHD, default)", 2560, 1440},
-                            {"1920x1920  (square limit)",1920, 1920},
-                            {"2560x2560  (square limit)",2560, 2560},
-                            {"2868x2868  (square limit)",2868, 2868},
-                            {"3840x3840  (square limit)",3840, 3840},
-                            {"3840x2160  (4K UHD)",       3840, 2160},
-                        };
-                        int cur_w = live_settings_->mirror_width.load();
-                        int cur_h = live_settings_->mirror_height.load();
-                        int sel = -1;   // -1 = none of the presets match
-                        for (int i = 0; i < (int)IM_ARRAYSIZE(presets); ++i) {
-                            if (presets[i].w == cur_w && presets[i].h == cur_h) {
-                                sel = i; break;
-                            }
-                        }
-                        // Custom mode is sticky once chosen so the
-                        // inputs don't disappear the moment the user
-                        // pauses on a partial value that happens to
-                        // match a preset (eg typing 1920 then 1080).
-                        // Reset to false whenever a preset is chosen
-                        // explicitly, or auto-set when current values
-                        // don't match any preset (eg --mirror-res CLI).
-                        if (sel < 0) custom_resolution = true;
-
-                        char preview_buf[48];
-                        const char* preview;
-                        if (custom_resolution) {
-                            std::snprintf(preview_buf, sizeof(preview_buf),
-                                          "Custom: %dx%d", cur_w, cur_h);
-                            preview = preview_buf;
-                        } else {
-                            preview = presets[sel].label;
-                        }
-
-                        ImGui::SetNextItemWidth(-1);
-                        if (ImGui::BeginCombo("##mirror_res", preview)) {
-                            for (int i = 0; i < (int)IM_ARRAYSIZE(presets); ++i) {
-                                const bool is_sel =
-                                    (!custom_resolution && sel == i);
-                                if (ImGui::Selectable(presets[i].label,
-                                                      is_sel)) {
-                                    custom_resolution = false;
-                                    live_settings_->mirror_width.store(presets[i].w);
-                                    live_settings_->mirror_height.store(presets[i].h);
-                                }
-                                if (is_sel) ImGui::SetItemDefaultFocus();
-                            }
-                            ImGui::Separator();
-                            if (ImGui::Selectable("Custom...", custom_resolution)) {
-                                custom_resolution = true;
-                            }
-                            ImGui::EndCombo();
-                        }
-
-                        if (custom_resolution) {
-                            // Width / height inputs that commit live
-                            // (no Enter) as soon as the value falls in
-                            // the accepted range. While the user is
-                            // typing a partial number outside the
-                            // range nothing is written — so 2 / 25 /
-                            // 256 don't get applied on the way to 2560.
-                            static int  width_buf    = 0;
-                            static int  height_buf   = 0;
-                            static bool width_active = false;
-                            static bool height_active= false;
-                            if (!width_active)  width_buf  = cur_w;
-                            if (!height_active) height_buf = cur_h;
-
-                            ImGui::SetNextItemWidth(80);
-                            ImGui::InputInt("Width##custom",
-                                            &width_buf, 0, 0);
-                            width_active = ImGui::IsItemActive();
-                            ImGui::SameLine();
-                            ImGui::SetNextItemWidth(80);
-                            ImGui::InputInt("Height##custom",
-                                            &height_buf, 0, 0);
-                            height_active = ImGui::IsItemActive();
-
-                            if (width_buf  >= 320 && width_buf  <= 7680 &&
-                                width_buf  != cur_w) {
-                                live_settings_->mirror_width.store(width_buf);
-                            }
-                            if (height_buf >= 240 && height_buf <= 4320 &&
-                                height_buf != cur_h) {
-                                live_settings_->mirror_height.store(height_buf);
-                            }
-                            ImGui::TextDisabled(
-                                "Range: 320-7680 x 240-4320");
-                        }
-                        ImGui::TextDisabled(
-                            "Maximum video size. Your device chooses the actual stream resolution.");
-                        if (video_tex_w > 0 && video_tex_h > 0)
-                            ImGui::TextDisabled("Received: %d x %d", video_tex_w, video_tex_h);
-                        ImGui::TextDisabled("Applies on next device connection");
-                    } else {
-                        ImGui::TextDisabled("(LiveSettings not wired)");
-                    }
-                }
-                if (settings_section("Video decoder",
-                        ImGuiTreeNodeFlags_DefaultOpen)) {
-                    if (live_settings_) {
-                        bool hw = live_settings_->mirror_hwaccel.load();
-                        if (ImGui::Checkbox("Use GPU acceleration",
-                                            &hw)) {
-                            live_settings_->mirror_hwaccel.store(hw);
-                        }
-                        ImGui::TextDisabled(
-                            hw
-                              ? "Uses your graphics card when available."
-                              : "Uses your processor to decode video.");
-                        ImGui::TextDisabled("Applies on next device connection");
-
-                        ImGui::Separator();
-
-                        bool vsync = live_settings_->vsync_enabled.load();
-                        if (ImGui::Checkbox("Synchronize with display", &vsync)) {
-                            live_settings_->vsync_enabled.store(vsync);
-                        }
-                        ImGui::TextDisabled(
-                            vsync
-                              ? "Sync presents to monitor refresh."
-                              : "Present immediately (lower latency,"
-                                " visible tearing on fast pans).");
-                        ImGui::TextDisabled("Applies live (no reconnect needed)");
-                    } else {
-                        ImGui::TextDisabled("(LiveSettings not wired)");
-                    }
-                }
-                if (settings_section("Recording")) {
-                    const auto rec = recorder_->status();
-                    ImGui::TextUnformatted("Folder");
-#if defined(_WIN32)
-                    ImGui::SetNextItemWidth(-92.0f);
-#endif
-                    ImGui::InputText("##recording_folder", recording_dir.data(),
-                                     recording_dir.size());
-#if defined(_WIN32)
-                    ImGui::SameLine();
-                    if (ImGui::Button("Browse...", ImVec2(-1.0f, 0.0f))) {
-                        std::string selected_folder;
-                        if (browse_recording_folder(
-                                window, recording_dir.data(), selected_folder)) {
-                            std::snprintf(recording_dir.data(),
-                                          recording_dir.size(), "%s",
-                                          selected_folder.c_str());
-                        }
-                    }
-#endif
-                    const char* encoder_modes[] = {
-                        "Auto (GPU preferred)", "GPU only", "CPU only"
-                    };
-                    const char* video_codecs[] = {
-                        "H.264 (compatible)", "H.265 / HEVC (smaller)"
-                    };
-                    int video_codec =
-                        static_cast<int>(recording_options.codec);
-                    if (ImGui::Combo("Video codec", &video_codec,
-                                     video_codecs, 2)) {
-                        recording_options.codec =
-                            static_cast<VideoRecorder::VideoCodec>(video_codec);
-                    }
-                    int encoder_mode =
-                        static_cast<int>(recording_options.encoder);
-                    if (ImGui::Combo("Encoder", &encoder_mode,
-                                     encoder_modes, 3)) {
-                        recording_options.encoder =
-                            static_cast<VideoRecorder::EncoderMode>(encoder_mode);
-                    }
-                    ImGui::SliderInt("Bitrate (Mbps)",
-                                     &recording_options.bitrate_mbps, 2, 40);
-                    ImGui::TextDisabled(
-                        "Lower bitrate = smaller file / more compression");
-                    if (rec.recording)
-                        ImGui::TextDisabled("Settings apply to the next recording");
-                    if (rec.recording) {
-                        const int64_t seconds = rec.elapsed_ms / 1000;
-                        ImGui::TextColored(ImVec4(1.0f, 0.30f, 0.32f, 1.0f),
-                                           "REC  %02lld:%02lld",
-                                           static_cast<long long>(seconds / 60),
-                                           static_cast<long long>(seconds % 60));
-                        ImGui::Text("Frames: %llu",
-                            static_cast<unsigned long long>(rec.frames));
-                        ImGui::Text("Audio: %s",
-                            rec.audio_samples > 0 ? "AAC stereo" : "waiting for PCM");
-                        if (rec.dropped > 0) {
-                            ImGui::TextColored(ImVec4(1.0f, 0.70f, 0.25f, 1.0f),
-                                "Queue drops: %llu",
-                                static_cast<unsigned long long>(rec.dropped));
-                        }
-                        if (!rec.codec.empty())
-                            ImGui::TextWrapped("Codec: %s", rec.codec.c_str());
-                        if (ImGui::Button("Stop recording", ImVec2(-1, 0)))
-                            toggle_recording();
-                    } else {
-                        ImGui::TextDisabled("MP4 video (decoded AirPlay stream)");
-                        if (ImGui::Button("Start recording", ImVec2(-1, 0)))
-                            toggle_recording();
-                    }
-                    if (!rec.output_path.empty())
-                        ImGui::TextWrapped("File: %s", rec.output_path.c_str());
-                    if (!rec.error.empty())
-                        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
-                                           "%s", rec.error.c_str());
-                }
-                ImGui::Separator();
-                if (settings_section("Advanced")) {
-                    ImGui::Checkbox("Show diagnostics", &ui.diagnostics);
-                if (settings_section("Rotation")) {
-                    if (live_settings_) {
-                        int selected = live_settings_->video_rotation.load() + 1;
-                        ImGui::SetNextItemWidth(-1.0f);
-                        if (ImGui::Combo("##video_rotation", &selected, kRotationModes, IM_ARRAYSIZE(kRotationModes)))
-                            live_settings_->video_rotation.store(selected - 1);
-                        ImGui::TextDisabled(
-                            "Auto follows the orientation sent by the device."
-                            " Manual angles rotate clockwise from the received image.");
-                        if (video_tex_w > 0 && video_tex_h > 0)
-                            ImGui::TextDisabled("Received: %s (%d x %d)",
-                                video_tex_w > video_tex_h ? "Landscape" :
-                                video_tex_w < video_tex_h ? "Portrait" : "Square",
-                                video_tex_w, video_tex_h);
-                        ImGui::TextDisabled("Applies live to display only; recording is unchanged.");
-                    }
-                }
-                if (settings_section("Frame rate")) {
-                    if (live_settings_) {
-                        // iOS effectively takes the min of maxFPS and
-                        // refreshRate, so two separate sliders meant
-                        // the same thing twice. Drive both atomics
-                        // from a single "Frame rate cap" knob and
-                        // keep the underlying fields in lockstep.
-                        int cap = live_settings_->max_fps.load();
-                        ImGui::SetNextItemWidth(200);
-                        if (ImGui::SliderInt("Frame rate cap",
-                                             &cap, 1, 60, "%d fps")) {
-                            live_settings_->max_fps.store(cap);
-                            live_settings_->refresh_rate.store(cap);
-                        }
-                        ImGui::TextDisabled(
-                            "iOS caps mirror at 60 fps regardless of hint;"
-                            " lower values force a deterministic cadence.");
-                        ImGui::TextDisabled("Applies on next device connection");
-                    } else {
-                        ImGui::TextDisabled("(LiveSettings not wired)");
-                    }
-                }
-                if (settings_section("Compression")) {
-                    if (live_settings_) {
-                        bool hevc = live_settings_->hevc_enabled.load();
-                        if (ImGui::Checkbox("Allow HEVC (H.265)", &hevc)) {
-                            live_settings_->hevc_enabled.store(hevc);
-                        }
-                        ImGui::TextDisabled(
-                            hevc
-                              ? "The device may pick HEVC at high resolution"
-                              : "Force H.264 (more CPU, more bandwidth)");
-                        ImGui::TextDisabled("Applies on next device connection");
-                    } else {
-                        ImGui::TextDisabled("(LiveSettings not wired)");
-                    }
-                }
-                if (settings_section("Network")) {
-                    ImGui::TextDisabled("RTSP   :7000");
-                    ImGui::TextDisabled("HLS    :7100");
-                    ImGui::TextDisabled("mDNS   advertising");
-                }
-                if (settings_section("Keyboard shortcuts")) {
-                    ImGui::BulletText("F / F11 / double-click  Toggle fullscreen");
-                    ImGui::BulletText("H       Hide / show the interface");
-                    ImGui::BulletText("R       Start / stop recording");
-                    ImGui::BulletText("Esc     Exit fullscreen / show UI / quit");
-                }
-                }
-                ImGui::Spacing();
-                ImGui::Separator();
-                ImGui::TextDisabled("Restore all app preferences to their defaults.");
-                ImGui::BeginDisabled(!live_settings_);
-                if (ui_draw::text_button("Reset all settings",ImVec2(-1,36))) reset_all_settings();
-                ImGui::EndDisabled();
-                if (ImGui::GetTime() < settings_reset_notice_until)
-                    ImGui::TextDisabled("Default settings restored.");
-                ImGui::PopTextWrapPos();
-            }
-            ImGui::EndChild();
-            ImGui::PopStyleVar(2);
-            ImGui::End();
-            ImGui::PopStyleVar();
-        }
 
         if (ui.diagnostics) {
         // ---- Bottom status bar ------------------------------------
@@ -2382,23 +2350,23 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             // in mirror); "Idle" = nothing connected.
             const char* state_label =
                 has_active_dev
-                    ? (has_video ? (playing ? "Streaming" : "Paused")
-                                 : "Connected")
-                    : "Idle";
-            ImGui::Text("State: %s", state_label);
+                    ? (has_video ? (playing ? tr("Streaming") : tr("Paused"))
+                                 : tr("Connected"))
+                    : tr("Idle");
+            ImGui::Text(tr("State: %s"), state_label);
             sep();
             if (vid_w > 0 && vid_h > 0) {
-                ImGui::Text("Video: %dx%d @ %.1f", vid_w, vid_h,
+                ImGui::Text(tr("Video: %dx%d @ %.1f"), vid_w, vid_h,
                             has_video ? vid_fps : 0.0f);
             } else {
-                ImGui::TextDisabled("Video: -");
+                ImGui::TextDisabled(tr("Video: -"));
             }
             sep();
-            ImGui::Text("Frames: %llu", static_cast<unsigned long long>(total));
+            ImGui::Text(tr("Frames: %llu"), static_cast<unsigned long long>(total));
             sep();
-            ImGui::Text("Stage: %dx%d", stage_w, stage_h);
+            ImGui::Text(tr("Stage: %dx%d"), stage_w, stage_h);
             sep();
-            ImGui::Text("Renderer: %.0f fps", io_ui.Framerate);
+            ImGui::Text(tr("Renderer: %.0f fps"), io_ui.Framerate);
             sep();
             const float    mbps  =
                 payload_mbps_ema_.load(std::memory_order_relaxed);
@@ -2422,17 +2390,17 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                 }
                 return std::string(buf);
             };
-            ImGui::Text("BW: %.1f Mbps", has_video ? mbps : 0.0f);
+            ImGui::Text(tr("BW: %.1f Mbps"), has_video ? mbps : 0.0f);
             sep();
-            ImGui::Text("Total: %s", fmt_total(total_b).c_str());
+            ImGui::Text(tr("Total: %s"), fmt_total(total_b).c_str());
             sep();
             const float lat_ms =
                 pipeline_latency_ms_ema_.load(std::memory_order_relaxed);
             // Only show when a recent video frame populated it,
             // otherwise the EMA is stale or zero.
-            ImGui::Text("Lat: %.1f ms", has_video ? lat_ms : 0.0f);
+            ImGui::Text(tr("Lat: %.1f ms"), has_video ? lat_ms : 0.0f);
             sep();
-            ImGui::TextDisabled("HLS backend: %s", kHlsBackend);
+            ImGui::TextDisabled(tr("HLS backend: %s"), kHlsBackend);
             ImGui::EndTable();
             }
         }
@@ -2450,7 +2418,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             const float controls_y = wide ? std::max(90.0f, (stage_h - std::min(300.0f, stage_h * .40f)) * .42f) + 180 : stage_h - controls_h;
             ImGui::SetNextWindowPos(ImVec2(stage_x + controls_x, stage_y + controls_y));
             ImGui::SetNextWindowSize(ImVec2(stage_w - controls_x - 20, controls_h));
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(.961f,.965f,.957f,1));
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ui_draw::rgba(ui_draw::paper));
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 8));
             if (ImGui::Begin("##audio_controls", nullptr, kPanelFlags | ImGuiWindowFlags_NoScrollbar)) {
                 draw_audio_controls();
@@ -2500,7 +2468,20 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         ImGui_ImplSDLRenderer2_RenderDrawData(
             ImGui::GetDrawData(), renderer);
 
+        const auto cadence_present_start=std::chrono::steady_clock::now();
         SDL_RenderPresent(renderer);
+        live_preview.draw(renderer,has_active_dev && show_video && !session_cleared ? video_tex : nullptr,
+            video_tex_w,video_tex_h,rotation_degrees(),last_video_frame_time,
+            tr("Live video"),tr("Waiting for screen mirroring"));
+        if (face_swap_enabled) {
+            const auto presented=std::chrono::steady_clock::now();
+            const auto now_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(presented.time_since_epoch()).count();
+            face_swap.record_cadence(frames_total_.load(std::memory_order_relaxed),avframes_replaced_.load(std::memory_order_relaxed),
+                cadence_input,cadence_swapped && video_tex && show_video && (no_chrome || ui.page==2),cadence_held,cadence_wait_ms,
+                std::chrono::duration<double,std::milli>(presented-cadence_present_start).count(),
+                frame_origin_ns_local>0 ? (now_ns-frame_origin_ns_local)/1e6 : -1);
+        }
+
 
         // Pipeline-latency measurement: from when the encrypted
         // frame body finished arriving on the wire (origin_ns
@@ -2523,6 +2504,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         }
     }
 
+    face_swap.stop();
     if (recorder_) recorder_->stop();
     publish_preferences();
     if (title_tex)     SDL_DestroyTexture(title_tex);
@@ -2541,6 +2523,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
     desktop.stop();
+    live_preview.close();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_QuitSubSystem(SDL_INIT_VIDEO);

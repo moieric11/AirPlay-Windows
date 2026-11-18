@@ -37,7 +37,7 @@ private:
 
     // Return a copy of `content` with "mlhls://localhost/" replaced by
     // "http://localhost:<port>/" so the player can fetch through us.
-    std::string rewrite_urls(const std::string& content) const;
+    std::string rewrite_urls(const std::string& content, uint64_t epoch) const;
 
     ap::net::TcpServer server_;
 };

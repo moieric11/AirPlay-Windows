@@ -8,6 +8,8 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <algorithm>
+#include <limits>
 
 extern "C" {
 #include <libavformat/avio.h>
@@ -33,10 +35,10 @@ void HlsLocalServer::stop() {
     server_.stop();
 }
 
-std::string HlsLocalServer::rewrite_urls(const std::string& content) const {
+std::string HlsLocalServer::rewrite_urls(const std::string& content, uint64_t epoch) const {
     constexpr const char* kFrom = "mlhls://localhost/";
     const std::string to = "http://localhost:" +
-        std::to_string(server_.port()) + "/";
+        std::to_string(server_.port()) + "/hls/" + std::to_string(epoch) + "/";
     std::string out;
     out.reserve(content.size() + 64);
     const std::size_t flen = std::strlen(kFrom);
@@ -55,6 +57,16 @@ std::string HlsLocalServer::rewrite_urls(const std::string& content) const {
 }
 
 void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
+    // TcpServer's short control-message send timeout must not truncate
+    // media when the player applies back-pressure (including pause).
+    // stop() shuts down the tracked socket, so blocked sends remain cancellable.
+#if defined(_WIN32)
+    DWORD send_timeout = 0;
+#else
+    timeval send_timeout{0, 0};
+#endif
+    ::setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO,
+        reinterpret_cast<const char*>(&send_timeout), sizeof(send_timeout));
     // Byte-at-a-time read until we see "\r\n\r\n" or the socket closes.
     // Media-player GETs are small (<500 B) so 8 KB is plenty.
     std::string headers;
@@ -134,6 +146,15 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
         send_response(400, "Bad Request", "", "text/plain");
         return;
     }
+    const uint64_t epoch = HlsSessionRegistry::instance().playback_epoch();
+    if (path.rfind("/hls/", 0) == 0) {
+        const std::string prefix = "/hls/" + std::to_string(epoch) + "/";
+        if (path.rfind(prefix, 0) != 0) {
+            send_response(410, "Gone", "", "text/plain");
+            return;
+        }
+        path = path.substr(prefix.size() - 1);
+    }
 
     // The player GETs `/<path>`. Rebuild the canonical mlhls:// URL iOS
     // used so the registry lookup hits.
@@ -146,12 +167,24 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
     // passthrough so HLS clients using byte-range requests get a
     // proper 206 Partial Content).
     if (path.size() > 5 && path.compare(0, 5, "/seg/") == 0) {
-        const std::string cdn_url =
+        std::string cdn_url =
             HlsSessionRegistry::instance().resolve_segment_path(path);
         if (cdn_url.empty()) {
             LOG_WARN << "HLS GET " << path << " -> 404 (seg id unknown)";
             send_response(404, "Not Found", "", "text/plain");
             return;
+        }
+        if (cdn_url.rfind("mlhls://", 0) == 0) {
+            std::string bytes, redirect;
+            if (!HlsSessionRegistry::instance().fetch_segment(cdn_url, bytes, redirect)) {
+                send_response(504, "Gateway Timeout", "", "text/plain");
+                return;
+            }
+            if (redirect.empty()) {
+                send_response(200, "OK", bytes, "application/octet-stream");
+                return;
+            }
+            cdn_url = std::move(redirect);
         }
 
         // Parse Range: bytes=<start>-<end> from the incoming headers.
@@ -200,15 +233,21 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
         const auto t_start = std::chrono::steady_clock::now();
 
         AVDictionary* opts = nullptr;
+        av_dict_set(&opts, "rw_timeout", "5000000", 0);
         if (range_start >= 0) {
             av_dict_set_int(&opts, "offset", range_start, 0);
-            if (range_end >= 0) {
+            if (range_end >= 0 && range_end < std::numeric_limits<int64_t>::max()) {
                 av_dict_set_int(&opts, "end_offset", range_end + 1, 0);
             }
         }
         AVIOContext* avio = nullptr;
+        AVIOInterruptCB interrupt{};
+        interrupt.callback = [](void* opaque) {
+            return static_cast<std::atomic<bool>*>(opaque)->load() ? 1 : 0;
+        };
+        interrupt.opaque = client.cancelled.get();
         const int rc = avio_open2(&avio, cdn_url.c_str(),
-                                  AVIO_FLAG_READ, nullptr, &opts);
+                                  AVIO_FLAG_READ, &interrupt, &opts);
         av_dict_free(&opts);
         if (rc < 0) {
             kInFlight.fetch_sub(1);
@@ -219,27 +258,38 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
             return;
         }
         const int64_t size = avio_size(avio);
+        if (range_start >= 0 && size >= 0 && range_start >= size) {
+            avio_close(avio);
+            kInFlight.fetch_sub(1);
+            std::string wire = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */" +
+                std::to_string(size) + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            ap::net::send_all(client.fd, wire.data(), static_cast<int>(wire.size()));
+            return;
+        }
+        const int64_t effective_end = range_start >= 0
+            ? (size >= 0 ? (range_end >= 0 ? std::min(range_end, size - 1) : size - 1)
+                         : range_end) : -1;
+        const int64_t response_size = range_start >= 0
+            ? (effective_end >= range_start ? effective_end - range_start + 1 : -1)
+            : size;
         const auto t_opened = std::chrono::steady_clock::now();
         const auto open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             t_opened - t_start).count();
 
         std::string hdr;
         if (range_start >= 0) {
-            // 206 Partial Content — we don't know the full resource
-            // size (libavio doesn't expose the upstream Content-Range
-            // total), so use "*" per RFC 7233 §4.2.
-            const int64_t effective_end =
-                (range_end >= 0) ? range_end
-                                 : (size > 0 ? range_start + size - 1 : -1);
+            // avio_size reports the full upstream resource. The response
+            // length is only the requested interval, clamped to that size.
             hdr.append("HTTP/1.1 206 Partial Content\r\n");
             hdr.append("Content-Type: application/octet-stream\r\n");
             if (effective_end >= 0) {
                 char crange[96];
                 std::snprintf(crange, sizeof(crange),
-                              "Content-Range: bytes %lld-%lld/*\r\n",
+                              "Content-Range: bytes %lld-%lld/",
                               static_cast<long long>(range_start),
                               static_cast<long long>(effective_end));
                 hdr.append(crange);
+                hdr.append(size >= 0 ? std::to_string(size) : "*").append("\r\n");
             }
             hdr.append("Accept-Ranges: bytes\r\n");
         } else {
@@ -247,8 +297,8 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
             hdr.append("Content-Type: application/octet-stream\r\n");
             hdr.append("Accept-Ranges: bytes\r\n");
         }
-        if (size > 0) {
-            hdr.append("Content-Length: ").append(std::to_string(size))
+        if (response_size >= 0) {
+            hdr.append("Content-Length: ").append(std::to_string(response_size))
                .append("\r\n");
         } else {
             hdr.append("Transfer-Encoding: chunked\r\n");
@@ -260,28 +310,31 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
         std::int64_t total = 0;
         std::chrono::steady_clock::time_point t_first_byte{};
         bool got_first_byte = false;
-        while (true) {
-            const int n = avio_read(avio, buf, sizeof(buf));
+        while (!client.cancelled->load() && (response_size < 0 || total < response_size)) {
+            const int wanted = response_size >= 0
+                ? static_cast<int>(std::min<int64_t>(sizeof(buf), response_size - total))
+                : static_cast<int>(sizeof(buf));
+            const int n = avio_read(avio, buf, wanted);
             if (n <= 0) break;
             if (!got_first_byte) {
                 t_first_byte = std::chrono::steady_clock::now();
                 got_first_byte = true;
             }
             total += n;
-            if (size > 0) {
+            if (response_size >= 0) {
                 if (ap::net::send_all(client.fd,
                         reinterpret_cast<const char*>(buf), n) < 0) break;
             } else {
                 char chunk_hdr[16];
                 const int hlen = std::snprintf(chunk_hdr, sizeof(chunk_hdr),
                                                "%x\r\n", n);
-                ap::net::send_all(client.fd, chunk_hdr, hlen);
-                ap::net::send_all(client.fd,
-                    reinterpret_cast<const char*>(buf), n);
-                ap::net::send_all(client.fd, "\r\n", 2);
+                if (ap::net::send_all(client.fd, chunk_hdr, hlen) < 0 ||
+                    ap::net::send_all(client.fd,
+                        reinterpret_cast<const char*>(buf), n) < 0 ||
+                    ap::net::send_all(client.fd, "\r\n", 2) < 0) break;
             }
         }
-        if (size <= 0) {
+        if (response_size < 0) {
             ap::net::send_all(client.fd, "0\r\n\r\n", 5);
         }
         avio_close(avio);
@@ -312,8 +365,10 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
     // map. Everything else is a segment the player is pulling — those
     // aren't in media_playlists, we fetch them on demand from iOS via
     // FCUP and block until /action arrives.
-    const bool is_playlist = (path.size() >= 5 &&
-        path.compare(path.size() - 5, 5, ".m3u8") == 0);
+    const auto query = path.find('?');
+    const std::string pathname = path.substr(0, query);
+    const bool is_playlist = (pathname.size() >= 5 &&
+        pathname.compare(pathname.size() - 5, 5, ".m3u8") == 0);
 
     if (is_playlist) {
         std::string body;
@@ -341,7 +396,11 @@ void HlsLocalServer::handle_client(ap::net::ClientSocket client) {
                          << " refresh failed; serving cached non-final playlist";
             }
         }
-        body = rewrite_urls(body);
+        if (HlsSessionRegistry::instance().playback_epoch() != epoch) {
+            send_response(410, "Gone", "", "text/plain");
+            return;
+        }
+        body = rewrite_urls(body, epoch);
         // Master playlist: strip all-but-first variant so FFmpeg picks
         // one rendition and stops probing 16 itags. Media playlists
         // already hold the localised /seg/ URLs — serve as-is.

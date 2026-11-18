@@ -1,0 +1,10 @@
+# Isolated Windows DirectML worker, Python 3.11 x64.
+# Install InsightFace separately with --no-deps; do not mix ORT packages.
+onnxruntime-directml==1.24.4
+numpy>=1.26,<3
+opencv-python>=4.9,<5
+onnx
+scipy
+scikit-image
+tqdm
+requests

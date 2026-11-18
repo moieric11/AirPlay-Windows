@@ -157,7 +157,7 @@ int main(int argc, char** argv) {
     // but YouTube/Photos play audio-only with thumbnail. Opt-in HLS
     // proxy for the rare cases where you want the video stream delivered
     // via the signed-CDN path we built.
-    bool hls_playback = false;
+    bool hls_playback = saved.hls_playback;
     bool mirror_hwaccel = saved.mirror_hwaccel;
     int  mirror_w = saved.mirror_width;
     int  mirror_h = saved.mirror_height;
@@ -241,6 +241,8 @@ int main(int argc, char** argv) {
     live_settings.mirror_width.store(mirror_w);
     live_settings.mirror_height.store(mirror_h);
     live_settings.hevc_enabled.store(saved.hevc_enabled);
+    live_settings.hls_playback.store(saved.hls_playback);
+    live_settings.hls_playback_active = hls_playback;
     live_settings.max_fps.store(saved.max_fps);
     live_settings.refresh_rate.store(saved.refresh_rate);
     live_settings.mirror_hwaccel.store(mirror_hwaccel);
@@ -251,7 +253,7 @@ int main(int argc, char** argv) {
     live_settings.set_ui_preferences(saved.ui);
     ctx.live = &live_settings;
     LOG_INFO << "AirPlay Streaming HLS path: "
-             << (hls_playback ? "ENABLED (--hls-proxy-playback)"
+             << (hls_playback ? "ENABLED (experimental)"
                               : "disabled (mirror + RAOP audio only)");
 
     // Load (or create) the persistent Ed25519 identity. iOS caches receivers
@@ -324,9 +326,9 @@ int main(int argc, char** argv) {
     // keeps a clean log.
     ap::airplay::HlsLocalServer hls_server;
     if (hls_playback) {
-        if (!hls_server.start(7100)) {
-            LOG_WARN << "HLS local server could not bind 7100 — "
-                        "--hls-proxy-playback playback will not work";
+        if (!hls_server.start(7100) && !hls_server.start(0)) {
+            LOG_ERROR << "HLS local server could not start";
+            return 1;
         }
         ctx.hls_local_port = hls_server.port();
     }

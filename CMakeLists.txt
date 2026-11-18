@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(airplay-windows VERSION 0.4.1 LANGUAGES C CXX)
+project(airplay-windows VERSION 0.5.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -328,6 +328,9 @@ add_executable(airplay-windows
     src/airplay/routes.cpp
     src/video/h264_decoder.cpp
     src/video/gpu_video.cpp
+    src/video/face_swap.cpp
+    src/video/face_swap_process.cpp
+    src/video/face_swap_gpu.cpp
     src/video/gpu_recording.cpp
     src/video/video_recorder.cpp
     ${HLS_PLAYER_SRC}
@@ -418,7 +421,7 @@ if(WIN32)
     # dwmapi: DwmSetWindowAttribute for the Win11 Mica backdrop on the
     # VideoRenderer window.
     target_link_libraries(airplay-windows PRIVATE
-        ws2_32 iphlpapi dnsapi dwmapi d3d11
+        ws2_32 iphlpapi dnsapi dwmapi d3d11 dxgi
         setupapi shell32 ole32 oleaut32 windowsapp)   # USB, Lockdown lookup and firewall COM API
 
     # Released as a GUI app so no empty console window pops up when
@@ -433,8 +436,33 @@ if(WIN32)
 endif()
 
 # ---- Runtime DLL deployment (Windows) ----------------------------------------
+option(ENABLE_CUDA_FACE_SWAP "Build the optional CUDA/D3D11 face-swap bridge" ON)
+if(WIN32 AND ENABLE_CUDA_FACE_SWAP)
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        add_library(airplay-cuda-bridge SHARED src/video/cuda_d3d11_bridge.cpp)
+        target_link_libraries(airplay-cuda-bridge PRIVATE CUDA::cuda_driver d3d11 dxgi)
+        set_target_properties(airplay-cuda-bridge PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/face_swap/engine")
+        add_dependencies(airplay-windows airplay-cuda-bridge)
+    endif()
+endif()
 option(BUILD_GPU_TESTS "Build the D3D11 hardware integration test" OFF)
 if(WIN32 AND BUILD_GPU_TESTS)
+    add_executable(render-face-swap-settings tools/render_face_swap_settings.cpp)
+    target_include_directories(render-face-swap-settings PRIVATE src)
+    target_link_libraries(render-face-swap-settings PRIVATE imgui ${SDL2_TARGET})
+    if(TARGET airplay-cuda-bridge)
+        add_executable(test-gpu-face-interop tools/test_gpu_face_interop.cpp src/video/face_swap_gpu.cpp
+            src/video/face_swap.cpp src/video/face_swap_process.cpp src/net/socket.cpp src/log.cpp)
+        target_include_directories(test-gpu-face-interop PRIVATE src ${FFMPEG_INCLUDE_DIRS_OK})
+        target_link_libraries(test-gpu-face-interop PRIVATE ${FFMPEG_TARGETS} CUDA::cuda_driver d3d11 dxgi ws2_32 iphlpapi)
+        add_dependencies(test-gpu-face-interop airplay-cuda-bridge)
+    endif()
+    add_executable(test-face-swap tools/test_face_swap.cpp src/video/face_swap.cpp src/video/face_swap_process.cpp src/video/face_swap_gpu.cpp
+        src/net/socket.cpp src/log.cpp)
+    target_include_directories(test-face-swap PRIVATE src ${FFMPEG_INCLUDE_DIRS_OK})
+    target_link_libraries(test-face-swap PRIVATE ${FFMPEG_TARGETS} ws2_32 iphlpapi d3d11 dxgi)
     add_executable(test-gpu-video tools/test_gpu_video.cpp src/video/gpu_video.cpp
         src/video/h264_decoder.cpp src/video/gpu_recording.cpp
         src/video/video_recorder.cpp src/log.cpp)
@@ -461,6 +489,28 @@ endif()
 # its registered plugin path — practically: as long as the user has
 # GStreamer's bin/ on PATH the plugins resolve at startup.
 if(WIN32)
+    # Only deploy runtime modules; tools, weights and per-machine caches are separate.
+    set(FACE_SWAP_RUNTIME_FILES
+        face_swap_worker.py face_swap_gpu_worker.py face_swap_detection.py
+        face_swap_progress.py face_swap_tensorrt.py face_swap_models.py face_swap_occlusion.py face_swap_parser.py face_swap_mask.py face_swap_detectors.py face_swap_landmarker.py face_swap_portrait.py
+        download_face_swap_models.py prepare_face_swap_python.ps1 face_swap_models_manifest.json
+        requirements-face-swap.txt requirements-face-swap-gpu.txt
+        requirements-face-swap-directml.txt requirements-face-swap-cpu.txt requirements-face-swap-tensorrt.txt)
+    add_custom_target(deploy-face-swap
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:airplay-windows>/face_swap/engine")
+    foreach(runtime_file IN LISTS FACE_SWAP_RUNTIME_FILES)
+        add_custom_command(TARGET deploy-face-swap POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/tools/${runtime_file}"
+                "$<TARGET_FILE_DIR:airplay-windows>/face_swap/engine/${runtime_file}"
+            VERBATIM)
+    endforeach()
+    add_custom_command(TARGET deploy-face-swap POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/docs/FACE_SWAP_DISTRIBUTION.md"
+            "$<TARGET_FILE_DIR:airplay-windows>/face_swap/README.md"
+        VERBATIM)
+    add_dependencies(airplay-windows deploy-face-swap)
     add_custom_command(TARGET airplay-windows POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_RUNTIME_DLLS:airplay-windows>
@@ -488,6 +538,15 @@ endif()
 # Focused regression tests for receiver disconnect and shutdown.
 option(BUILD_NETWORK_TESTS "Build socket shutdown regression tests" OFF)
 if(BUILD_NETWORK_TESTS)
+    add_executable(test-hls tools/test_hls.cpp src/video/hls_player.cpp src/audio/audio_output.cpp
+        src/airplay/hls_local_server.cpp src/airplay/hls_session.cpp src/airplay/fcup.cpp
+        src/airplay/reverse_channel.cpp src/net/tcp_server.cpp src/net/socket.cpp src/log.cpp)
+    target_include_directories(test-hls PRIVATE src ${FFMPEG_INCLUDE_DIRS_OK})
+    target_link_libraries(test-hls PRIVATE ${FFMPEG_TARGETS} ${SDL2_TARGET} ${LIBPLIST_TARGET})
+    target_compile_definitions(test-hls PRIVATE HAVE_LIBPLIST=1)
+    if(WIN32)
+        target_link_libraries(test-hls PRIVATE ws2_32 iphlpapi)
+    endif()
     add_executable(test-firewall tools/test_firewall.cpp src/platform/firewall.cpp)
     target_include_directories(test-firewall PRIVATE src)
     if(WIN32)
@@ -495,6 +554,8 @@ if(BUILD_NETWORK_TESTS)
     endif()
     add_executable(test-settings tools/test_settings.cpp src/settings.cpp src/log.cpp)
     target_include_directories(test-settings PRIVATE src)
+    add_executable(test-i18n tools/test_i18n.cpp)
+    target_include_directories(test-i18n PRIVATE src)
     if(WIN32)
         target_link_libraries(test-settings PRIVATE shell32 ole32)
     endif()
@@ -518,8 +579,18 @@ if(BUILD_NETWORK_TESTS)
         target_link_libraries(test-shutdown PRIVATE Threads::Threads)
     endif()
     enable_testing()
+    add_test(NAME hls COMMAND test-hls)
+    set_tests_properties(hls PROPERTIES TIMEOUT 20)
     add_test(NAME firewall COMMAND test-firewall)
     add_test(NAME settings COMMAND test-settings)
+    add_test(NAME i18n COMMAND test-i18n)
+    if(WIN32)
+        add_executable(test-python-setup tools/test_python_setup.cpp src/video/face_swap_process.cpp)
+        target_include_directories(test-python-setup PRIVATE src)
+        target_link_libraries(test-python-setup PRIVATE dxgi)
+        add_test(NAME python-setup COMMAND test-python-setup)
+        set_tests_properties(python-setup PROPERTIES TIMEOUT 30)
+    endif()
     add_test(NAME socket-shutdown COMMAND test-shutdown)
     add_test(NAME audio-timing COMMAND test-audio-timing)
     add_test(NAME cover-art COMMAND test-cover-art)

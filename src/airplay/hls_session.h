@@ -37,7 +37,7 @@ struct HlsSession {
     // googlevideo.com URL and expects us to follow). The local
     // server forwards the 302 to FFmpeg which fetches the segment
     // directly from the CDN over HTTPS.
-    std::mutex                                            seg_mtx;
+    mutable std::mutex                                    seg_mtx; // also protects playlists
     std::condition_variable                               seg_cv;
     std::unordered_map<std::string, std::string>          segment_data;       // raw bytes (empty string on 302)
     std::unordered_map<std::string, std::string>          segment_redirect;   // Location URL on 302
@@ -81,6 +81,9 @@ public:
     // local paths across video changes, so stale sessions must not win
     // registry scans.
     void set_active_session(const std::string& session_id);
+    bool is_active_session(const std::string& session_id) const;
+    bool has_active_session() const;
+    uint64_t playback_epoch() const { return playback_epoch_.load(); }
 
     // Remove + free. Called on TEARDOWN / session end.
     void remove(const std::string& session_id);
@@ -143,6 +146,7 @@ private:
     mutable std::mutex                                   mtx_;
     std::unordered_map<std::string, std::unique_ptr<HlsSession>> sessions_;
     std::string                                          active_session_id_;
+    std::atomic<uint64_t>                                playback_epoch_{0};
 };
 
 // Extract every occurrence of `mlhls://localhost/.../*.m3u8` from a
@@ -153,8 +157,8 @@ std::vector<std::string> extract_media_uris(const std::string& master);
 // Reduce a YouTube-style master playlist to a single video variant
 // and one audio rendition per TYPE so FFmpeg doesn't probe every
 // itag. Keeps all header tags, the first #EXT-X-MEDIA per TYPE, and
-// the first #EXT-X-STREAM-INF (plus its URI line). Drops every
-// later variant. Returns `master` unchanged if it doesn't match the
+// the best #EXT-X-STREAM-INF up to Full HD in either orientation
+// (plus its URI line). Drops other variants. Returns `master` unchanged if it doesn't match the
 // expected shape.
 std::string filter_master_to_single_variant(const std::string& master);
 

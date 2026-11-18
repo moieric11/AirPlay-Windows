@@ -33,6 +33,7 @@ graphics hardware and drivers. Software decoding is available as a fallback.
 | Display controls | Fullscreen, borderless Hide UI, automatic/manual rotation |
 | Recording | MP4 video with a stereo AAC audio track when RAOP audio is received |
 | Settings | Automatically saved in `%APPDATA%\AirPlay-Windows\settings.ini`, including display, diagnostics, window placement and recording preferences |
+| Interface languages | English, French, Simplified Chinese, Spanish, Brazilian Portuguese, German, Japanese, Italian, Russian and Korean; select Settings → Language. Changes apply immediately and the choice is saved. See [translations](docs/TRANSLATIONS.md). |
 | Sessions | One active device session at a time |
 | Direct HLS playback | Experimental, opt-in with `--hls-proxy-playback` |
 | DRM-protected streaming | Not supported |
@@ -52,13 +53,15 @@ global firewall policy are left untouched. Administrator-enforced restrictions
 are reported separately. Checks repeat automatically and run immediately after
 the rule update; cancelling the administrator prompt leaves the firewall unchanged.
 
+**Settings** opens a full page of responsive cards for receiver, video, recording and advanced preferences.
+
 In **Settings > Receiver name**, enter a name and choose **Apply name** (or press
 Enter). The name is saved automatically and both AirPlay and RAOP discovery are
 updated without restarting the receiver. Accented names are supported; names
 must fit within 50 UTF-8 bytes and cannot contain dots or backslashes. Devices
 may briefly retain the previous name in their discovery cache.
 
-In **Settings > Advanced > Rotation**, choose **Automatic (device)** or a clockwise manual
+In **Settings > Rotation**, choose **Automatic (device)** or a clockwise manual
 rotation of **0, 90, 180 or 270 degrees** relative to the received image.
 Automatic follows the orientation encoded in the incoming video, not the
 device's physical orientation sensor. Changes apply immediately to display and
@@ -92,6 +95,29 @@ but may introduce tearing. Keep the setting that works best on your display.
 
 The status bar's **Lat** value is a local pipeline estimate. It does not measure
 the sender's capture time, network transit time or exact display scan-out.
+
+## Face swap (experimental)
+
+An optional experimental **NVIDIA CUDA face swap** can replace the largest face
+in the mirror preview using a local photo. See [setup and limits](docs/FACE_SWAP.md).
+Face swap supports **NVIDIA CUDA**, **DirectML (AMD / Intel / NVIDIA)** and a **CPU** fallback. DirectML uses an isolated Python environment; see [setup](docs/FACE_SWAP.md#directml-on-windows).
+
+Open **Faceswap Settings** just above **Settings** at the bottom of the navigation
+for the dedicated source, model, GPU, restoration and engine controls.
+GPU model preparation starts on activation without screen mirroring; video
+textures attach later. Weights and derived caches live under `face_swap/swappers`
+(`prepared`, `tensorrt-engines`, `cuda-kernels`); engine logs live in `face_swap/logs`.
+The app starts and stops its engine automatically. **Prepare Python Environment**
+in Faceswap Settings installs a dedicated Python runtime and the selected
+backend's dependencies, with progress, cancellation and an error log. Models
+still need separate one-time setup; recordings keep the original video.
+The experimental **Keep video on GPU** option uses D3D11/CUDA texture sharing
+and ONNX Runtime IO Binding with NVIDIA GPU decoding. It requires the optional
+CUDA bridge and CuPy; unavailable GPU interop falls back to CPU pixel transport.
+Balanced and Detail can additionally accelerate GPEN 256/512 with the optional TensorRT
+runtime, using FP32 and cached engines with CUDA restoration as fallback.
+Experimental AlphaFace and HyperSwap A/B/C can also be compared without GPEN;
+see [optional model setup and measurements](docs/FACE_SWAP_MODELS.md).
 
 ## MP4 recording
 
@@ -148,6 +174,24 @@ resident path.
 Normal operation advertises screen mirroring and RAOP audio. The experimental
 `--hls-proxy-playback` flag also enables a direct media URL/HLS proxy path.
 Compatibility and buffering depend on the sending app and stream.
+It is also available in **Settings → EXPERIMENTAL → Direct video playback (HLS)**.
+The saved preference is **off by default** and takes effect after restarting
+the app. The `--hls` flag enables it for one launch without changing that preference.
+
+Run `build\Release\airplay-windows.exe --hls --log`, then select the receiver
+from YouTube's AirPlay menu on an iPhone on the same network. Test playback
+with sound, pause/resume, seeking, switching videos, and disconnect/reconnect.
+HTTP(S) media URLs are opened directly; `mlhls://` playlists and segments use
+the iPhone's reverse channel and a local HTTP proxy. The FFmpeg backend paces
+video by its timestamps and decodes audio to SDL; GStreamer is optional.
+The proxy selects the highest available resolution up to 1920×1080 (or
+1080×1920 for vertical video), with its matching audio group, independently
+of playlist order. At equal resolution it prefers H.264 for software decoding.
+
+For reproducible local checks, configure with `-DBUILD_NETWORK_TESTS=ON`, build
+`test-hls`, then run `ctest --test-dir build -C Release -R "^hls$" --output-on-failure`.
+This checks HTTP byte ranges, playlist query strings, a generated MPEG-TS HLS
+stream, audio/video decoding, pacing, pause/resume, seek, restart, and stop.
 
 HLS playback uses **libavformat** unless the project was built with the optional
 GStreamer backend. **HLS backend** in the status bar identifies that media-player
@@ -279,8 +323,9 @@ timestamps, and zero-readback counters. Pixel transfers inside the tests are
 validation instrumentation only. Add `--benchmark` for local 1080p timings;
 these are not end-to-end AirPlay latency measurements.
 
-GitHub CI builds on Windows and runs the protocol suite. The tag workflow builds
-the release ZIP and SHA-256 checksum; hardware integration tests run locally on
+GitHub CI builds on Windows and runs the protocol suite. The tag workflow uses `tools/package_release.ps1` to build
+the release ZIP and SHA-256 checksum, including `face_swap/engine` and its setup
+instructions (Python and weights are provisioned separately); hardware integration tests run locally on
 compatible GPU hardware.
 
 ## Project notes

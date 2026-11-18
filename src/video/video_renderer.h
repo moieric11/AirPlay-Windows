@@ -287,6 +287,7 @@ private:
     std::atomic<int>           video_w_seen_{0};
     std::atomic<int>           video_h_seen_{0};
     std::atomic<uint64_t>      frames_total_{0};
+    std::atomic<uint64_t>      avframes_replaced_{0};
 
     // Bandwidth accounting for the mirror payload. Updated from
     // record_payload_bytes() — the mirror listener calls it once

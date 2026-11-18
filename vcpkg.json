@@ -1,6 +1,6 @@
 {
   "name": "airplay-windows",
-  "version-string": "0.4.1",
+  "version-string": "0.5.0",
   "dependencies": [
     "libplist",
     "openssl",

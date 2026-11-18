@@ -74,15 +74,15 @@ void hls_set_position(HlsSession& hls, double position_seconds) {
 
 void reset_hls_media_state(HlsSession& hls, const std::string& master_url,
                            double start_position_seconds) {
-    hls.master_url       = master_url;
-    hls.master_playlist.clear();
-    hls.media_uris.clear();
-    hls.media_playlists.clear();
     const int generation = hls.playback_generation.fetch_add(1) + 1;
     const int master_request_id = hls.next_request_id.fetch_add(1);
     hls.master_request_id.store(master_request_id);
     {
         std::lock_guard<std::mutex> lock(hls.seg_mtx);
+        hls.master_url = master_url;
+        hls.master_playlist.clear();
+        hls.media_uris.clear();
+        hls.media_playlists.clear();
         hls.segment_data.clear();
         hls.segment_redirect.clear();
         hls.request_generations.clear();
@@ -517,6 +517,9 @@ Response handle_teardown(const DeviceContext& ctx, ClientSession& session, const
     Response r = make(200, "OK");
     copy_cseq(req, r);
     r.set_header("Connection", "close");
+    const auto& hls_registry = HlsSessionRegistry::instance();
+    const bool owns_playback = !hls_registry.has_active_session() ||
+        hls_registry.is_active_session(req.header("x-apple-session-id"));
 
     // Try to parse an AirPlay 2 partial-teardown plist.
     std::vector<int> stream_types;
@@ -551,24 +554,24 @@ Response handle_teardown(const DeviceContext& ctx, ClientSession& session, const
         LOG_INFO << "TEARDOWN: sdp.reset() done";
         // Wipe the idle-mode UI so a new connection doesn't inherit the
         // last track's cover, metadata and progress.
-        if (session.renderer) {
+        if (session.renderer && owns_playback) {
             session.renderer->clear_session();
             session.renderer->clear_active_device();
         }
         LOG_INFO << "TEARDOWN: renderer.clear_session() done";
         // Full session end: stop the HLS player so the player thread
         // doesn't keep fetching stale segments.
-        if (ctx.hls_player) ctx.hls_player->stop();
+        if (ctx.hls_player && owns_playback) ctx.hls_player->stop();
         LOG_INFO << "TEARDOWN: hls_player.stop() done";
-        if (!sid.empty()) HlsSessionRegistry::instance().set_active_session("");
+        if (owns_playback && !sid.empty()) HlsSessionRegistry::instance().set_active_session("");
         LOG_INFO << "TEARDOWN: full cleanup complete";
     } else {
         // No session state and no stream filter — treat as a full
         // teardown too, since iOS may send an empty body to end a
         // session we never had (paranoid fallback).
         const std::string sid = req.header("x-apple-session-id");
-        if (ctx.hls_player) ctx.hls_player->stop();
-        if (!sid.empty()) HlsSessionRegistry::instance().set_active_session("");
+        if (ctx.hls_player && owns_playback) ctx.hls_player->stop();
+        if (owns_playback && !sid.empty()) HlsSessionRegistry::instance().set_active_session("");
     }
     return r;
 }
@@ -789,7 +792,7 @@ Response handle_server_info(const DeviceContext& ctx, const Request& req) {
     copy_cseq(req, r);
 #if defined(HAVE_LIBPLIST)
     plist_t root = plist_new_dict();
-    plist_dict_set_item(root, "features",       plist_new_uint(0x27F));
+    plist_dict_set_item(root, "features",       plist_new_uint(ctx.hls_player ? 0x27F : 0x26E));
     plist_dict_set_item(root, "macAddress",     plist_new_string(ctx.deviceid.c_str()));
     plist_dict_set_item(root, "deviceid",       plist_new_string(ctx.deviceid.c_str()));
     plist_dict_set_item(root, "model",          plist_new_string(ctx.model.c_str()));
@@ -811,7 +814,7 @@ Response handle_server_info(const DeviceContext& ctx, const Request& req) {
     r.body = build_info_plist(ctx);
 #endif
     LOG_INFO << "/server-info served (" << r.body.size()
-             << "B, features=0x27F incl. HLS bit 4)";
+             << "B, HLS=" << (ctx.hls_player ? "enabled" : "disabled") << ')';
     return r;
 }
 
@@ -937,6 +940,8 @@ Response handle_play(const DeviceContext& ctx, ClientSession& session,
     if (!parse_play_body(req.body, session_id, pr)) {
         LOG_WARN << "POST /play: could not parse body ("
                  << req.body.size() << "B)  " << snapshot_body(req.body);
+        r.status_code = 400;
+        r.status_text = "Bad Request";
         return r;
     }
     LOG_INFO << "POST /play [" << pr.client_proc << "]"
@@ -946,12 +951,16 @@ Response handle_play(const DeviceContext& ctx, ClientSession& session,
              << "  start=" << pr.start_position_seconds << 's'
              << "  session=" << pr.session_id;
 
-    // UxPlay gates on clientProcName == "YouTube" — other apps (Netflix,
-    // Apple TV+, Music in non-audio mode) ship FairPlay-protected HLS
-    // that we can't decrypt without an MFi key-server certificate.
-    if (pr.client_proc != "YouTube") {
-        LOG_WARN << "POST /play: clientProcName \"" << pr.client_proc
-                 << "\" not in supported list [YouTube]; skipping playback";
+    const bool direct = pr.url.rfind("http://", 0) == 0 ||
+                        pr.url.rfind("https://", 0) == 0;
+    if (!ctx.hls_player || !ctx.renderer) {
+        r.status_code = 503;
+        r.status_text = "Service Unavailable";
+        return r;
+    }
+    if (!direct && pr.url.rfind("mlhls://localhost/", 0) != 0) {
+        r.status_code = 400;
+        r.status_text = "Bad Request";
         return r;
     }
 
@@ -960,16 +969,19 @@ Response handle_play(const DeviceContext& ctx, ClientSession& session,
     // the master playlist via POST /action.
     const int reverse_fd =
         ReverseChannelRegistry::instance().socket_for(pr.session_id);
-    if (reverse_fd < 0) {
+    if (!direct && reverse_fd < 0) {
         LOG_WARN << "POST /play: no /reverse socket for session "
                  << pr.session_id << "; cannot send FCUP Request";
+        r.status_code = 503;
+        r.status_text = "Service Unavailable";
         return r;
     }
     // Remember master URL on the HLS session so handle_action can tell
     // "master" from "media" playlists by URL comparison.
     auto* hls = HlsSessionRegistry::instance().get_or_create(pr.session_id);
-    HlsSessionRegistry::instance().set_active_session(pr.session_id);
     if (ctx.hls_player) ctx.hls_player->stop();
+    if (ctx.renderer) ctx.renderer->clear_session();
+    HlsSessionRegistry::instance().set_active_session(pr.session_id);
     reset_hls_media_state(*hls, pr.url, pr.start_position_seconds);
 
     // Update the DEVICES sidebar — HLS playback wins over any audio /
@@ -983,6 +995,26 @@ Response handle_play(const DeviceContext& ctx, ClientSession& session,
         dev.session_id = pr.session_id;
         dev.kind       = "HLS";
         session.renderer->set_active_device(std::move(dev));
+    }
+
+    if (direct) {
+        const int generation = hls->playback_generation.load();
+        ctx.hls_player->set_end_callback([sid = pr.session_id, generation] {
+            auto* ended = HlsSessionRegistry::instance().find(sid);
+            if (ended && ended->playback_generation.load() == generation)
+                hls_set_rate(*ended, 0.0);
+        });
+        if (!ctx.hls_player->start(pr.url, ctx.renderer)) {
+            hls_set_rate(*hls, 0.0);
+            r.status_code = 503;
+            r.status_text = "Service Unavailable";
+            return r;
+        }
+        if (pr.start_position_seconds > 0.0)
+            ctx.hls_player->seek(pr.start_position_seconds);
+        hls->media_playlist_ready.store(true);
+        ctx.renderer->push_playback_rate(1.0f);
+        return r;
     }
 
     const int master_request_id = hls->master_request_id.load();
@@ -1000,16 +1032,17 @@ Response handle_stop(const DeviceContext& ctx, const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
     const std::string sid = req.header("x-apple-session-id");
+    if (!HlsSessionRegistry::instance().is_active_session(sid)) return r;
     if (!sid.empty()) {
         if (auto* hls = HlsSessionRegistry::instance().find(sid)) {
             hls_set_rate(*hls, 0.0);
             hls->playback_started.store(false);
             hls->media_playlist_ready.store(false);
-            hls->master_playlist.clear();
-            hls->media_uris.clear();
-            hls->media_playlists.clear();
             {
                 std::lock_guard<std::mutex> lock(hls->seg_mtx);
+                hls->master_playlist.clear();
+                hls->media_uris.clear();
+                hls->media_playlists.clear();
                 hls->segment_data.clear();
                 hls->segment_redirect.clear();
             }
@@ -1023,6 +1056,7 @@ Response handle_stop(const DeviceContext& ctx, const Request& req) {
     }
     if (ctx.hls_player) ctx.hls_player->stop();
     if (!sid.empty()) HlsSessionRegistry::instance().set_active_session("");
+    if (ctx.renderer) ctx.renderer->clear_session_if_active(sid);
     LOG_INFO << "POST /stop: stopped HLS playback for session "
              << (sid.empty() ? "<none>" : sid);
     return r;
@@ -1129,6 +1163,11 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
         plist_free(root);
         return r;
     }
+    if (!HlsSessionRegistry::instance().is_active_session(sid) || response_request_id == 0) {
+        LOG_INFO << "POST /action: ignoring inactive/unidentified response sid=" << sid;
+        plist_free(root);
+        return r;
+    }
     if (response_request_id != 0) {
         const int request_id = static_cast<int>(response_request_id);
         const int generation = hls->playback_generation.load();
@@ -1150,9 +1189,13 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
     }
 
     const bool is_master = (!hls->master_url.empty() && url == hls->master_url);
+    const std::string playlist_path = url.substr(0, url.find('?'));
     if (is_master) {
-        hls->master_playlist = playlist;
-        hls->media_uris      = extract_media_uris(playlist);
+        {
+            std::lock_guard<std::mutex> lock(hls->seg_mtx);
+            hls->master_playlist = playlist;
+            hls->media_uris      = extract_media_uris(playlist);
+        }
         LOG_INFO << "POST /action: master playlist stored ("
                  << hls->media_uris.size() << " child URIs)";
         for (std::size_t i = 0; i < hls->media_uris.size(); ++i) {
@@ -1168,7 +1211,8 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
         if (ctx.hls_player && ctx.renderer) {
             const std::string local_master =
                 "http://localhost:" + std::to_string(ctx.hls_local_port) +
-                "/master.m3u8";
+                "/hls/" + std::to_string(HlsSessionRegistry::instance().playback_epoch()) +
+                hls->master_url.substr(std::strlen("mlhls://localhost"));
             LOG_INFO << "POST /action: master stored — starting HlsPlayer on "
                      << local_master;
             const int eos_generation = hls->playback_generation.load();
@@ -1184,6 +1228,8 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
                          << " generation=" << eos_generation;
             });
             ctx.hls_player->start(local_master, ctx.renderer);
+            if (hls->playback_position_base.load() > 0.0)
+                ctx.hls_player->seek(hls->playback_position_base.load());
             ctx.hls_player->set_rate(hls->playback_rate.load());
             // Sync the renderer's playing flag so the pause badge
             // doesn't linger from a prior audio session that left
@@ -1191,8 +1237,8 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
             // we wait for iOS to send its first POST /rate.
             if (ctx.renderer) ctx.renderer->push_playback_rate(1.0f);
         }
-    } else if (url.size() >= 5 &&
-               url.compare(url.size() - 5, 5, ".m3u8") == 0) {
+    } else if (playlist_path.size() >= 5 &&
+               playlist_path.compare(playlist_path.size() - 5, 5, ".m3u8") == 0) {
         // Media (child) playlist. Two-pass:
         //   1. Expand YouTube's "condensed" URL form (builds
         //      googlevideo.com URLs from BASE-URI + PARAMS).
@@ -1221,30 +1267,33 @@ Response handle_action(const DeviceContext& ctx, ClientSession& session, const R
                      << "after rewrite — FFmpeg will bypass the proxy";
         }
 
-        if (hls->media_playlists.empty()) {
-            auto slice_around_first_chunk = [](const std::string& s) {
-                const auto p = s.find("#EXTINF");
-                if (p == std::string::npos) {
-                    return s.substr(0, std::min<std::size_t>(600, s.size()));
-                }
-                return s.substr(p, std::min<std::size_t>(1200, s.size() - p));
-            };
-            LOG_INFO << "POST /action: first media playlist first chunk RAW:\n"
-                     << slice_around_first_chunk(playlist);
-            LOG_INFO << "POST /action: first media playlist first chunk EXPANDED:\n"
-                     << slice_around_first_chunk(expanded);
-            LOG_INFO << "POST /action: first media playlist first chunk LOCALISED:\n"
-                     << slice_around_first_chunk(localised);
+        {
+            std::lock_guard<std::mutex> playlist_lock(hls->seg_mtx);
+            if (hls->media_playlists.empty()) {
+                auto slice_around_first_chunk = [](const std::string& s) {
+                    const auto p = s.find("#EXTINF");
+                    if (p == std::string::npos) {
+                        return s.substr(0, std::min<std::size_t>(600, s.size()));
+                    }
+                    return s.substr(p, std::min<std::size_t>(1200, s.size() - p));
+                };
+                LOG_INFO << "POST /action: first media playlist first chunk RAW:\n"
+                         << slice_around_first_chunk(playlist);
+                LOG_INFO << "POST /action: first media playlist first chunk EXPANDED:\n"
+                         << slice_around_first_chunk(expanded);
+                LOG_INFO << "POST /action: first media playlist first chunk LOCALISED:\n"
+                         << slice_around_first_chunk(localised);
+            }
+            hls->media_playlists[url] = localised;
+            hls->media_playlist_ready.store(true);
+            LOG_INFO << "POST /action: media playlist stored "
+                     << hls->media_playlists.size() << '/'
+                     << hls->media_uris.size() << " ("
+                     << playlist.size() << "B raw, "
+                     << localised.size() << "B localised, "
+                     << rewritten << " segs rewritten, "
+                     << after_gv << " googlevideo leaks)";
         }
-        hls->media_playlists[url] = localised;
-        hls->media_playlist_ready.store(true);
-        LOG_INFO << "POST /action: media playlist stored "
-                 << hls->media_playlists.size() << '/'
-                 << hls->media_uris.size() << " ("
-                 << playlist.size() << "B raw, "
-                 << localised.size() << "B localised, "
-                 << rewritten << " segs rewritten, "
-                 << after_gv << " googlevideo leaks)";
         HlsSessionRegistry::instance().notify_playlist_arrived(sid, url);
     } else if (!redirect_location.empty()) {
         // 302 to a signed CDN URL — forward to FFmpeg.
@@ -1408,6 +1457,8 @@ bool query_double(const std::string& uri, const char* key, double& out) {
 
 Response handle_scrub(const DeviceContext& ctx, const Request& req) {
     const std::string sid = req.header("x-apple-session-id");
+    if (!HlsSessionRegistry::instance().is_active_session(sid))
+        return handle_stream_stub(req, "stale scrub");
     double pos = 0.0;
     if (query_double(req.uri, "position", pos) ||
         query_double(req.uri, "value", pos)) {
@@ -1447,6 +1498,13 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     const auto qpos = req.uri.find('?');
     const std::string path = (qpos == std::string::npos)
                                  ? req.uri : req.uri.substr(0, qpos);
+    // Different RTSP connections can deliver /play and old /action or
+    // /stop concurrently. Keep the ownership check and player change atomic.
+    static std::mutex hls_control_mutex;
+    std::unique_lock<std::mutex> hls_control_lock(hls_control_mutex, std::defer_lock);
+    if (path == "/play" || path == "/action" || path == "/stop" ||
+        path == "/rate" || path == "/scrub" || req.method == "TEARDOWN")
+        hls_control_lock.lock();
 
     // Order matches the rough handshake sequence iOS initiates.
     if (req.method == "GET"  && path == "/info")          return handle_info(ctx, req);
@@ -1500,6 +1558,9 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     // POST /rate?value=N: AirPlay Streaming pause/play (iOS also uses it
     // for audio in some flows). value=0 → paused, value=1 → playing.
     if (req.method == "POST" && path == "/rate") {
+        if (HlsSessionRegistry::instance().has_active_session() &&
+            !HlsSessionRegistry::instance().is_active_session(req.header("x-apple-session-id")))
+            return handle_stream_stub(req, "stale rate");
         const auto eq = req.uri.find("value=");
         if (eq != std::string::npos) {
             try {

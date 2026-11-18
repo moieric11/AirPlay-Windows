@@ -72,23 +72,17 @@ jobs:
       - name: Package zip
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          if ([string]::IsNullOrEmpty($tag) -or $tag -eq "main") {
+          $tag = $env:GITHUB_REF_NAME
+          if (-not $env:GITHUB_REF.StartsWith('refs/tags/v')) {
             $tag = "dev-$($env:GITHUB_SHA.Substring(0,7))"
           }
-          $zipName = "airplay-windows-$tag-x64.zip"
-          $packageDir = Join-Path $env:RUNNER_TEMP "airplay-release-$tag"
-          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
-          Copy-Item -LiteralPath build\Release\airplay-windows.exe -Destination $packageDir
-          Get-ChildItem build\Release -Filter *.dll -File | Copy-Item -Destination $packageDir
-          Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $packageDir
-          Copy-Item -LiteralPath docs -Destination $packageDir -Recurse
-          Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
-          $hash = (Get-FileHash -LiteralPath $zipName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $zipName" | Set-Content -Path "$zipName.sha256" -Encoding ascii
-          "ZIP_PATH=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $packageOutput = & ./tools/package_release.ps1 -BuildDirectory build/Release `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP "airplay-release") -Version $tag
+          $zipPath = $packageOutput[0]
+          $zipName = Split-Path -Leaf $zipPath
+          "ZIP_PATH=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Get-ChildItem $zipName | Format-List Name, Length
+          Get-Item -LiteralPath $zipPath | Format-List Name, Length
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4

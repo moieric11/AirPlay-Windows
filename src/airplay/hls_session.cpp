@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <utility>
+#include <tuple>
 
 namespace ap::airplay {
 
@@ -36,7 +37,29 @@ HlsSession* HlsSessionRegistry::find(const std::string& session_id) {
 
 void HlsSessionRegistry::set_active_session(const std::string& session_id) {
     std::lock_guard<std::mutex> lock(mtx_);
+    const auto previous = sessions_.find(active_session_id_);
+    if (previous != sessions_.end()) {
+        auto& old = *previous->second;
+        {
+            std::lock_guard<std::mutex> state_lock(old.seg_mtx);
+            old.playback_generation.fetch_add(1);
+            old.request_generations.clear();
+            old.playback_started.store(false);
+        }
+        old.seg_cv.notify_all();
+    }
     active_session_id_ = session_id;
+    playback_epoch_.fetch_add(1);
+}
+
+bool HlsSessionRegistry::is_active_session(const std::string& session_id) const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return !session_id.empty() && active_session_id_ == session_id;
+}
+
+bool HlsSessionRegistry::has_active_session() const {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return !active_session_id_.empty();
 }
 
 void HlsSessionRegistry::remove(const std::string& session_id) {
@@ -56,13 +79,6 @@ std::string HlsSessionRegistry::resolve_segment_path(
             if (it != active->second->seg_url_map.end()) return it->second;
         }
     }
-    for (const auto& [sid, s] : sessions_) {
-        if (sid == active_session_id_) continue;
-        if (!s) continue;
-        std::lock_guard<std::mutex> sl(s->seg_url_mtx);
-        const auto it = s->seg_url_map.find(local_path);
-        if (it != s->seg_url_map.end()) return it->second;
-    }
     return {};
 }
 
@@ -71,6 +87,7 @@ bool HlsSessionRegistry::lookup_playlist(const std::string& url,
                                          bool& out_is_master) const {
     std::lock_guard<std::mutex> lock(mtx_);
     auto lookup_in_session = [&](const HlsSession& s) {
+        std::lock_guard<std::mutex> playlist_lock(s.seg_mtx);
         if (s.master_url == url) {
             out_bytes     = s.master_playlist;
             out_is_master = true;
@@ -90,11 +107,6 @@ bool HlsSessionRegistry::lookup_playlist(const std::string& url,
             lookup_in_session(*active->second)) {
             return true;
         }
-    }
-    for (const auto& [sid, s] : sessions_) {
-        if (sid == active_session_id_) continue;
-        if (!s) continue;
-        if (lookup_in_session(*s)) return true;
     }
     return false;
 }
@@ -126,23 +138,14 @@ bool HlsSessionRegistry::fetch_segment(const std::string& url,
                 }
             }
         }
-        for (auto& [sid, sess] : sessions_) {
-            if (s) break;
-            if (!sess) continue;
-            const int fd =
-                ReverseChannelRegistry::instance().socket_for(sid);
-            if (fd < 0) continue;
-            s           = sess.get();
-            session_id  = sid;
-            reverse_fd  = fd;
-            request_id  = s->next_request_id.fetch_add(1);
-            break;
-        }
+
     }
     if (!s) {
         LOG_WARN << "fetch_segment: no active HLS session with a reverse channel";
         return false;
     }
+
+    const int generation = s->playback_generation.load();
 
     // Was it already delivered (iOS sometimes races a prior FCUP)?
     {
@@ -163,7 +166,7 @@ bool HlsSessionRegistry::fetch_segment(const std::string& url,
 
     {
         std::lock_guard<std::mutex> lock(s->seg_mtx);
-        s->request_generations[request_id] = s->playback_generation.load();
+        s->request_generations[request_id] = generation;
     }
     if (!send_fcup_request(reverse_fd, url, session_id, request_id)) {
         LOG_WARN << "fetch_segment: FCUP send failed for " << url;
@@ -173,8 +176,10 @@ bool HlsSessionRegistry::fetch_segment(const std::string& url,
     std::unique_lock<std::mutex> lock(s->seg_mtx);
     const bool arrived = s->seg_cv.wait_for(lock,
         std::chrono::milliseconds(timeout_ms),
-        [&] { return s->segment_data.count(url)     != 0 ||
+        [&] { return s->playback_generation.load() != generation ||
+                     s->segment_data.count(url)     != 0 ||
                      s->segment_redirect.count(url) != 0; });
+    if (s->playback_generation.load() != generation) return false;
     if (!arrived) {
         LOG_WARN << "fetch_segment: timeout after " << timeout_ms
                  << "ms for " << url;
@@ -245,20 +250,11 @@ bool HlsSessionRegistry::fetch_playlist(const std::string& url,
                 }
             }
         }
-        for (auto& [sid, sess] : sessions_) {
-            if (s) break;
-            if (!sess) continue;
-            const int fd =
-                ReverseChannelRegistry::instance().socket_for(sid);
-            if (fd < 0) continue;
-            s          = sess.get();
-            session_id = sid;
-            reverse_fd = fd;
-            request_id = s->next_request_id.fetch_add(1);
-            break;
-        }
+
     }
     if (!s) return false;
+
+    const int generation = s->playback_generation.load();
 
     // Maybe it was already delivered while we were initialising. Media
     // playlists without EXT-X-ENDLIST are refreshed on demand because
@@ -281,7 +277,7 @@ bool HlsSessionRegistry::fetch_playlist(const std::string& url,
 
     {
         std::lock_guard<std::mutex> lock(s->seg_mtx);
-        s->request_generations[request_id] = s->playback_generation.load();
+        s->request_generations[request_id] = generation;
     }
     if (!send_fcup_request(reverse_fd, url, session_id, request_id)) {
         LOG_WARN << "fetch_playlist: FCUP send failed for " << url;
@@ -295,7 +291,9 @@ bool HlsSessionRegistry::fetch_playlist(const std::string& url,
     std::unique_lock<std::mutex> lock(s->seg_mtx);
     const bool arrived = s->seg_cv.wait_for(lock,
         std::chrono::milliseconds(timeout_ms),
-        [&] { return s->media_playlists.count(url) != 0; });
+        [&] { return s->playback_generation.load() != generation ||
+                     s->media_playlists.count(url) != 0; });
+    if (s->playback_generation.load() != generation) return false;
     if (!arrived) {
         LOG_WARN << "fetch_playlist: timeout after " << timeout_ms
                  << "ms for " << url;
@@ -396,8 +394,9 @@ std::string expand_yt_condensed_playlist(const std::string& playlist) {
         // Find end of the condensed URL line (next '\n' or end).
         auto url_end = playlist.find('\n', chunk_line);
         if (url_end == std::string::npos) url_end = playlist.size();
-        const std::string condensed = playlist.substr(
+        std::string condensed = playlist.substr(
             chunk_line + prefix.size(), url_end - chunk_line - prefix.size());
+        if (!condensed.empty() && condensed.back() == '\r') condensed.pop_back();
 
         // Split condensed on '/' and drop empty tokens — robust to
         // prefixes that do or do not end with '/' (iOS builds vary).
@@ -502,10 +501,11 @@ std::string rewrite_segments_to_local(HlsSession& session,
                                       const std::string& expanded,
                                       std::size_t& out_rewritten_count) {
     auto register_local = [&](const std::string& url_line) {
+        static std::atomic<uint64_t> next_segment_id{0};
         std::string local_path;
         {
             std::lock_guard<std::mutex> lock(session.seg_url_mtx);
-            local_path = "/seg/" + std::to_string(session.seg_url_counter++);
+            local_path = "/seg/" + std::to_string(next_segment_id.fetch_add(1));
             session.seg_url_map[local_path] = url_line;
         }
         std::string local_url = "http://localhost:";
@@ -575,8 +575,8 @@ std::string lookup_segment_url(const std::string& local_path) {
 }
 
 std::string filter_master_to_single_variant(const std::string& master) {
-    // Two-pass. First pass picks the STREAM-INF we'll keep (first
-    // seen) and records its AUDIO="…" group id if any. Second pass
+    // Two-pass. Pick the best rendition up to Full HD, then its audio
+    // group. Playlist order is not a quality ranking. Second pass
     // rebuilds the playlist keeping only compatible renditions so
     // FFmpeg doesn't probe every itag.
     auto quoted = [](const std::string& line,
@@ -617,25 +617,56 @@ std::string filter_master_to_single_variant(const std::string& master) {
 
     const auto lines = split_lines(master);
 
-    // --- Pass 1: pick the STREAM-INF and remember its AUDIO group.
+    // --- Pass 1: prefer the largest resolution within Full HD in either
+    // orientation. If only larger variants exist, choose the smallest one.
+    // At equal resolution, prefer H.264 for inexpensive software decoding.
     std::string audio_group;
     std::size_t stream_inf_idx = std::string::npos;
+    std::tuple<int, int64_t, int, uint64_t> best_video_score{-1, 0, 0, 0};
+    auto number = [&](const std::string& line, const char* key) -> uint64_t {
+        const std::string value = bare_attr(line, key);
+        if (value.empty() || !std::all_of(value.begin(), value.end(),
+                [](unsigned char c) { return c >= '0' && c <= '9'; })) return 0;
+        try { return std::stoull(value); } catch (...) { return 0; }
+    };
     for (std::size_t i = 0; i < lines.size(); ++i) {
-        if (lines[i].compare(0, 18, "#EXT-X-STREAM-INF:") == 0) {
+        if (lines[i].compare(0, 18, "#EXT-X-STREAM-INF:") != 0 ||
+            i + 1 >= lines.size() || lines[i + 1].empty() || lines[i + 1][0] == '#') continue;
+        const std::string resolution = bare_attr(lines[i], "RESOLUTION=");
+        const auto separator = resolution.find('x');
+        uint64_t width = 0, height = 0;
+        if (separator != std::string::npos) {
+            width = number("W=" + resolution.substr(0, separator), "W=");
+            height = number("H=" + resolution.substr(separator + 1), "H=");
+        }
+        // Invalid dimensions never outrank a real video rendition.
+        const bool known = width > 0 && height > 0 && width <= 16384 && height <= 16384;
+        const bool full_hd = known && std::max(width, height) <= 1920 && std::min(width, height) <= 1080;
+        const int64_t pixels = known ? static_cast<int64_t>(width * height) : 0;
+        const std::string codecs = quoted(lines[i], "CODECS=");
+        const int h264 = codecs.find("avc1") != std::string::npos || codecs.find("avc3") != std::string::npos;
+        const auto score = std::make_tuple(full_hd ? 2 : (known ? 1 : 0),
+            full_hd ? pixels : -pixels, h264, number(lines[i], "BANDWIDTH="));
+        if (stream_inf_idx == std::string::npos || score > best_video_score) {
+            best_video_score = score;
             stream_inf_idx = i;
             audio_group = quoted(lines[i], "AUDIO=");
-            break;
         }
     }
 
     // --- Pass 2: rebuild.
+    if (stream_inf_idx == std::string::npos) return master;
+    LOG_INFO << "HLS master filter: video resolution="
+             << bare_attr(lines[stream_inf_idx], "RESOLUTION=")
+             << " bandwidth=" << bare_attr(lines[stream_inf_idx], "BANDWIDTH=")
+             << " codecs=" << quoted(lines[stream_inf_idx], "CODECS=");
     //   - Keep all header tags not of interest as-is.
     //   - For #EXT-X-MEDIA:TYPE=AUDIO: keep only one entry whose
     //     GROUP-ID matches audio_group. Prefer French if available,
     //     then DEFAULT=YES, AUTOSELECT=YES, then the first one seen.
     //   - Drop non-audio MEDIA entries so GStreamer doesn't download
     //     subtitle/caption side playlists while we only render video.
-    //   - For #EXT-X-STREAM-INF: keep only the first one + its URI.
+    //   - For #EXT-X-STREAM-INF: keep the selected variant + its URI.
     std::string out;
     out.reserve(master.size());
 
@@ -669,8 +700,8 @@ std::string filter_master_to_single_variant(const std::string& master) {
             if (!audio_group.empty() &&
                 quoted(l, "GROUP-ID=") != audio_group) continue;
             int score = 1;
-            if (is_yes(quoted(l, "AUTOSELECT="))) score += 10;
-            if (is_yes(quoted(l, "DEFAULT="))) score += 20;
+            if (is_yes(bare_attr(l, "AUTOSELECT="))) score += 10;
+            if (is_yes(bare_attr(l, "DEFAULT="))) score += 20;
             if (looks_french(l)) score += 100;
             if (score > best_score) {
                 best_score = score;
@@ -686,7 +717,6 @@ std::string filter_master_to_single_variant(const std::string& master) {
                  << '"';
     }
 
-    bool emitted_stream_inf = false;
     for (std::size_t i = 0; i < lines.size(); ++i) {
         const auto& l = lines[i];
 
@@ -699,12 +729,11 @@ std::string filter_master_to_single_variant(const std::string& master) {
             continue;
         }
         if (l.compare(0, 18, "#EXT-X-STREAM-INF:") == 0) {
-            if (emitted_stream_inf) {
+            if (i != stream_inf_idx) {
                 // skip this stream-inf + its URI
                 if (i + 1 < lines.size()) ++i;
                 continue;
             }
-            emitted_stream_inf = true;
             out.append(l); out.push_back('\n');
             if (i + 1 < lines.size()) {
                 out.append(lines[i + 1]);
@@ -717,7 +746,6 @@ std::string filter_master_to_single_variant(const std::string& master) {
         out.append(l);
         if (i + 1 < lines.size()) out.push_back('\n');
     }
-    (void)stream_inf_idx;
     return out;
 }
 
@@ -729,7 +757,8 @@ std::vector<std::string> extract_media_uris(const std::string& master) {
     while ((pos = master.find(kPrefix, pos)) != std::string::npos) {
         const std::size_t end = master.find(kSuffix, pos);
         if (end == std::string::npos) break;
-        const std::size_t stop = end + std::strlen(kSuffix);
+        auto stop = master.find_first_of("\"\r\n \t", end + std::strlen(kSuffix));
+        if (stop == std::string::npos) stop = master.size();
         std::string uri = master.substr(pos, stop - pos);
         if (std::find(out.begin(), out.end(), uri) == out.end()) {
             out.push_back(std::move(uri));

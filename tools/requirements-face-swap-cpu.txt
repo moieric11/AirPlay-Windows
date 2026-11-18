@@ -1,0 +1,9 @@
+# Managed CPU worker, Python 3.11 x64. Keep separate from CUDA and DirectML.
+onnxruntime==1.23.2
+numpy>=1.26,<3
+opencv-python>=4.9,<5
+onnx
+scipy
+scikit-image
+tqdm
+requests

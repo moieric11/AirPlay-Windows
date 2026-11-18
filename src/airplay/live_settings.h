@@ -43,6 +43,9 @@ struct LiveSettings {
     // is more compatible with weaker decoders but uses ~50% more
     // bandwidth at the same visual quality.
     std::atomic<bool> hevc_enabled{true};
+    // Saved preference; changes require an app restart to rebuild services.
+    std::atomic<bool> hls_playback{false};
+    bool hls_playback_active = false; // Set before starting the UI thread.
 
     // Frame-rate hints sent in the displays plist. iOS uses these
     // to cap the rate at which it emits encoded mirror frames —

@@ -1,0 +1,4 @@
+# Optional Windows CUDA 12 / TensorRT 10.9 libraries for pinned ORT 1.23.2.
+# Use NVIDIA's official wheel directly (the PyPI stub requires its extra index).
+-r requirements-face-swap-gpu.txt
+https://pypi.nvidia.com/tensorrt-cu12-libs/tensorrt_cu12_libs-10.9.0.34-py2.py3-none-win_amd64.whl#sha256=e43d38cc380d615bf8afab637c265f01a9452dc23deb9b9dd47b7662edf24531 ; sys_platform == 'win32'

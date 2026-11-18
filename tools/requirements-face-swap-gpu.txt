@@ -1,0 +1,3 @@
+-r requirements-face-swap.txt
+# Optional GPU-resident video path. Install InsightFace separately as documented.
+cupy-cuda12x==14.2.0

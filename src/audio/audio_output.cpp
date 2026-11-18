@@ -60,6 +60,10 @@ void SdlAudioOutput::stop() {
     }
 }
 
+void SdlAudioOutput::pause(bool paused) {
+    if (device_) SDL_PauseAudioDevice(device_, paused ? 1 : 0);
+}
+
 void SdlAudioOutput::push(const int16_t* samples, int count) {
     if (!device_ || !samples || count <= 0) return;
 
