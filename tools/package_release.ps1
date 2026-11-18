@@ -59,6 +59,14 @@ try {
     New-Item -ItemType Directory -Path $docs | Out-Null
     Get-ChildItem -LiteralPath (Join-Path $repoRoot 'docs') -Filter '*.md' -File |
         Where-Object Name -ne 'EXPLORATION-AUDIT.md' | Copy-Item -Destination $docs
+    foreach ($relativePath in @('images/interface-preview.png', "releases/$Version.md")) {
+        $sourceDoc = Join-Path (Join-Path $repoRoot 'docs') $relativePath
+        if (Test-Path -LiteralPath $sourceDoc) {
+            $destinationDoc = Join-Path $docs $relativePath
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destinationDoc) -Force | Out-Null
+            Copy-Item -LiteralPath $sourceDoc -Destination $destinationDoc
+        }
+    }
     $faceRoot = Join-Path $stage 'face_swap'
     $engine = Join-Path $faceRoot 'engine'
     New-Item -ItemType Directory -Path $engine | Out-Null

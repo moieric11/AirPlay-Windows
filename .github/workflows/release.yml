@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,11 +55,25 @@ jobs:
           restore-keys: |
             vcpkg-installed-${{ runner.os }}-
 
+      - name: Prepare NVIDIA CUDA driver SDK
+        shell: pwsh
+        run: |
+          $package = "cuda_cudart-windows-x86_64-12.9.79-archive"
+          $zip = Join-Path $env:RUNNER_TEMP "$package.zip"
+          Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/$package.zip" -OutFile $zip
+          $expected = "179e9c43b0735ffe67207b3da556eb5a0c50f3047961882b7657d3b822d34ef8"
+          if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $expected) {
+            throw "CUDA driver SDK archive checksum mismatch"
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $env:RUNNER_TEMP
+          "AIRPLAY_CUDA_DRIVER_SDK=$(Join-Path $env:RUNNER_TEMP $package)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Configure (CMake + vcpkg manifest mode)
         shell: pwsh
         run: |
           cmake -S . -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCUDA_DRIVER_SDK_ROOT="$env:AIRPLAY_CUDA_DRIVER_SDK" `
             -DBUILD_NETWORK_TESTS=ON `
             -G "Visual Studio 18 2026" -A x64
 
@@ -72,6 +86,9 @@ jobs:
       - name: Package zip
         shell: pwsh
         run: |
+          if (-not (Test-Path -LiteralPath "build/Release/face_swap/engine/airplay-cuda-bridge.dll")) {
+            throw "The CUDA bridge is missing from the release build"
+          }
           $tag = $env:GITHUB_REF_NAME
           if (-not $env:GITHUB_REF.StartsWith('refs/tags/v')) {
             $tag = "dev-$($env:GITHUB_SHA.Substring(0,7))"

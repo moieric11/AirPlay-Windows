@@ -437,11 +437,27 @@ endif()
 
 # ---- Runtime DLL deployment (Windows) ----------------------------------------
 option(ENABLE_CUDA_FACE_SWAP "Build the optional CUDA/D3D11 face-swap bridge" ON)
+set(CUDA_DRIVER_SDK_ROOT "" CACHE PATH "NVIDIA CUDA Runtime redistributable used to build the driver bridge")
 if(WIN32 AND ENABLE_CUDA_FACE_SWAP)
-    find_package(CUDAToolkit QUIET)
-    if(CUDAToolkit_FOUND)
+    if(CUDA_DRIVER_SDK_ROOT)
+        if(NOT EXISTS "${CUDA_DRIVER_SDK_ROOT}/include/cudaD3D11.h" OR
+           NOT EXISTS "${CUDA_DRIVER_SDK_ROOT}/lib/x64/cuda.lib")
+            message(FATAL_ERROR "CUDA_DRIVER_SDK_ROOT must contain the NVIDIA CUDA Runtime redistributable (Windows x64)")
+        endif()
+        add_library(airplay-cuda-driver UNKNOWN IMPORTED)
+        set_target_properties(airplay-cuda-driver PROPERTIES
+            IMPORTED_LOCATION "${CUDA_DRIVER_SDK_ROOT}/lib/x64/cuda.lib"
+            INTERFACE_INCLUDE_DIRECTORIES "${CUDA_DRIVER_SDK_ROOT}/include")
+        set(airplay_cuda_driver airplay-cuda-driver)
+    else()
+        find_package(CUDAToolkit QUIET)
+        if(TARGET CUDA::cuda_driver)
+            set(airplay_cuda_driver CUDA::cuda_driver)
+        endif()
+    endif()
+    if(airplay_cuda_driver)
         add_library(airplay-cuda-bridge SHARED src/video/cuda_d3d11_bridge.cpp)
-        target_link_libraries(airplay-cuda-bridge PRIVATE CUDA::cuda_driver d3d11 dxgi)
+        target_link_libraries(airplay-cuda-bridge PRIVATE ${airplay_cuda_driver} d3d11 dxgi)
         set_target_properties(airplay-cuda-bridge PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/face_swap/engine")
         add_dependencies(airplay-windows airplay-cuda-bridge)
@@ -456,7 +472,7 @@ if(WIN32 AND BUILD_GPU_TESTS)
         add_executable(test-gpu-face-interop tools/test_gpu_face_interop.cpp src/video/face_swap_gpu.cpp
             src/video/face_swap.cpp src/video/face_swap_process.cpp src/net/socket.cpp src/log.cpp)
         target_include_directories(test-gpu-face-interop PRIVATE src ${FFMPEG_INCLUDE_DIRS_OK})
-        target_link_libraries(test-gpu-face-interop PRIVATE ${FFMPEG_TARGETS} CUDA::cuda_driver d3d11 dxgi ws2_32 iphlpapi)
+        target_link_libraries(test-gpu-face-interop PRIVATE ${FFMPEG_TARGETS} ${airplay_cuda_driver} d3d11 dxgi ws2_32 iphlpapi)
         add_dependencies(test-gpu-face-interop airplay-cuda-bridge)
     endif()
     add_executable(test-face-swap tools/test_face_swap.cpp src/video/face_swap.cpp src/video/face_swap_process.cpp src/video/face_swap_gpu.cpp

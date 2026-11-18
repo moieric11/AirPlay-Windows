@@ -1,12 +1,21 @@
 # AirPlay Windows Receiver
 
-Native AirPlay receiver for Windows: screen mirroring, RAOP audio and MP4
-recording, based on [UxPlay](https://github.com/FDH2/UxPlay).
+Native AirPlay receiver for Windows with screen mirroring, RAOP audio, MP4
+recording and optional live FaceSwap. Based on [UxPlay](https://github.com/FDH2/UxPlay).
 
-Latest release: [v0.4.1](https://github.com/moieric11/AirPlay-Windows/releases/tag/v0.4.1)
-— [what changed](docs/releases/v0.4.1.md).
+**[Download v0.5.0 for Windows x64](https://github.com/moieric11/AirPlay-Windows/releases/tag/v0.5.0)** · [Release notes](docs/releases/v0.5.0.md)
 
-![AirPlay Windows interface with Home, Music, Screen Mirroring and Settings navigation](docs/images/interface-preview.png)
+![FaceSwap settings showing engine controls, the floating-preview button and model management](docs/images/interface-preview.png)
+
+## What's new in v0.5.0
+
+- **Live FaceSwap (experimental)** uses a local photo to replace the largest
+  face in the mirroring preview. Set up Python and download models from the
+  app, then open a floating preview while you adjust settings.
+- **Ten interface languages** and a **light/dark theme** you can switch with
+  the moon/sun button.
+- **Experimental direct HLS playback** is now available in Settings and
+  selects a stream up to 1080p with its matching audio track.
 
 ## Get started
 
@@ -35,7 +44,7 @@ graphics hardware and drivers. Software decoding is available as a fallback.
 | Settings | Automatically saved in `%APPDATA%\AirPlay-Windows\settings.ini`, including display, diagnostics, window placement and recording preferences |
 | Interface languages | English, French, Simplified Chinese, Spanish, Brazilian Portuguese, German, Japanese, Italian, Russian and Korean; select Settings → Language. Changes apply immediately and the choice is saved. See [translations](docs/TRANSLATIONS.md). |
 | Sessions | One active device session at a time |
-| Direct HLS playback | Experimental, opt-in with `--hls-proxy-playback` |
+| Direct HLS playback | Experimental, opt-in from Settings or with `--hls` |
 | DRM-protected streaming | Not supported |
 
 The sidebar shows the active device. **Disconnect** drops the active AirPlay
@@ -98,26 +107,24 @@ the sender's capture time, network transit time or exact display scan-out.
 
 ## Face swap (experimental)
 
-An optional experimental **NVIDIA CUDA face swap** can replace the largest face
-in the mirror preview using a local photo. See [setup and limits](docs/FACE_SWAP.md).
-Face swap supports **NVIDIA CUDA**, **DirectML (AMD / Intel / NVIDIA)** and a **CPU** fallback. DirectML uses an isolated Python environment; see [setup](docs/FACE_SWAP.md#directml-on-windows).
+Open **Faceswap Settings** in the sidebar to get started.
 
-Open **Faceswap Settings** just above **Settings** at the bottom of the navigation
-for the dedicated source, model, GPU, restoration and engine controls.
-GPU model preparation starts on activation without screen mirroring; video
-textures attach later. Weights and derived caches live under `face_swap/swappers`
-(`prepared`, `tensorrt-engines`, `cuda-kernels`); engine logs live in `face_swap/logs`.
-The app starts and stops its engine automatically. **Prepare Python Environment**
-in Faceswap Settings installs a dedicated Python runtime and the selected
-backend's dependencies, with progress, cancellation and an error log. Models
-still need separate one-time setup; recordings keep the original video.
-The experimental **Keep video on GPU** option uses D3D11/CUDA texture sharing
-and ONNX Runtime IO Binding with NVIDIA GPU decoding. It requires the optional
-CUDA bridge and CuPy; unavailable GPU interop falls back to CPU pixel transport.
-Balanced and Detail can additionally accelerate GPEN 256/512 with the optional TensorRT
-runtime, using FP32 and cached engines with CUDA restoration as fallback.
-Experimental AlphaFace and HyperSwap A/B/C can also be compared without GPEN;
-see [optional model setup and measurements](docs/FACE_SWAP_MODELS.md).
+1. Choose a processing device and select **Prepare Python Environment** to
+   install its dependencies in an isolated environment.
+2. Use **Model management** to download and verify the models requested by
+   the engine. The default preset uses HyperSwap 1A 256, SCRFD 10G, ArcFace
+   recognition and HRFFA 68-point landmarks with five-point FaceFusion-style
+   alignment.
+3. Choose a clear source photo and select **Enable faceswap**. Start AirPlay
+   screen mirroring, then use **Preview Settings** if you want the video in a
+   separate window while you fine-tune the result.
+
+FaceSwap supports **NVIDIA CUDA**, **DirectML** on compatible AMD, Intel and
+NVIDIA GPUs, and **CPU** processing. With compatible NVIDIA hardware,
+**Keep video on GPU** uses the CUDA/D3D11 bridge. TensorRT can accelerate
+inference, and its first engine build may take 5–20 minutes. MP4 recordings
+retain the original video. See the [setup guide](docs/FACE_SWAP.md) and
+[model reference](docs/FACE_SWAP_MODELS.md).
 
 ## MP4 recording
 

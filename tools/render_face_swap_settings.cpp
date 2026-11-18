@@ -187,6 +187,10 @@ int main(int argc,char** argv) {
         }
         const auto root=std::filesystem::path(argc>1?argv[1]:"build/faceswap-ui-qa");
         std::filesystem::create_directories(root);
+        if (argc>2 && std::string(argv[2])=="--readme") {
+            render(root/"faceswap-readme.bmp",1030,1012,2,false,false);
+            return 0;
+        }
         if (argc>2 && std::string(argv[2])=="--source-required") {
             render(root/"source-required-fr.bmp",770,720,3,false,false,0,0,5,false,"fr",0,false);
             return 0;
